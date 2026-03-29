@@ -21,7 +21,7 @@ var initCmd = &cobra.Command{
 
 		// Check if config already exists
 		if _, err := os.Stat(cfgPath); err == nil {
-			fmt.Printf("Config already exists at %s — use 'gspl config show' to view\n", cfgPath)
+			fmt.Printf("Config already exists at %s — use 'spl-go config show' to view\n", cfgPath)
 			return nil
 		}
 

@@ -15,7 +15,7 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "spl",
+	Use:   "spl-go",
 	Short: "SPL 2.0 — Semantic Prompt Language runtime (Go)",
 	Long: `SPL 2.0 is an agentic workflow orchestration language for LLMs.
 
@@ -45,4 +45,6 @@ func init() {
 	rootCmd.AddCommand(docRAGCmd)
 	rootCmd.AddCommand(codeRAGCmd)
 	rootCmd.AddCommand(text2splCmd)
+	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(cacheCmd)
 }

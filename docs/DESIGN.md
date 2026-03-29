@@ -7,7 +7,7 @@ The canonical implementation is Python (`digital-duck/SPL20`).
 
 This repository (`digital-duck/SPL20.go`) is a Go port with one primary motivation:
 **single-binary deployment alongside Momagrid**, which is also implemented in Go.
-No Python runtime, no virtual environment, no pip install — just `gspl`.
+No Python runtime, no virtual environment, no pip install — just `spl-go`.
 
 ---
 
@@ -27,7 +27,7 @@ Go (`SPL20.go`) receives features only after they have stabilized in Python.
 **Workflow:**
 
 ```
-Python SPL (spl)              Go SPL (gspl)
+Python SPL (spl)              Go SPL (spl-go)
 ──────────────────            ──────────────────
 experiment fast      ──►      port when stable
 add new recipe       ──►      benchmark after bake-in
@@ -37,13 +37,13 @@ try new adapter      ──►      add Go adapter once proven
 
 ---
 
-## 3. Command Name: `spl` binary, `gspl` alias
+## 3. Command Name: `spl` binary, `spl-go` alias
 
 **Decision:** The Go binary is compiled as `spl` (same name as the Python CLI).
 Users distinguish the two runtimes via a shell alias:
 
 ```bash
-alias gspl='/path/to/SPL20.go/spl'   # Go runtime
+alias spl-go='/path/to/SPL20.go/spl'   # Go runtime
 # 'spl' continues to resolve to the Python CLI
 ```
 
@@ -53,13 +53,13 @@ alias gspl='/path/to/SPL20.go/spl'   # Go runtime
 - The alias approach is maximally flexible: the user controls which binary
   each name points to per machine, per session, or per benchmark run.
 - Keeps cobra help text and error messages consistent (`spl run`, `spl validate`).
-- The `gspl version` output prints `Go runtime` to make the active runtime unambiguous.
+- The `spl-go version` output prints `Go runtime` to make the active runtime unambiguous.
 
 **Side-by-side benchmark pattern:**
 
 ```bash
 time spl  run recipe.spl --adapter ollama   # Python runtime
-time gspl run recipe.spl --adapter ollama   # Go runtime
+time spl-go run recipe.spl --adapter ollama   # Go runtime
 ```
 
 Same `.spl` file, same Momagrid hub, two runtimes — accuracy diff + wall-clock diff
@@ -138,7 +138,7 @@ expected to match or exceed these numbers once validated on the 5-node grid.
 
 The Go port targets **feature parity** with the Python runtime for the 40-recipe
 SPL Cookbook (`digital-duck/Cookbook-of-SPL-Recipes`). Any recipe that passes
-`spl run` must also pass `gspl run` on the same adapter.
+`spl run` must also pass `spl-go run` on the same adapter.
 
 Divergences between the two runtimes are bugs in the Go port, not design choices.
 

@@ -147,7 +147,7 @@ func (s *WorkflowState) recordLLMCall(res *adapter.GenerationResult) {
 // warnNotImplemented prints a consistent warning to stderr when a feature is
 // not fully supported in the Go runtime.
 func warnNotImplemented(feature string) {
-	fmt.Fprintf(os.Stderr, "WARNING: [%s] not fully supported in gspl (Go runtime). Use 'spl' (Python) for this feature. See ROADMAP in docs/DESIGN.md\n", feature)
+	fmt.Fprintf(os.Stderr, "WARNING: [%s] not fully supported in spl-go (Go runtime). Use 'spl' (Python) for this feature. See ROADMAP in docs/DESIGN.md\n", feature)
 }
 
 // =============================================================================

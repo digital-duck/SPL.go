@@ -1,6 +1,6 @@
 # SPL20.go — SPL 2.0 Go Runtime
 
-**gspl** is the Go implementation of [SPL 2.0](https://github.com/digital-duck/SPL20) (Semantic Prompt Language), a declarative, SQL-inspired language for LLM-powered agentic workflows.
+**spl-go** is the Go implementation of [SPL 2.0](https://github.com/digital-duck/SPL20) (Semantic Prompt Language), a declarative, SQL-inspired language for LLM-powered agentic workflows.
 
 ```sql
 PROMPT greet
@@ -11,21 +11,21 @@ END
 ```
 
 ```bash
-gspl run greet.spl topic="machine learning"
+spl-go run greet.spl topic="machine learning"
 ```
 
 ---
 
-## Why gspl?
+## Why spl-go?
 
-| | Python `spl` | Go `gspl` |
+| | Python `spl` | Go `spl-go` |
 |---|---|---|
 | **Purpose** | Development, experimentation | Production, single-binary deployment |
 | **Deploy** | pip + venv | `go build` → one binary |
 | **Momagrid** | Python adapter | Native Go (same language as Momagrid hub) |
 | **Iteration** | Fast — new features land here first | Stable — proven features ported from Python |
 
-Use `spl` to experiment. Use `gspl` when you want a self-contained binary next to your Momagrid node.
+Use `spl` to experiment. Use `spl-go` when you want a self-contained binary next to your Momagrid node.
 
 ---
 
@@ -35,7 +35,7 @@ Use `spl` to experiment. Use `gspl` when you want a self-contained binary next t
 git clone git@github.com:digital-duck/SPL20.go.git
 cd SPL20.go
 go build -o ~/bin/spl-go .
-alias gspl=~/bin/spl-go
+alias spl-go=~/bin/spl-go
 ```
 
 **Requirements:** Go 1.22+
@@ -52,28 +52,28 @@ docker run -p 8000:8000 chromadb/chroma       # vector store (RAG)
 
 ```bash
 # Validate an SPL file
-gspl validate my_workflow.spl
+spl-go validate my_workflow.spl
 
 # Run with Ollama (default)
-gspl run my_workflow.spl -m gemma3
+spl-go run my_workflow.spl -m gemma3
 
 # Run on Momagrid LAN grid
-gspl run my_workflow.spl --adapter momagrid -m gemma3
+spl-go run my_workflow.spl --adapter momagrid -m gemma3
 
 # Run with Anthropic API
-ANTHROPIC_API_KEY=sk-... gspl run my_workflow.spl --adapter anthropic -m claude-sonnet-4-6
+ANTHROPIC_API_KEY=sk-... spl-go run my_workflow.spl --adapter anthropic -m claude-sonnet-4-6
 
 # Run with Claude Code CLI (zero marginal cost)
-gspl run my_workflow.spl --adapter claude_cli
+spl-go run my_workflow.spl --adapter claude_cli
 
 # Dry-run (echo adapter — no LLM calls)
-gspl run my_workflow.spl --adapter echo
+spl-go run my_workflow.spl --adapter echo
 
 # Generate SPL from natural language
-gspl text2spl "summarize a document in three bullet points"
+spl-go text2spl "summarize a document in three bullet points"
 
 # Inspect what an SPL file contains
-gspl explain my_workflow.spl
+spl-go explain my_workflow.spl
 ```
 
 ---
@@ -93,31 +93,31 @@ gspl explain my_workflow.spl
 ## Commands
 
 ```
-gspl run <file.spl> [KEY=VALUE...]   Execute an SPL program
-gspl validate <file.spl>             Check syntax
-gspl explain <file.spl>              Summarize structure
-gspl text2spl "<description>"        Generate SPL from natural language
-gspl adapters                        List adapters
-gspl version                         Show runtime version
+spl-go run <file.spl> [KEY=VALUE...]   Execute an SPL program
+spl-go validate <file.spl>             Check syntax
+spl-go explain <file.spl>              Summarize structure
+spl-go text2spl "<description>"        Generate SPL from natural language
+spl-go adapters                        List adapters
+spl-go version                         Show runtime version
 
-gspl config show                     Print current config
-gspl config get <key>                Get a config value
-gspl config set <key> <value>        Set a config value
-gspl config path                     Print config file path
+spl-go config show                     Print current config
+spl-go config get <key>                Get a config value
+spl-go config set <key> <value>        Set a config value
+spl-go config path                     Print config file path
 
-gspl memory list                     List all memory keys
-gspl memory get <key>                Get a memory value
-gspl memory set <key> <value>        Set a memory value
-gspl memory delete <key>             Delete a memory entry
+spl-go memory list                     List all memory keys
+spl-go memory get <key>                Get a memory value
+spl-go memory set <key> <value>        Set a memory value
+spl-go memory delete <key>             Delete a memory entry
 
-gspl doc-rag add <text_or_file>      Index a document
-gspl doc-rag query "<search>"        Semantic search
-gspl doc-rag count                   Count indexed documents
+spl-go doc-rag add <text_or_file>      Index a document
+spl-go doc-rag query "<search>"        Semantic search
+spl-go doc-rag count                   Count indexed documents
 
-gspl code-rag import                 Index cookbook recipes
-gspl code-rag add "<desc>" <file>    Add a (description, SPL) pair
-gspl code-rag query "<desc>"         Find similar examples
-gspl code-rag count                  Count indexed pairs
+spl-go code-rag import                 Index cookbook recipes
+spl-go code-rag add "<desc>" <file>    Add a (description, SPL) pair
+spl-go code-rag query "<desc>"         Find similar examples
+spl-go code-rag count                  Count indexed pairs
 ```
 
 ---
@@ -186,11 +186,11 @@ doc_rag:
 
 ## Relationship to Python SPL 2.0
 
-`gspl` follows a **Python-first, Go-second** discipline:
+`spl-go` follows a **Python-first, Go-second** discipline:
 
 1. New features land in `digital-duck/SPL20` (Python) first
 2. After validation on the cookbook benchmark, they are ported to Go
-3. Any recipe that passes `spl run` must also pass `gspl run` — divergences are bugs
+3. Any recipe that passes `spl run` must also pass `spl-go run` — divergences are bugs
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design rationale and [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for detailed usage.
 

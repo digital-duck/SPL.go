@@ -1,4 +1,4 @@
-# gspl User Guide — SPL 2.0 Go Runtime
+# spl-go User Guide — SPL 2.0 Go Runtime
 
 ## Table of Contents
 
@@ -30,21 +30,21 @@ go build -o ~/bin/spl-go .
 
 ### Set up the alias
 
-Because the Python `spl` CLI may be installed on the same machine, the Go binary is aliased as `gspl`:
+Because the Python `spl` CLI may be installed on the same machine, the Go binary is aliased as `spl-go`:
 
 ```bash
-alias gspl=~/bin/spl-go          # add to ~/.bashrc or ~/.zshrc
+alias spl-go=~/bin/spl-go          # add to ~/.bashrc or ~/.zshrc
 ```
 
-Both `spl` (Python) and `gspl` (Go) accept identical `.spl` files and flags — this makes side-by-side comparison trivial.
+Both `spl` (Python) and `spl-go` (Go) accept identical `.spl` files and flags — this makes side-by-side comparison trivial.
 
 ### Verify
 
 ```bash
-gspl version
-# gspl — SPL 2.0 Go runtime v0.1.0
+spl-go version
+# spl-go — SPL 2.0 Go runtime v0.1.0
 
-gspl adapters
+spl-go adapters
 # echo, ollama, momagrid, anthropic, claude_cli
 ```
 
@@ -72,7 +72,7 @@ END
 Run it:
 
 ```bash
-gspl run hello.spl
+spl-go run hello.spl
 ```
 
 Output:
@@ -107,7 +107,7 @@ END
 
 Run with a parameter:
 ```bash
-gspl run summarize.spl text="Long article content here..."
+spl-go run summarize.spl text="Long article content here..."
 ```
 
 ### WORKFLOW — multi-step agentic flow
@@ -228,40 +228,40 @@ Values persist in `~/.spl/memory.db` (SQLite).
 ### Basic run
 
 ```bash
-gspl run my_workflow.spl
+spl-go run my_workflow.spl
 ```
 
 ### Pass parameters
 
 ```bash
 # Positional KEY=VALUE
-gspl run summarize.spl topic="climate change" length="short"
+spl-go run summarize.spl topic="climate change" length="short"
 
 # Flag form
-gspl run summarize.spl -p topic="climate change" -p length="short"
+spl-go run summarize.spl -p topic="climate change" -p length="short"
 ```
 
 ### Override adapter and model
 
 ```bash
-gspl run my.spl --adapter ollama -m llama3.2
-gspl run my.spl --adapter momagrid -m gemma3
-gspl run my.spl --adapter anthropic -m claude-sonnet-4-6
-gspl run my.spl --adapter claude_cli
-gspl run my.spl --adapter echo          # dry-run, no LLM calls
+spl-go run my.spl --adapter ollama -m llama3.2
+spl-go run my.spl --adapter momagrid -m gemma3
+spl-go run my.spl --adapter anthropic -m claude-sonnet-4-6
+spl-go run my.spl --adapter claude_cli
+spl-go run my.spl --adapter echo          # dry-run, no LLM calls
 ```
 
 ### Validate syntax without running
 
 ```bash
-gspl validate my_workflow.spl
+spl-go validate my_workflow.spl
 # ✓ Valid: my_workflow.spl
 ```
 
 ### Explain structure
 
 ```bash
-gspl explain my_workflow.spl
+spl-go explain my_workflow.spl
 # Statements: 4
 # WORKFLOWs: draft_review
 # PROMPTs:   (none)
@@ -280,7 +280,7 @@ Requires [Ollama](https://ollama.com) running locally.
 ollama serve
 ollama pull llama3.2    # or gemma3, phi3, deepseek-r1, qwen3, etc.
 
-gspl run my.spl --adapter ollama -m gemma3
+spl-go run my.spl --adapter ollama -m gemma3
 ```
 
 Config in `~/.spl/config.yaml`:
@@ -294,7 +294,7 @@ adapters:
 
 Override via env:
 ```bash
-OLLAMA_BASE_URL=http://192.168.0.10:11434 gspl run my.spl
+OLLAMA_BASE_URL=http://192.168.0.10:11434 spl-go run my.spl
 ```
 
 ### momagrid
@@ -302,7 +302,7 @@ OLLAMA_BASE_URL=http://192.168.0.10:11434 gspl run my.spl
 Requires a running [Momagrid](https://github.com/digital-duck/momagrid) hub.
 
 ```bash
-gspl run my.spl --adapter momagrid -m gemma3
+spl-go run my.spl --adapter momagrid -m gemma3
 ```
 
 Config:
@@ -315,7 +315,7 @@ adapters:
 
 Override via env:
 ```bash
-MOMAGRID_HUB_URL=http://192.168.0.184:9000 gspl run my.spl --adapter momagrid
+MOMAGRID_HUB_URL=http://192.168.0.184:9000 spl-go run my.spl --adapter momagrid
 ```
 
 ### anthropic
@@ -324,7 +324,7 @@ Requires `ANTHROPIC_API_KEY` environment variable.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-gspl run my.spl --adapter anthropic -m claude-sonnet-4-6
+spl-go run my.spl --adapter anthropic -m claude-sonnet-4-6
 ```
 
 Available models: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
@@ -334,7 +334,7 @@ Available models: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-2025
 Uses the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` binary). Billed via Claude Code subscription — **$0.00 per call**.
 
 ```bash
-gspl run my.spl --adapter claude_cli
+spl-go run my.spl --adapter claude_cli
 ```
 
 Config:
@@ -351,7 +351,7 @@ adapters:
 Returns the assembled prompt as output. No LLM call. Useful for testing prompt construction.
 
 ```bash
-gspl run my.spl --adapter echo
+spl-go run my.spl --adapter echo
 ```
 
 ---
@@ -363,26 +363,26 @@ Config file: `~/.spl/config.yaml`
 ### View current config
 
 ```bash
-gspl config show
+spl-go config show
 ```
 
 ### Get / set values
 
 ```bash
-gspl config get adapter
-gspl config set adapter momagrid
+spl-go config get adapter
+spl-go config set adapter momagrid
 
-gspl config get model
-gspl config set model gemma3
+spl-go config get model
+spl-go config set model gemma3
 
-gspl config set max_llm_calls 50
-gspl config set max_total_tokens 200000
+spl-go config set max_llm_calls 50
+spl-go config set max_total_tokens 200000
 ```
 
 ### Config file path
 
 ```bash
-gspl config path
+spl-go config path
 # /home/user/.spl/config.yaml
 ```
 
@@ -455,10 +455,10 @@ STORE @user_name IN memory.user
 ### CLI commands
 
 ```bash
-gspl memory list                   # show all keys
-gspl memory get last_summary       # get a value
-gspl memory set greeting "Hello!"  # set a value
-gspl memory delete last_summary    # delete a key
+spl-go memory list                   # show all keys
+spl-go memory get last_summary       # get a value
+spl-go memory set greeting "Hello!"  # set a value
+spl-go memory delete last_summary    # delete a key
 ```
 
 ---
@@ -478,26 +478,26 @@ ollama pull nomic-embed-text
 
 ```bash
 # Add raw text
-gspl doc-rag add "ChromaDB is a vector database for AI applications."
+spl-go doc-rag add "ChromaDB is a vector database for AI applications."
 
 # Add a file (text file)
-gspl doc-rag add ./report.txt
+spl-go doc-rag add ./report.txt
 
 # Long documents are split on blank lines (paragraph chunking)
-gspl doc-rag add ./long_paper.txt
+spl-go doc-rag add ./long_paper.txt
 ```
 
 ### Query
 
 ```bash
-gspl doc-rag query "what is a vector database"
-gspl doc-rag query "AI inference" --top-k 10
+spl-go doc-rag query "what is a vector database"
+spl-go doc-rag query "AI inference" --top-k 10
 ```
 
 ### Count
 
 ```bash
-gspl doc-rag count
+spl-go doc-rag count
 # 47 documents indexed
 ```
 
@@ -526,25 +526,25 @@ Same as doc-rag: ChromaDB + `nomic-embed-text`.
 ### Index the cookbook
 
 ```bash
-gspl code-rag import --cookbook-dir /path/to/Cookbook-of-SPL-Recipes/cookbook
-gspl code-rag count
+spl-go code-rag import --cookbook-dir /path/to/Cookbook-of-SPL-Recipes/cookbook
+spl-go code-rag count
 # 40 pairs indexed
 ```
 
 ### Add a custom pair
 
 ```bash
-gspl code-rag add "translate text to Spanish" my_translate.spl
+spl-go code-rag add "translate text to Spanish" my_translate.spl
 ```
 
 ### Query for examples
 
 ```bash
-gspl code-rag query "classify user intent from chat message"
-gspl code-rag query "summarize a document" --top-k 4 --show-spl
+spl-go code-rag query "classify user intent from chat message"
+spl-go code-rag query "summarize a document" --top-k 4 --show-spl
 ```
 
-When Code-RAG is populated, `gspl text2spl` automatically injects the top-k retrieved examples into the compiler system prompt, dramatically improving generation quality.
+When Code-RAG is populated, `spl-go text2spl` automatically injects the top-k retrieved examples into the compiler system prompt, dramatically improving generation quality.
 
 ---
 
@@ -555,7 +555,7 @@ When Code-RAG is populated, `gspl text2spl` automatically injects the top-k retr
 ### Basic usage
 
 ```bash
-gspl text2spl "summarize a document in three bullet points"
+spl-go text2spl "summarize a document in three bullet points"
 ```
 
 Output:
@@ -570,34 +570,34 @@ END
 ### Generation modes
 
 ```bash
-gspl text2spl "classify user intent" --mode prompt    # single PROMPT
-gspl text2spl "classify user intent" --mode workflow  # multi-step WORKFLOW
-gspl text2spl "classify user intent" --mode auto      # LLM decides (default)
+spl-go text2spl "classify user intent" --mode prompt    # single PROMPT
+spl-go text2spl "classify user intent" --mode workflow  # multi-step WORKFLOW
+spl-go text2spl "classify user intent" --mode auto      # LLM decides (default)
 ```
 
 ### Save to file
 
 ```bash
-gspl text2spl "translate email to French" -o translate.spl
+spl-go text2spl "translate email to French" -o translate.spl
 ```
 
 ### Generate and execute immediately
 
 ```bash
-gspl text2spl "say hello in three languages" --execute
+spl-go text2spl "say hello in three languages" --execute
 
 # With parameters
-gspl text2spl "translate text to Spanish" --execute -p text="Good morning"
+spl-go text2spl "translate text to Spanish" --execute -p text="Good morning"
 ```
 
 ### Override the compiler model
 
 ```bash
 # Use Ollama for compilation (free, no API key)
-gspl text2spl "draft a meeting summary" --adapter ollama -m qwen2.5-coder
+spl-go text2spl "draft a meeting summary" --adapter ollama -m qwen2.5-coder
 
 # Use Anthropic directly
-gspl text2spl "draft a meeting summary" --adapter anthropic -m claude-sonnet-4-6
+spl-go text2spl "draft a meeting summary" --adapter anthropic -m claude-sonnet-4-6
 ```
 
 ### Validation and retry
@@ -605,7 +605,7 @@ gspl text2spl "draft a meeting summary" --adapter anthropic -m claude-sonnet-4-6
 By default, `text2spl` validates the generated SPL by lexing and parsing it. If the LLM produces invalid syntax, the error is fed back for up to 2 correction attempts.
 
 ```bash
-gspl text2spl "my description" --no-validate    # skip validation
+spl-go text2spl "my description" --no-validate    # skip validation
 ```
 
 ### Config
@@ -628,7 +628,7 @@ Momagrid is a hub-and-spoke LAN inference grid. Multiple GPU nodes share a task 
 ### Architecture
 
 ```
-gspl run recipe.spl --adapter momagrid
+spl-go run recipe.spl --adapter momagrid
        │
        ▼
   Momagrid Hub  (port 9000)
@@ -657,7 +657,7 @@ mg join http://<hub-ip>:9000 --name cat --host 0.0.0.0 --port 9010
 
 ```bash
 export MOMAGRID_HUB_URL=http://192.168.0.184:9000
-gspl run recipe.spl --adapter momagrid -m gemma3
+spl-go run recipe.spl --adapter momagrid -m gemma3
 ```
 
 ### Benchmark results (2026-03-27, Python runtime)
@@ -668,19 +668,19 @@ gspl run recipe.spl --adapter momagrid -m gemma3
 | 2-GPU (Momagrid) | 2× GTX 1080 Ti | 5 | 37/37 | 660.4s | 1.8× |
 | 3-GPU (Momagrid) | 3× GTX 1080 Ti | 10 | 37/37 | 383.7s | **3.1×** |
 
-The Go runtime targets identical results. Benchmark with `gspl` pending 5-node grid (Monday 2026-03-30).
+The Go runtime targets identical results. Benchmark with `spl-go` pending 5-node grid (Monday 2026-03-30).
 
 ---
 
 ## 12. Benchmarking
 
-Since `spl` (Python) and `gspl` (Go) accept identical `.spl` files and flags, side-by-side comparison is trivial.
+Since `spl` (Python) and `spl-go` (Go) accept identical `.spl` files and flags, side-by-side comparison is trivial.
 
 ### Single recipe
 
 ```bash
 time spl  run recipe.spl --adapter ollama -m gemma3
-time gspl run recipe.spl --adapter ollama -m gemma3
+time spl-go run recipe.spl --adapter ollama -m gemma3
 ```
 
 ### Full cookbook
@@ -689,7 +689,7 @@ time gspl run recipe.spl --adapter ollama -m gemma3
 # Python runtime
 time python run_all.py --adapter ollama
 
-# Go runtime — alias spl to gspl for the run
+# Go runtime — alias spl to spl-go for the run
 alias spl=~/bin/spl-go
 time python run_all.py --adapter ollama
 unalias spl
@@ -697,10 +697,10 @@ unalias spl
 
 ### Reporting a divergence
 
-If a recipe passes `spl` but fails `gspl`, file a bug with:
+If a recipe passes `spl` but fails `spl-go`, file a bug with:
 - The `.spl` file content
 - Adapter and model used
-- Output of both `spl run` and `gspl run`
+- Output of both `spl run` and `spl-go run`
 
 Divergences are bugs in the Go port, not design choices.
 
@@ -708,17 +708,17 @@ Divergences are bugs in the Go port, not design choices.
 
 ## 13. Known Limitations
 
-When `gspl` encounters an unsupported construct, it prints a clear warning to stderr and continues — it does not crash.
+When `spl-go` encounters an unsupported construct, it prints a clear warning to stderr and continues — it does not crash.
 
 ```
-WARNING: [feature] not fully supported in gspl (Go runtime).
+WARNING: [feature] not fully supported in spl-go (Go runtime).
 Use 'spl' (Python) for this feature. See ROADMAP in docs/DESIGN.md
 ```
 
 | Feature | Workaround |
 |---|---|
 | `STORAGE()` multi-backend (DuckDB, Postgres) | Use `STORE @var IN memory.key` instead |
-| `RAG QUERY` in PROMPT body | Run `gspl doc-rag query`, pass result as parameter |
+| `RAG QUERY` in PROMPT body | Run `spl-go doc-rag query`, pass result as parameter |
 | Adapters: openai, google, openrouter, deepseek, bedrock, azure, vertex | Use Python `spl` |
 | Accurate token counting | Go uses chars/4 estimate; Python `spl` has exact counts |
 | Optimizer / parallel execution plans | Go executes statements sequentially |

@@ -1,6 +1,6 @@
 # SPL20.go — Port Roadmap
 
-_Last updated: 2026-03-28_
+_Last updated: 2026-03-28 (evening)_
 
 This document tracks what has been ported from the Python implementation
 (`digital-duck/SPL20`) to the Go runtime (`digital-duck/SPL20.go`), what is
@@ -34,6 +34,9 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] `anthropic` — Anthropic Claude API
 - [x] `claude_cli` — Claude Code CLI (subscription billing, $0/call)
 - [x] `openrouter` — OpenRouter (100+ models, 3-pass JSON parser, reasoning model fallback)
+- [x] `openai` — OpenAI API (gpt-4o, o1, o3 family)
+- [x] `deepseek` — DeepSeek API, reasoning model fallback
+- [x] `qwen` — Alibaba Cloud DashScope (qwen-plus, qwen-max, qwen2.5-* family)
 
 ### RAG
 - [x] ChromaDB REST client + Ollama embedding foundation (`internal/rag/chroma.go`)
@@ -48,17 +51,27 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] Safety caps (`max_llm_calls`, `max_total_tokens`)
 - [x] `text2spl`, `code_rag`, `doc_rag` config sections
 
+### Runtime internals
+- [x] `tokencount` — model-aware chars/token ratio (claude=3.5, gpt=4.0, gemini=3.8, llama=3.5)
+- [x] `analyzer` — semantic analysis: duplicate names, exception type validation, temperature/budget bounds
+- [x] `functions` — FunctionRegistry: builtins (summarize, list_*, file I/O) + user-defined `CREATE FUNCTION` + `CALL`
+- [x] Goroutine pool — parallel execution of independent workflow steps via `--workers N`
+- [x] `WorkflowState` mutex — thread-safe variable reads/writes for concurrent steps
+
 ### CLI
-- [x] `gspl run` — execute SPL programs
-- [x] `gspl validate` — syntax check
-- [x] `gspl explain` — structure summary
-- [x] `gspl adapters` — list adapters + env vars
-- [x] `gspl version`
-- [x] `gspl config show/get/set/path`
-- [x] `gspl memory list/get/set/delete` (SQLite)
-- [x] `gspl doc-rag add/query/count`
-- [x] `gspl code-rag import/add/query/count`
-- [x] `gspl text2spl` — with `--mode`, `-o`, `--execute`, `--no-code-rag`, `--no-validate`
+- [x] `spl-go run` — execute SPL programs
+- [x] `spl-go run --workers N` — parallel step execution via goroutine pool
+- [x] `spl-go validate` — syntax check + semantic analysis warnings
+- [x] `spl-go explain` — structure summary with analysis results
+- [x] `spl-go adapters` — list adapters + env vars
+- [x] `spl-go version`
+- [x] `spl-go init` — create `~/.spl/` and default `config.yaml`
+- [x] `spl-go config show/get/set/path`
+- [x] `spl-go memory list/get/set/delete` (SQLite)
+- [x] `spl-go cache list/clear` (SQLite prompt_cache)
+- [x] `spl-go doc-rag add/query/count`
+- [x] `spl-go code-rag import/add/query/count/export/parse-log`
+- [x] `spl-go text2spl` — with `--mode`, `-o`, `--execute`, `--no-code-rag`, `--no-validate`
 
 ---
 
@@ -66,51 +79,14 @@ Mark items `[ ]` → `[x]` as you complete them.
 
 Mark `[ ]` → `[x]` and I will implement.
 
-### Group 1 — Adapters (low effort, high value)
+### Cloud provider adapters — implement when Momagrid WAN deployment is funded
 
-`openai`, `deepseek`, `qwen` all use the OpenAI-compatible `/chat/completions` protocol —
-trivial to add once `openrouter` is done.
+All three exist in the Python implementation (`spl/adapters/`). Port to Go when
+Momagrid is deployed to cloud infrastructure (AWS, GCP, Azure).
 
-- [x] `openai` — OpenAI API (`OPENAI_API_KEY`)
-- [x] `deepseek` — DeepSeek API, OpenAI-compatible (`DEEPSEEK_API_KEY`)
-- [x] `qwen` — Alibaba Cloud Qwen, OpenAI-compatible (`QWEN_API_KEY`)
-- [ ] `google` — Google Generative AI REST (different schema, medium effort)
-- [ ] `azure_openai` — OpenAI-compatible + deployment name in URL + API version header
-- [ ] `bedrock` — AWS SigV4 signing required (high effort — see Deferred)
-- [ ] `vertex` — GCP OAuth2 required (high effort — see Deferred)
-
-### Group 2 — Runtime internals
-
-- [x] `token_counter` — model-aware chars/token ratio (claude=3.5, gpt=4.0, gemini=3.8, llama=3.5); improves cost accuracy across all adapters
-- [x] `analyzer` — semantic analysis: variable scope, undefined references, exception type validation; improves `gspl validate`
-- [x] `functions` — `FunctionRegistry`: user-defined SPL functions (`CREATE FUNCTION`) + `CALL` statement execution
-- [x] `explain` — richer `gspl explain` output: execution plan, CTE fan-outs, estimated LLM calls (needs `analyzer` first)
-- [x] `optimizer` — execution plan builder (prerequisite for parallel step execution)
-- [x] `ir` — intermediate representation (required by `optimizer`)
-
-### Group 3 — CLI commands (low effort, storage already in place)
-
-- [x] `gspl init` — create `~/.spl/` and write default `config.yaml`
-- [x] `gspl cache list` — list cached prompts from `prompt_cache` SQLite table
-- [x] `gspl cache clear` — clear all cached prompts
-- [x] `gspl code-rag export -o file.jsonl` — export all pairs as JSONL for fine-tuning
-- [x] `gspl code-rag parse-log <run.md>` — extract (description, SPL) pairs from `run_all.py` logs
-
----
-
-## Suggested implementation order
-
-```
-1. openai + deepseek + qwen adapters      ~1 hr    — unlocks most cloud models
-2. token_counter                          ~30 min  — better cost accuracy everywhere
-3. gspl init + cache list/clear           ~30 min  — CLI completeness
-4. code-rag export + parse-log            ~30 min  — useful for fine-tuning
-5. analyzer                               ~2-3 hrs — richer gspl validate
-6. functions (FunctionRegistry + CALL)    ~2-3 hrs — CALL statement support
-7. google + azure_openai adapters         ~2 hrs   — after openai is done
-8. explain (richer output)                ~1 hr    — needs analyzer
-9. optimizer + IR                         future   — parallel execution
-```
+- [ ] `google` — Google Generative AI SDK / Gemini (`GOOGLE_API_KEY`)
+- [ ] `azure_openai` — Azure OpenAI (`AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY`)
+- [ ] `bedrock` — AWS Bedrock Converse API (AWS credentials: env / profile / IAM role; supports Claude, Llama, Nova, cross-region inference profiles)
 
 ---
 
@@ -118,7 +94,7 @@ trivial to add once `openrouter` is done.
 
 5-node Momagrid grid (4× GTX 1080 Ti + 1× RTX 4060 8 GB):
 
-- [ ] Run full 40-recipe cookbook with `gspl` + `--adapter momagrid`
+- [ ] Run full 40-recipe cookbook with `spl-go` + `--adapter momagrid`
 - [ ] Compare wall-clock vs Python `spl` baseline (1197.6s single-node)
 - [ ] Record pass rate — any failure = Go port bug to fix
 
@@ -128,7 +104,6 @@ trivial to add once `openrouter` is done.
 
 | Feature | Reason |
 |---|---|
-| `bedrock` adapter | AWS SigV4 credential signing — complex, low priority |
-| `vertex` adapter | GCP OAuth2 — complex, low priority |
+| `vertex` adapter | GCP Vertex AI OAuth2 — superseded by `google` adapter via API key |
 | Streamlit UI (`spl ui`) | No Go equivalent planned |
-| `asyncio` concurrency | Go uses sync executor; goroutine pool is a future option |
+| `asyncio` concurrency | **Done** — replaced with goroutine pool (`--workers N`) |
