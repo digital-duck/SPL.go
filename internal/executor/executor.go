@@ -612,7 +612,21 @@ func (e *Executor) executeStatement(ctx context.Context, stmt ast.Stmt, state *W
 		}
 		return nil
 	case *ast.StorageAssignStatement:
-		warnNotImplemented("StorageAssignStatement (@memory['key'] := expr — persistent storage)")
+		key := e.evalExpression(s.Key, state)
+		value := e.evalExpression(s.Value, state)
+		varVal := state.getVar(s.StorageVar)
+		// Try updating an existing JSON dict (MAP variable)
+		var obj map[string]interface{}
+		if json.Unmarshal([]byte(varVal), &obj) == nil {
+			obj[key] = value
+			b, _ := json.Marshal(obj)
+			state.setVar(s.StorageVar, string(b))
+			return nil
+		}
+		// Variable is not a MAP yet — initialize as a new MAP
+		newObj := map[string]interface{}{key: value}
+		b, _ := json.Marshal(newObj)
+		state.setVar(s.StorageVar, string(b))
 		return nil
 	case *ast.CallStatement:
 		return e.execCall(ctx, s, state)
@@ -1308,9 +1322,49 @@ func (e *Executor) evalExpression(expr ast.Expr, state *WorkflowState) string {
 		}
 		return ""
 
+	case *ast.MapLiteral:
+		obj := make(map[string]string, len(ex.Pairs))
+		for _, pair := range ex.Pairs {
+			k := e.evalExpression(pair.Key, state)
+			v := e.evalExpression(pair.Value, state)
+			obj[k] = v
+		}
+		b, _ := json.Marshal(obj)
+		return string(b)
+
 	case *ast.StorageSubscript:
-		warnNotImplemented(fmt.Sprintf("StorageSubscript (@%s['key'] — persistent storage read)", ex.StorageVar))
-		return state.getVar(ex.StorageVar)
+		key := e.evalExpression(ex.Key, state)
+		varVal := state.getVar(ex.StorageVar)
+		// Try JSON dict (MAP variable)
+		var obj map[string]interface{}
+		if json.Unmarshal([]byte(varVal), &obj) == nil {
+			if v, ok := obj[key]; ok {
+				switch vt := v.(type) {
+				case string:
+					return vt
+				default:
+					b, _ := json.Marshal(vt)
+					return string(b)
+				}
+			}
+			return ""
+		}
+		// Try JSON list (LIST variable — integer index)
+		var arr []interface{}
+		if json.Unmarshal([]byte(varVal), &arr) == nil {
+			idx, err := strconv.Atoi(key)
+			if err == nil && idx >= 0 && idx < len(arr) {
+				switch vt := arr[idx].(type) {
+				case string:
+					return vt
+				default:
+					b, _ := json.Marshal(vt)
+					return string(b)
+				}
+			}
+			return ""
+		}
+		return ""
 
 	case *ast.DottedName:
 		return state.getVar(ex.FullName())

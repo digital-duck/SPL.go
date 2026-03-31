@@ -2269,6 +2269,48 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 		return &ast.ListLiteral{Elements: elements}, nil
 	}
 
+	// Map literal: {} or {'key': value, ...}
+	if tok.Type == lexer.LBRACE {
+		p.advance() // consume {
+		var pairs []ast.MapPair
+		if !p.check(lexer.RBRACE) {
+			key, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			if _, err = p.expect(lexer.COLON); err != nil {
+				return nil, err
+			}
+			val, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			pairs = append(pairs, ast.MapPair{Key: key, Value: val})
+			for p.check(lexer.COMMA) {
+				p.advance()
+				if p.check(lexer.RBRACE) {
+					break // trailing comma
+				}
+				key, err = p.parseExpression()
+				if err != nil {
+					return nil, err
+				}
+				if _, err = p.expect(lexer.COLON); err != nil {
+					return nil, err
+				}
+				val, err = p.parseExpression()
+				if err != nil {
+					return nil, err
+				}
+				pairs = append(pairs, ast.MapPair{Key: key, Value: val})
+			}
+		}
+		if _, err := p.expect(lexer.RBRACE); err != nil {
+			return nil, err
+		}
+		return &ast.MapLiteral{Pairs: pairs}, nil
+	}
+
 	// Boolean literals
 	if tok.Type == lexer.TRUE {
 		p.advance()

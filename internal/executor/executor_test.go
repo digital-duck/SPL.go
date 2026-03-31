@@ -264,3 +264,108 @@ END`
 		_, _ = exec.ExecuteProgram(ctx, prog, params)
 	}
 }
+
+// ── MapLiteral, StorageSubscript, StorageAssignStatement ─────────────────────
+
+func TestMapLiteralEval(t *testing.T) {
+	src := `WORKFLOW test_map
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @m := {'lang': 'SPL', 'version': '2.0'}
+    @result := @m
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	// result should be a JSON object string
+	if !strings.Contains(r.CommittedValue, "SPL") {
+		t.Errorf("expected JSON map with 'SPL', got: %s", r.CommittedValue)
+	}
+	if !strings.Contains(r.CommittedValue, "lang") {
+		t.Errorf("expected key 'lang' in map, got: %s", r.CommittedValue)
+	}
+}
+
+func TestEmptyMapLiteral(t *testing.T) {
+	src := `WORKFLOW test_empty_map
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @m := {}
+    @result := @m
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "{}" {
+		t.Errorf("expected '{}', got: %s", r.CommittedValue)
+	}
+}
+
+func TestStorageSubscriptReadMap(t *testing.T) {
+	src := `WORKFLOW test_subscript
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @m := {'key': 'hello', 'other': 'world'}
+    @result := @m['key']
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "hello" {
+		t.Errorf("expected 'hello', got: %s", r.CommittedValue)
+	}
+}
+
+func TestStorageSubscriptReadList(t *testing.T) {
+	src := `WORKFLOW test_list_subscript
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @items := ['alpha', 'beta', 'gamma']
+    @result := @items['1']
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "beta" {
+		t.Errorf("expected 'beta', got: %s", r.CommittedValue)
+	}
+}
+
+func TestStorageAssignStatement(t *testing.T) {
+	src := `WORKFLOW test_storage_assign
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @m := {}
+    @m['name'] := 'SPL'
+    @m['year'] := '2026'
+    @result := @m['name']
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "SPL" {
+		t.Errorf("expected 'SPL', got: %s", r.CommittedValue)
+	}
+}
+
+func TestStorageAssignUpdatesExistingMap(t *testing.T) {
+	src := `WORKFLOW test_storage_update
+INPUT:  @unused TEXT
+OUTPUT: @result TEXT
+DO
+    @m := {'key': 'original'}
+    @m['key'] := 'updated'
+    @result := @m['key']
+    COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"unused": ""})
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "updated" {
+		t.Errorf("expected 'updated', got: %s", r.CommittedValue)
+	}
+}

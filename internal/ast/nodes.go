@@ -143,6 +143,20 @@ type ListLiteral struct {
 func (*ListLiteral) nodeTag() {}
 func (*ListLiteral) exprTag() {}
 
+// MapPair is a single key-value pair inside a MapLiteral.
+type MapPair struct {
+	Key   Expr
+	Value Expr
+}
+
+// MapLiteral represents {'key': value, ...} — a key/value map literal.
+type MapLiteral struct {
+	Pairs []MapPair
+}
+
+func (*MapLiteral) nodeTag() {}
+func (*MapLiteral) exprTag() {}
+
 // StorageSpec represents STORAGE(backend, path).
 type StorageSpec struct {
 	Backend string
