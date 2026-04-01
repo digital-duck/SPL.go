@@ -13,8 +13,9 @@
 9. [Code RAG](#9-code-rag)
 10. [text2spl — Generate SPL from Natural Language](#10-text2spl)
 11. [Momagrid — Distributed Inference](#11-momagrid)
-12. [Side-by-Side Benchmarking with Python spl](#12-benchmarking)
-13. [Known Limitations](#13-known-limitations)
+12. [Go-Native vs. Python](#12-go-native-vs-python)
+13. [Testing and Benchmarking](#13-testing-and-benchmarking)
+14. [Known Limitations](#14-known-limitations)
 
 ---
 
@@ -45,7 +46,7 @@ spl-go version
 # spl-go — SPL 2.0 Go runtime v0.1.0
 
 spl-go adapters
-# echo, ollama, momagrid, anthropic, claude_cli
+# echo, ollama, momagrid, anthropic, claude_cli, openrouter, openai, deepseek, qwen
 ```
 
 ### Optional services
@@ -672,59 +673,65 @@ The Go runtime targets identical results. Benchmark with `spl-go` pending 5-node
 
 ---
 
-## 12. Benchmarking
+## 12. Go-Native vs. Python
 
-Since `spl` (Python) and `spl-go` (Go) accept identical `.spl` files and flags, side-by-side comparison is trivial.
+The Go implementation (`spl-go`) and the Python implementation (`spl`) aim for feature parity, but have different architectural priorities:
 
-### Single recipe
+| Feature | Go Runtime (`spl-go`) | Python Runtime (`spl`) |
+|---|---|---|
+| **Deployment** | Single static binary (no dependencies) | Python environment + `pip` dependencies |
+| **Concurrency** | Goroutines for parallel steps | `asyncio` loop |
+| **Persistence** | SQLite (`~/.spl/memory.db`) | JSON (`~/.spl/memory.json`) |
+| **Cold Start** | Extremely fast (<10ms) | Slow (0.5s - 1.5s) |
+| **Planning** | Direct execution | Advanced Execution Plans + Optimizer |
+| **Streaming** | Not supported (by design) | Optional streaming for some adapters |
+| **Adapters** | Core set (Ollama, Anthropic, Momagrid, etc.) | Broadest set (Bedrock, Azure, Google, etc.) |
 
-```bash
-time spl  run recipe.spl --adapter ollama -m gemma3
-time spl-go run recipe.spl --adapter ollama -m gemma3
-```
-
-### Full cookbook
-
-```bash
-# Python runtime
-time python run_all.py --adapter ollama
-
-# Go runtime — alias spl to spl-go for the run
-alias spl=~/bin/spl-go
-time python run_all.py --adapter ollama
-unalias spl
-```
-
-### Reporting a divergence
-
-If a recipe passes `spl` but fails `spl-go`, file a bug with:
-- The `.spl` file content
-- Adapter and model used
-- Output of both `spl run` and `spl-go run`
-
-Divergences are bugs in the Go port, not design choices.
+### Go-Native Concurrency
+The Go runtime automatically parallelizes adjacent, independent `GENERATE` or `ASSIGN` statements in a `WORKFLOW` using goroutines. This maximizes throughput for I/O-bound LLM calls without requiring complex `async/await` syntax in the SPL source.
 
 ---
 
-## 13. Known Limitations
+## 13. Testing and Benchmarking
+
+`spl-go` is designed for high-performance orchestration. You can verify its behavior and performance using the following methods:
+
+### Unit Tests
+```bash
+go test ./...
+```
+
+### Benchmarking the Runtime
+Run benchmarks to measure the orchestration overhead without LLM latency:
+```bash
+go test -bench=. -benchtime=5s ./internal/executor/
+```
+
+### Side-by-Side Benchmarking
+Compare `spl-go` against `spl` using the `echo` adapter (zero LLM latency):
+```bash
+time spl    run recipe.spl --adapter echo
+time spl-go run recipe.spl --adapter echo
+```
+
+For real-world latency comparison:
+```bash
+time spl    run recipe.spl --adapter ollama -m llama3.2
+time spl-go run recipe.spl --adapter ollama -m llama3.2
+```
+
+---
+
+## 14. Known Limitations
 
 When `spl-go` encounters an unsupported construct, it prints a clear warning to stderr and continues — it does not crash.
 
-```
-WARNING: [feature] not fully supported in spl-go (Go runtime).
-Use 'spl' (Python) for this feature. See ROADMAP in docs/DESIGN.md
-```
-
-| Feature | Workaround |
-|---|---|
-| `STORAGE()` multi-backend (DuckDB, Postgres) | Use `STORE @var IN memory.key` instead |
-| `RAG QUERY` in PROMPT body | Run `spl-go doc-rag query`, pass result as parameter |
-| Adapters: openai, google, openrouter, deepseek, bedrock, azure, vertex | Use Python `spl` |
-| Accurate token counting | Go uses chars/4 estimate; Python `spl` has exact counts |
-| Optimizer / parallel execution plans | Go executes statements sequentially |
-| Static analyzer (`spl analyze`) | Use Python `spl validate` |
-| Streamlit UI (`spl ui`) | Use Python `spl ui` |
-| Async / concurrent workflow steps | Use Python `spl` for asyncio workflows |
+| Feature | Status in Go | Workaround |
+|---|---|---|
+| `STORAGE()` multi-backend | ⚠️ Warning | Use `STORE @var IN memory.key` |
+| `RAG QUERY` in PROMPT | ⚠️ Warning | Use `WORKFLOW` with `RAG QUERY` step |
+| Streamlit UI | ❌ N/A | Use Python `spl ui` |
+| Accurate Tiktoken count | ⚠️ Approx | Go uses char/4 estimation |
 
 All items are on the roadmap — see [DESIGN.md](DESIGN.md).
 

@@ -1,6 +1,6 @@
 # SPL20.go — Port Roadmap
 
-_Last updated: 2026-03-28 (evening)_
+_Last updated: 2026-04-01 (afternoon)_
 
 This document tracks what has been ported from the Python implementation
 (`digital-duck/SPL20`) to the Go runtime (`digital-duck/SPL20.go`), what is
@@ -10,7 +10,7 @@ Mark items `[ ]` → `[x]` as you complete them.
 
 ---
 
-## Completed (as of 2026-03-28)
+## Completed (as of 2026-04-01)
 
 ### Core pipeline
 - [x] Lexer — all token types (100% parity with Python)
@@ -21,6 +21,8 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] Budget enforcement — `max_llm_calls`, `max_total_tokens`
 - [x] Stdlib — 47 functions including `trim_turns`
 - [x] Missing-feature warnings — stderr warnings instead of silent failures
+- [x] **Lightweight Planner** — pre-execution resource estimates (LLM calls, tokens, cost) via `--plan`
+- [x] **Idiomatic Error Aggregation** — `errors.Join` for multi-errors in parallel workflows
 
 ### Storage
 - [x] Memory store — SQLite-backed `~/.spl/memory.db` (`kv_store` + `prompt_cache`)
@@ -55,12 +57,13 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] `tokencount` — model-aware chars/token ratio (claude=3.5, gpt=4.0, gemini=3.8, llama=3.5)
 - [x] `analyzer` — semantic analysis: duplicate names, exception type validation, temperature/budget bounds
 - [x] `functions` — FunctionRegistry: builtins (summarize, list_*, file I/O) + user-defined `CREATE FUNCTION` + `CALL`
-- [x] Goroutine pool — parallel execution of independent workflow steps via `--workers N`
+- [x] **Dependency-Aware Parallelization** — improved grouping of non-adjacent independent workflow steps
 - [x] `WorkflowState` mutex — thread-safe variable reads/writes for concurrent steps
 
 ### CLI
 - [x] `spl-go run` — execute SPL programs
 - [x] `spl-go run --workers N` — parallel step execution via goroutine pool
+- [x] **`spl-go run --plan`** — show resource estimates before execution
 - [x] `spl-go validate` — syntax check + semantic analysis warnings
 - [x] `spl-go explain` — structure summary with analysis results
 - [x] `spl-go adapters` — list adapters + env vars
@@ -92,11 +95,13 @@ Momagrid is deployed to cloud infrastructure (AWS, GCP, Azure).
 
 ## Benchmark target (2026-03-30)
 
-5-node Momagrid grid (4× GTX 1080 Ti + 1× RTX 4060 8 GB):
+4-node Momagrid grid (3× GTX 1080 Ti + 1× RTX 4060 8 GB):
 
 - [ ] Run full 40-recipe cookbook with `spl-go` + `--adapter momagrid`
-- [ ] Compare wall-clock vs Python `spl` baseline (1197.6s single-node)
+- [ ] Compare wall-clock vs Python `spl` baseline (1197.6s single-node, 414s 4 nodes)
 - [ ] Record pass rate — any failure = Go port bug to fix
+
+see https://github.com/digital-duck/dd-arxiv/blob/main/docs/SPL20-arxiv.pdf
 
 ---
 

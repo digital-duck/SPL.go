@@ -17,6 +17,7 @@ import (
 
 var runParams []string
 var runWorkers int
+var runPlan bool
 
 var runCmd = &cobra.Command{
 	Use:   "run <file.spl> [KEY=VALUE...]",
@@ -70,6 +71,17 @@ Examples:
 			return fmt.Errorf("parse error in %q: %w", filename, err)
 		}
 
+		// Run Planner if requested
+		if runPlan {
+			planner := executor.NewPlanner(flagModel)
+			planResult := planner.Plan(program)
+			fmt.Println("PRE-EXECUTION PLAN")
+			fmt.Println(separator)
+			fmt.Print(planResult.Summary())
+			fmt.Println(separator)
+			fmt.Println()
+		}
+
 		// Select adapter
 		cfg, _ := config.Load()
 		adapterName := flagAdapter
@@ -118,6 +130,7 @@ Examples:
 func init() {
 	runCmd.Flags().StringArrayVarP(&runParams, "param", "p", nil, "Parameter as KEY=VALUE (repeatable)")
 	runCmd.Flags().IntVar(&runWorkers, "workers", 0, "Number of parallel workers for independent workflow steps (0 = sequential)")
+	runCmd.Flags().BoolVar(&runPlan, "plan", false, "Show pre-execution plan and resource estimates")
 }
 
 const separator = "============================================================"

@@ -452,7 +452,7 @@ func (e *Executor) executeBody(ctx context.Context, stmts []ast.Stmt, state *Wor
 		return nil
 	}
 
-	// Parallel execution: group independent adjacent generate/assignment statements
+	// Dependency-aware parallel execution
 	i := 0
 	for i < len(stmts) {
 		if state.Committed {
@@ -460,50 +460,59 @@ func (e *Executor) executeBody(ctx context.Context, stmts []ast.Stmt, state *Wor
 		}
 		stmt := stmts[i]
 
-		// Check if this statement is parallelizable
-		if isParallelizable(stmt) {
-			// Collect a batch of independent statements
-			batch := []ast.Stmt{stmt}
-			assignedVars := assignedVariables(stmt)
-
-			j := i + 1
-			for j < len(stmts) && isParallelizable(stmts[j]) {
-				// Check if stmts[j] references any variable assigned so far in this batch
-				if referencesAny(stmts[j], assignedVars) {
-					break
-				}
-				// Merge assigned vars
-				for v := range assignedVariables(stmts[j]) {
-					assignedVars[v] = true
-				}
-				batch = append(batch, stmts[j])
-				j++
-			}
-
-			if len(batch) == 1 {
-				// No parallelism benefit; run sequentially
-				if err := e.executeStatement(ctx, batch[0], state); err != nil {
-					return err
-				}
-			} else {
-				// Run batch in parallel
-				tasks := make([]func(context.Context) error, len(batch))
-				for k, s := range batch {
-					s := s // capture
-					tasks[k] = func(ctx context.Context) error {
-						return e.executeStatement(ctx, s, state)
-					}
-				}
-				if err := runParallel(ctx, tasks); err != nil {
-					return err
-				}
-			}
-			i = j
-		} else {
+		// If the current statement isn't parallelizable, run it sequentially
+		if !isParallelizable(stmt) {
 			if err := e.executeStatement(ctx, stmt, state); err != nil {
 				return err
 			}
 			i++
+			continue
+		}
+
+		// Look ahead to find a batch of independent parallelizable statements
+		batch := []ast.Stmt{stmt}
+		assignedInBatch := assignedVariables(stmt)
+		
+		j := i + 1
+		for j < len(stmts) {
+			nextStmt := stmts[j]
+			
+			// Stop if next statement is not parallelizable
+			if !isParallelizable(nextStmt) {
+				break
+			}
+			
+			// Stop if next statement references any variable assigned in the current batch
+			if referencesAny(nextStmt, assignedInBatch) {
+				break
+			}
+			
+			// Add to batch and update tracked assignments
+			batch = append(batch, nextStmt)
+			for v := range assignedVariables(nextStmt) {
+				assignedInBatch[v] = true
+			}
+			j++
+		}
+
+		if len(batch) == 1 {
+			if err := e.executeStatement(ctx, batch[0], state); err != nil {
+				return err
+			}
+			i++
+		} else {
+			// Run batch in parallel
+			tasks := make([]func(context.Context) error, len(batch))
+			for k, s := range batch {
+				s := s // capture
+				tasks[k] = func(ctx context.Context) error {
+					return e.executeStatement(ctx, s, state)
+				}
+			}
+			if err := runParallel(ctx, tasks); err != nil {
+				return err
+			}
+			i = j
 		}
 	}
 	return nil

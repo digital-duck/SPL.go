@@ -2,12 +2,13 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
 // runParallel runs a batch of independent tasks concurrently.
 // Each task is a func(ctx) error.
-// Returns the first non-nil error encountered, or nil if all succeed.
+// Returns an aggregated error using errors.Join if any task fails.
 // Respects context cancellation: if one task fails, remaining tasks see a cancelled context.
 func runParallel(ctx context.Context, tasks []func(context.Context) error) error {
 	if len(tasks) == 0 {
@@ -38,11 +39,16 @@ func runParallel(ctx context.Context, tasks []func(context.Context) error) error
 	wg.Wait()
 	close(errCh)
 
-	// Return the first error if any
+	// Collect and join all non-nil errors
+	var errs []error
 	for err := range errCh {
 		if err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
 }
