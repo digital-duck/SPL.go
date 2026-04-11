@@ -1,4 +1,7 @@
-# SPL20.go — SPL 2.0 Go Runtime
+# SPL20.go — SPL Go Runtime
+
+- rename SPL20.go to SPL.go
+- port SPL v1.0, v2.0, v3.0 into Go-lang
 
 **spl-go** is the Go implementation of [SPL 2.0](https://github.com/digital-duck/SPL20) (Semantic Prompt Language), a declarative, SQL-inspired language for LLM-powered agentic workflows.
 
