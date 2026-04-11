@@ -80,6 +80,8 @@ func (p *Parser) parseStatement() (ast.Stmt, error) {
 		return p.parseRetryStatement()
 	case lexer.RAISE:
 		return p.parseRaiseStatement()
+	case lexer.IMPORT:
+		return p.parseImportStatement()
 	case lexer.CALL:
 		return p.parseCallStatement()
 	case lexer.LOGGING:
@@ -1291,7 +1293,7 @@ func (p *Parser) parseWorkflowParam() (ast.Parameter, error) {
 	paramType := ""
 	var defaultValue ast.Expr
 
-	if p.check(lexer.IDENTIFIER) {
+	if p.checkAny(lexer.IDENTIFIER, lexer.IMAGE, lexer.AUDIO, lexer.VIDEO) {
 		if strings.ToUpper(p.current().Value) == "STORAGE" {
 			p.advance()
 			paramType = "STORAGE"
@@ -1314,7 +1316,18 @@ func (p *Parser) parseWorkflowParam() (ast.Parameter, error) {
 				defaultValue = &ast.StorageSpec{Backend: backendTok.Value, Path: pathTok.Value}
 			}
 		} else {
-			paramType = p.advance().Value
+			// Normalize SPL 3.0 media type keywords to uppercase strings
+			tok := p.advance()
+			switch tok.Type {
+			case lexer.IMAGE:
+				paramType = "IMAGE"
+			case lexer.AUDIO:
+				paramType = "AUDIO"
+			case lexer.VIDEO:
+				paramType = "VIDEO"
+			default:
+				paramType = tok.Value
+			}
 		}
 	}
 
@@ -1983,9 +1996,13 @@ func (p *Parser) parseGenerateIntoStatement() (*ast.GenerateIntoStatement, error
 // CALL Statement
 // =============================================================================
 
-func (p *Parser) parseCallStatement() (*ast.CallStatement, error) {
+func (p *Parser) parseCallStatement() (ast.Stmt, error) {
 	if _, err := p.expect(lexer.CALL); err != nil {
 		return nil, err
+	}
+	// SPL 3.0: CALL PARALLEL ... END
+	if p.check(lexer.PARALLEL) {
+		return p.parseCallParallelBody()
 	}
 	procNameTok, err := p.expect(lexer.IDENTIFIER)
 	if err != nil {
@@ -2551,6 +2568,12 @@ func (p *Parser) expectIdentifierOrKeyword() (lexer.Token, error) {
 		lexer.CALL:        true,
 		lexer.DEFAULT:     true,
 		lexer.INTO:        true,
+		// SPL 3.0
+		lexer.IMPORT:   true,
+		lexer.PARALLEL: true,
+		lexer.IMAGE:    true,
+		lexer.AUDIO:    true,
+		lexer.VIDEO:    true,
 	}
 	if keywordAsIdent[tok.Type] {
 		return p.advance(), nil
@@ -2559,6 +2582,106 @@ func (p *Parser) expectIdentifierOrKeyword() (lexer.Token, error) {
 		Message: fmt.Sprintf("Expected identifier, got %d (%q)", tok.Type, tok.Value),
 		Token:   tok,
 	}
+}
+
+// =============================================================================
+// SPL 3.0: IMPORT Statement
+// =============================================================================
+
+func (p *Parser) parseImportStatement() (*ast.ImportStatement, error) {
+	if _, err := p.expect(lexer.IMPORT); err != nil {
+		return nil, err
+	}
+	pathTok, err := p.expect(lexer.STRING)
+	if err != nil {
+		return nil, err
+	}
+	return &ast.ImportStatement{Path: pathTok.Value}, nil
+}
+
+// =============================================================================
+// SPL 3.0: CALL PARALLEL Statement
+// =============================================================================
+
+// parseCallParallelBody parses the body of a CALL PARALLEL block.
+// Called after CALL has been consumed; PARALLEL is consumed here.
+//
+// Syntax:
+//
+//	CALL PARALLEL
+//	  workflow_a(@x, @y) INTO @result_a,
+//	  workflow_b(@z)     INTO @result_b
+//	END
+//
+// Commas between branches always appear AFTER the INTO clause (or after the
+// closing paren when INTO is absent), so argument list parsing is identical to
+// a regular CALL — no ambiguity.
+func (p *Parser) parseCallParallelBody() (*ast.CallParallelStatement, error) {
+	if _, err := p.expect(lexer.PARALLEL); err != nil {
+		return nil, err
+	}
+
+	var branches []ast.CallBranch
+	for !p.checkAny(lexer.END, lexer.EOF) {
+		procNameTok, err := p.expect(lexer.IDENTIFIER)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = p.expect(lexer.LPAREN); err != nil {
+			return nil, err
+		}
+
+		// Parse argument list — normal comma-separated args until ')'
+		var arguments []ast.Expr
+		if !p.check(lexer.RPAREN) {
+			arg, err := p.parseCallArgument()
+			if err != nil {
+				return nil, err
+			}
+			arguments = append(arguments, arg)
+			for p.check(lexer.COMMA) {
+				p.advance()
+				arg, err = p.parseCallArgument()
+				if err != nil {
+					return nil, err
+				}
+				arguments = append(arguments, arg)
+			}
+		}
+		if _, err = p.expect(lexer.RPAREN); err != nil {
+			return nil, err
+		}
+
+		// Optional INTO @var
+		target := ""
+		if p.check(lexer.INTO) {
+			p.advance()
+			if _, err = p.expect(lexer.AT); err != nil {
+				return nil, err
+			}
+			targetTok, err := p.expectIdentifierOrKeyword()
+			if err != nil {
+				return nil, err
+			}
+			target = targetTok.Value
+		}
+
+		branches = append(branches, ast.CallBranch{
+			ProcedureName:  procNameTok.Value,
+			Arguments:      arguments,
+			TargetVariable: target,
+		})
+
+		// Optional comma separating branches
+		if p.check(lexer.COMMA) {
+			p.advance()
+		}
+	}
+
+	if _, err := p.expect(lexer.END); err != nil {
+		return nil, err
+	}
+	return &ast.CallParallelStatement{Branches: branches}, nil
 }
 
 func (p *Parser) readModelName() (string, error) {

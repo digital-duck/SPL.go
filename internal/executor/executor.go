@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"github.com/digital-duck/spl20go/internal/adapter"
 	"github.com/digital-duck/spl20go/internal/ast"
 	"github.com/digital-duck/spl20go/internal/functions"
+	"github.com/digital-duck/spl20go/internal/lexer"
+	"github.com/digital-duck/spl20go/internal/parser"
 	"github.com/digital-duck/spl20go/internal/stdlib"
 	"github.com/digital-duck/spl20go/internal/storage"
 )
@@ -160,15 +163,19 @@ const (
 	defaultMaxIterations  = 100
 )
 
-// Executor executes SPL 2.0 programs.
+// Executor executes SPL 2.0/3.0 programs.
 type Executor struct {
 	Adapter        adapter.Adapter
 	MaxLLMCalls    int
 	MaxTotalTokens int
 	MaxWorkers     int // 0 = sequential, >0 = parallel workflow steps
+	// SourceDir is the directory of the top-level .spl file being executed.
+	// Used to resolve IMPORT paths relative to the calling file.
+	SourceDir      string
 	Tools          map[string]func(args []string) string
 	Functions      map[string]*ast.CreateFunctionStatement
 	Procedures     map[string]*ast.ProcedureStatement
+	Workflows      map[string]*ast.WorkflowStatement
 	Registry       *functions.Registry
 }
 
@@ -182,6 +189,7 @@ func New(a adapter.Adapter) *Executor {
 		Tools:          make(map[string]func(args []string) string),
 		Functions:      make(map[string]*ast.CreateFunctionStatement),
 		Procedures:     make(map[string]*ast.ProcedureStatement),
+		Workflows:      make(map[string]*ast.WorkflowStatement),
 		Registry:       functions.New(),
 	}
 }
@@ -192,16 +200,9 @@ func (e *Executor) ExecuteProgram(ctx context.Context, program *ast.Program, par
 		params = make(map[string]string)
 	}
 
-	// Register functions and procedures first
-	for _, stmt := range program.Statements {
-		switch s := stmt.(type) {
-		case *ast.CreateFunctionStatement:
-			e.Functions[s.Name] = s
-			e.Registry.RegisterFunction(s)
-		case *ast.ProcedureStatement:
-			e.Procedures[s.Name] = s
-			e.Registry.RegisterProcedure(s)
-		}
+	// Registration pass: process IMPORTs and register all definitions before execution.
+	if err := e.registerProgram(ctx, program); err != nil {
+		return nil, err
 	}
 
 	var results []interface{}
@@ -219,11 +220,83 @@ func (e *Executor) ExecuteProgram(ctx context.Context, program *ast.Program, par
 				return results, err
 			}
 			results = append(results, res)
-		case *ast.CreateFunctionStatement, *ast.ProcedureStatement:
-			// Already registered above; skip execution
+		case *ast.CreateFunctionStatement, *ast.ProcedureStatement, *ast.ImportStatement:
+			// Already handled in registration pass; skip execution.
 		}
 	}
 	return results, nil
+}
+
+// registerProgram processes IMPORT statements and registers all definitions
+// (CREATE FUNCTION, PROCEDURE, WORKFLOW) found in the program and its imports.
+func (e *Executor) registerProgram(ctx context.Context, program *ast.Program) error {
+	for _, stmt := range program.Statements {
+		switch s := stmt.(type) {
+		case *ast.ImportStatement:
+			if err := e.execImport(ctx, s); err != nil {
+				return err
+			}
+		case *ast.CreateFunctionStatement:
+			e.Functions[s.Name] = s
+			e.Registry.RegisterFunction(s)
+		case *ast.ProcedureStatement:
+			e.Procedures[s.Name] = s
+			e.Registry.RegisterProcedure(s)
+		case *ast.WorkflowStatement:
+			e.Workflows[s.Name] = s
+		}
+	}
+	return nil
+}
+
+// execImport loads an imported .spl file, parses it, and registers its
+// definitions into the executor. Path is resolved relative to SourceDir.
+func (e *Executor) execImport(_ context.Context, stmt *ast.ImportStatement) error {
+	importPath := stmt.Path
+	if !filepath.IsAbs(importPath) && e.SourceDir != "" {
+		importPath = filepath.Join(e.SourceDir, importPath)
+	}
+
+	src, err := os.ReadFile(importPath)
+	if err != nil {
+		return fmt.Errorf("IMPORT %q: %w", stmt.Path, err)
+	}
+
+	l := lexer.New(string(src))
+	tokens, err := l.Tokenize()
+	if err != nil {
+		return fmt.Errorf("IMPORT %q: lexer error: %w", stmt.Path, err)
+	}
+
+	p := parser.New(tokens)
+	prog, err := p.Parse()
+	if err != nil {
+		return fmt.Errorf("IMPORT %q: parse error: %w", stmt.Path, err)
+	}
+
+	// Register definitions from the imported file (no top-level execution).
+	for _, s := range prog.Statements {
+		switch def := s.(type) {
+		case *ast.CreateFunctionStatement:
+			e.Functions[def.Name] = def
+			e.Registry.RegisterFunction(def)
+		case *ast.ProcedureStatement:
+			e.Procedures[def.Name] = def
+			e.Registry.RegisterProcedure(def)
+		case *ast.WorkflowStatement:
+			e.Workflows[def.Name] = def
+		case *ast.ImportStatement:
+			// Support transitive imports: resolve relative to the imported file's dir.
+			savedDir := e.SourceDir
+			e.SourceDir = filepath.Dir(importPath)
+			if err := e.execImport(nil, def); err != nil { //nolint:staticcheck
+				e.SourceDir = savedDir
+				return err
+			}
+			e.SourceDir = savedDir
+		}
+	}
+	return nil
 }
 
 // =============================================================================
@@ -639,6 +712,8 @@ func (e *Executor) executeStatement(ctx context.Context, stmt ast.Stmt, state *W
 		return nil
 	case *ast.CallStatement:
 		return e.execCall(ctx, s, state)
+	case *ast.CallParallelStatement:
+		return e.execCallParallel(ctx, s, state)
 	case *ast.DoBlock:
 		return e.execDoBlock(ctx, s, state)
 	case *ast.SelectIntoStatement:
@@ -943,7 +1018,45 @@ func (e *Executor) execCall(ctx context.Context, stmt *ast.CallStatement, state 
 		return nil
 	}
 
-	// 4. LLM fallback
+	// 4. Check registered workflows (SPL 3.0: CALL can dispatch workflows)
+	if wf, ok := e.Workflows[stmt.ProcedureName]; ok {
+		wfParams := make(map[string]string)
+		var namedArgs = make(map[string]ast.Expr)
+		var positionalArgs []ast.Expr
+		for _, arg := range stmt.Arguments {
+			if na, ok := arg.(*ast.NamedArg); ok {
+				namedArgs[na.Name] = na.Value
+			} else {
+				positionalArgs = append(positionalArgs, arg)
+			}
+		}
+		posIdx := 0
+		for _, param := range wf.Inputs {
+			if namedVal, ok := namedArgs[param.Name]; ok {
+				wfParams[param.Name] = e.evalExpression(namedVal, state)
+			} else if posIdx < len(positionalArgs) {
+				wfParams[param.Name] = e.evalExpression(positionalArgs[posIdx], state)
+				posIdx++
+			} else if param.DefaultValue != nil {
+				wfParams[param.Name] = e.evalExpression(param.DefaultValue, state)
+			}
+		}
+		res, err := e.ExecuteWorkflow(ctx, wf, wfParams)
+		if err != nil {
+			return err
+		}
+		state.TotalLLMCalls += res.TotalLLMCalls
+		state.TotalInputToks += res.TotalInputToks
+		state.TotalOutputToks += res.TotalOutputToks
+		state.TotalLatencyMs += res.TotalLatencyMs
+		state.TotalCostUSD += res.TotalCostUSD
+		if stmt.TargetVariable != "" && res.CommittedValue != "" {
+			state.setVar(stmt.TargetVariable, res.CommittedValue)
+		}
+		return nil
+	}
+
+	// 5. LLM fallback
 	var argsText []string
 	for _, arg := range stmt.Arguments {
 		argsText = append(argsText, e.evalExpression(arg, state))
@@ -976,6 +1089,83 @@ func (e *Executor) execDoBlock(ctx context.Context, stmt *ast.DoBlock, state *Wo
 		} else {
 			return err
 		}
+	}
+	return nil
+}
+
+// execCallParallel executes a CALL PARALLEL block (SPL 3.0).
+//
+// Each branch receives a read-only snapshot of the parent variable scope.
+// Results are written back to the parent only via each branch's INTO @var.
+// All branches run concurrently; the first failure cancels remaining branches.
+func (e *Executor) execCallParallel(ctx context.Context, stmt *ast.CallParallelStatement, state *WorkflowState) error {
+	// Snapshot the parent variable scope so branches read a consistent view.
+	state.mu.RLock()
+	snapshot := make(map[string]string, len(state.Variables))
+	for k, v := range state.Variables {
+		snapshot[k] = v
+	}
+	state.mu.RUnlock()
+
+	type branchResult struct {
+		targetVar string
+		value     string
+		calls     int
+		inToks    int
+		outToks   int
+		latencyMs float64
+		costUSD   float64
+	}
+
+	results := make([]branchResult, len(stmt.Branches))
+
+	tasks := make([]func(context.Context) error, len(stmt.Branches))
+	for i, branch := range stmt.Branches {
+		i, branch := i, branch // capture for goroutine
+		tasks[i] = func(ctx context.Context) error {
+			// Each branch gets its own WorkflowState seeded from the parent snapshot.
+			branchState := newWorkflowState(snapshot)
+
+			callStmt := &ast.CallStatement{
+				ProcedureName:  branch.ProcedureName,
+				Arguments:      branch.Arguments,
+				TargetVariable: branch.TargetVariable,
+			}
+			if err := e.execCall(ctx, callStmt, branchState); err != nil {
+				return fmt.Errorf("CALL PARALLEL branch %q: %w", branch.ProcedureName, err)
+			}
+
+			val := ""
+			if branch.TargetVariable != "" {
+				val = branchState.getVar(branch.TargetVariable)
+			}
+			results[i] = branchResult{
+				targetVar: branch.TargetVariable,
+				value:     val,
+				calls:     branchState.TotalLLMCalls,
+				inToks:    branchState.TotalInputToks,
+				outToks:   branchState.TotalOutputToks,
+				latencyMs: branchState.TotalLatencyMs,
+				costUSD:   branchState.TotalCostUSD,
+			}
+			return nil
+		}
+	}
+
+	if err := runParallel(ctx, tasks); err != nil {
+		return err
+	}
+
+	// Merge results back into parent state.
+	for _, r := range results {
+		if r.targetVar != "" {
+			state.setVar(r.targetVar, r.value)
+		}
+		state.TotalLLMCalls += r.calls
+		state.TotalInputToks += r.inToks
+		state.TotalOutputToks += r.outToks
+		state.TotalLatencyMs += r.latencyMs
+		state.TotalCostUSD += r.costUSD
 	}
 	return nil
 }

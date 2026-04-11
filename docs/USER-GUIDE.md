@@ -1,21 +1,22 @@
-# spl-go User Guide — SPL 2.0 Go Runtime
+# spl-go User Guide — SPL Go Runtime (v1 · v2 · v3)
 
 ## Table of Contents
 
 1. [Installation](#1-installation)
 2. [Your First SPL Program](#2-your-first-spl-program)
 3. [SPL Language Basics](#3-spl-language-basics)
-4. [Running Programs](#4-running-programs)
-5. [Adapters](#5-adapters)
-6. [Configuration](#6-configuration)
-7. [Memory Store](#7-memory-store)
-8. [Document RAG](#8-document-rag-doc-rag)
-9. [Code RAG](#9-code-rag)
-10. [text2spl — Generate SPL from Natural Language](#10-text2spl)
-11. [Momagrid — Distributed Inference](#11-momagrid)
-12. [Go-Native vs. Python](#12-go-native-vs-python)
-13. [Testing and Benchmarking](#13-testing-and-benchmarking)
-14. [Known Limitations](#14-known-limitations)
+4. [SPL 3.0 Features](#4-spl-30-features)
+5. [Running Programs](#5-running-programs)
+6. [Adapters](#6-adapters)
+7. [Configuration](#7-configuration)
+8. [Memory Store](#8-memory-store)
+9. [Document RAG](#9-document-rag-doc-rag)
+10. [Code RAG](#10-code-rag)
+11. [text2spl — Generate SPL from Natural Language](#11-text2spl)
+12. [Momagrid — Distributed Inference](#12-momagrid)
+13. [Go-Native vs. Python](#13-go-native-vs-python)
+14. [Testing and Benchmarking](#14-testing-and-benchmarking)
+15. [Known Limitations](#15-known-limitations)
 
 ---
 
@@ -93,7 +94,7 @@ questions or tasks you have. What can I do for you today?
 
 ## 3. SPL Language Basics
 
-SPL 2.0 is a declarative language inspired by SQL. Every program is one or more **statements**.
+SPL is a declarative language inspired by SQL, spanning three generations. Every program is one or more **statements**. `spl-go` supports SPL v1.0, v2.0, and v3.0 core features in a single binary.
 
 ### PROMPT — single LLM call
 
@@ -224,7 +225,113 @@ Values persist in `~/.spl/memory.db` (SQLite).
 
 ---
 
-## 4. Running Programs
+## 4. SPL 3.0 Features
+
+### IMPORT — compose workflows across files
+
+Split large programs into reusable libraries. `IMPORT` merges all `CREATE FUNCTION`, `PROCEDURE`, and `WORKFLOW` definitions from the target file into the calling program's registry.
+
+`lib/greet.spl`:
+```sql
+PROCEDURE greet(name text) RETURNS text
+DO
+  COMMIT name
+END
+```
+
+`main.spl`:
+```sql
+IMPORT 'lib/greet.spl'
+
+WORKFLOW hello
+  INPUT:  @name text DEFAULT 'world'
+  OUTPUT: @result text
+DO
+  CALL greet(@name) INTO @result
+  COMMIT @result
+END
+```
+
+```bash
+spl-go run main.spl name="Claude"
+```
+
+- Paths are resolved **relative to the calling `.spl` file's directory**
+- Transitive imports are supported: an imported file may itself `IMPORT`
+- Circular imports are not detected — avoid them
+
+### CALL PARALLEL — concurrent branch execution
+
+Run multiple workflows or procedures at the same time. Each branch receives a snapshot of the current variable scope; results are written back only via `INTO @var`.
+
+```sql
+WORKFLOW parallel_review
+  INPUT:  @code text
+  OUTPUT: @report text
+DO
+  CALL PARALLEL
+    review_style(@code)   INTO @style_feedback,
+    review_security(@code) INTO @security_feedback
+  END
+
+  -- Both @style_feedback and @security_feedback are now available
+  @report := concat(@style_feedback, "\n---\n", @security_feedback)
+  COMMIT @report
+END
+```
+
+Rules:
+- All branches run concurrently via goroutines
+- Each branch sees the parent scope as **read-only** (snapshot)
+- The only way a branch writes to the parent is via its `INTO @var`
+- If any branch fails, the remaining branches are cancelled
+- `INTO @var` is optional — branches without it are fire-and-observe (result ignored)
+
+### Multimodal type keywords — IMAGE, AUDIO, VIDEO
+
+SPL 3.0 introduces media types as first-class `INPUT`/`OUTPUT` parameter types. Values are strings — a file path or a `data:{mime};base64,...` URL. Full codec encoding (file → base64 content blocks) is planned for Phase 3.
+
+```sql
+WORKFLOW image_restyle
+  INPUT:
+    @photo  IMAGE  DEFAULT 'photo.jpg',
+    @style  text   DEFAULT 'oil painting',
+    @clip   AUDIO  DEFAULT 'narration.wav'
+  OUTPUT: @restyled IMAGE
+DO
+  -- @photo, @clip hold file paths or base64 data URLs
+  GENERATE analyse_and_prompt(@photo, @style) INTO @analysis
+  COMMIT @analysis
+END
+```
+
+```bash
+spl-go validate image_restyle.spl   -- parses and validates cleanly
+```
+
+### CALL dispatches WORKFLOW definitions
+
+`CALL` now resolves in this order:
+1. Built-in registry functions
+2. Stdlib functions
+3. Tools (registered at runtime)
+4. `PROCEDURE` definitions
+5. **`WORKFLOW` definitions** ← new in SPL 3.0
+
+This means you can call a workflow as a subroutine from another workflow or procedure:
+
+```sql
+WORKFLOW pipeline
+DO
+  CALL summarize(@doc) INTO @summary
+  CALL translate(@summary, language="fr") INTO @translated
+  COMMIT @translated
+END
+```
+
+---
+
+## 5. Running Programs
 
 ### Basic run
 
@@ -271,7 +378,7 @@ spl-go explain my_workflow.spl
 
 ---
 
-## 5. Adapters
+## 6. Adapters
 
 ### ollama (default)
 
@@ -357,7 +464,7 @@ spl-go run my.spl --adapter echo
 
 ---
 
-## 6. Configuration
+## 7. Configuration
 
 Config file: `~/.spl/config.yaml`
 
@@ -437,7 +544,7 @@ doc_rag:
 
 ---
 
-## 7. Memory Store
+## 8. Memory Store
 
 The memory store (`~/.spl/memory.db`) is a SQLite-backed key-value store shared across all workflow runs.
 
@@ -464,7 +571,7 @@ spl-go memory delete last_summary    # delete a key
 
 ---
 
-## 8. Document RAG (doc-rag)
+## 9. Document RAG (doc-rag)
 
 Doc-RAG stores and semantically searches document chunks. Use it to inject relevant context into prompts.
 
@@ -516,7 +623,7 @@ END
 
 ---
 
-## 9. Code RAG
+## 10. Code RAG
 
 Code-RAG stores (description, SPL source) pairs and retrieves the most relevant examples for `text2spl`.
 
@@ -549,7 +656,7 @@ When Code-RAG is populated, `spl-go text2spl` automatically injects the top-k re
 
 ---
 
-## 10. text2spl
+## 11. text2spl
 
 `text2spl` compiles a natural language description into valid SPL 2.0 source code using an LLM.
 
@@ -622,7 +729,7 @@ text2spl:
 
 ---
 
-## 11. Momagrid — Distributed Inference
+## 12. Momagrid — Distributed Inference
 
 Momagrid is a hub-and-spoke LAN inference grid. Multiple GPU nodes share a task queue. SPL recipes are dispatched to whichever node is free.
 
@@ -673,7 +780,7 @@ The Go runtime targets identical results. Benchmark with `spl-go` pending 5-node
 
 ---
 
-## 12. Go-Native vs. Python
+## 13. Go-Native vs. Python
 
 The Go implementation (`spl-go`) and the Python implementation (`spl`) aim for feature parity, but have different architectural priorities:
 
@@ -685,14 +792,14 @@ The Go implementation (`spl-go`) and the Python implementation (`spl`) aim for f
 | **Cold Start** | Extremely fast (<10ms) | Slow (0.5s - 1.5s) |
 | **Planning** | Direct execution | Advanced Execution Plans + Optimizer |
 | **Streaming** | Not supported (by design) | Optional streaming for some adapters |
-| **Adapters** | Core set (Ollama, Anthropic, Momagrid, etc.) | Broadest set (Bedrock, Azure, Google, etc.) |
+| **Adapters** | Core set (Ollama, Anthropic, Momagrid, OpenAI, DeepSeek, Qwen, etc.) | Broadest set (Bedrock, Azure, Google, etc.) |
 
 ### Go-Native Concurrency
 The Go runtime automatically parallelizes adjacent, independent `GENERATE` or `ASSIGN` statements in a `WORKFLOW` using goroutines. This maximizes throughput for I/O-bound LLM calls without requiring complex `async/await` syntax in the SPL source.
 
 ---
 
-## 13. Testing and Benchmarking
+## 14. Testing and Benchmarking
 
 `spl-go` is designed for high-performance orchestration. You can verify its behavior and performance using the following methods:
 
@@ -722,7 +829,7 @@ time spl-go run recipe.spl --adapter ollama -m llama3.2
 
 ---
 
-## 14. Known Limitations
+## 15. Known Limitations
 
 When `spl-go` encounters an unsupported construct, it prints a clear warning to stderr and continues — it does not crash.
 
@@ -755,6 +862,8 @@ All items are on the roadmap — see [DESIGN.md](DESIGN.md).
 | `STORE @var IN memory.key` | Persist to SQLite memory |
 | `LOGGING "message"` | Write to SPL log |
 | `SELECT col FROM cte INTO @var` | Fan-out generation |
+| `IMPORT 'file.spl'` | Load definitions from another file (SPL 3.0) |
+| `CALL PARALLEL wf_a() INTO @x, wf_b() INTO @y END` | Concurrent branch execution (SPL 3.0) |
 
 ---
 

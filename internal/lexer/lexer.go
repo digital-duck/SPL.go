@@ -93,6 +93,13 @@ const (
 	ITERATIONS
 	OTHERS
 
+	// SPL 3.0 keywords
+	IMPORT
+	PARALLEL
+	IMAGE
+	AUDIO
+	VIDEO
+
 	// Literals
 	INTEGER
 	FLOAT
@@ -211,6 +218,12 @@ var keywords = map[string]TokenType{
 	"overflow":       OVERFLOW,
 	"iterations":     ITERATIONS,
 	"others":         OTHERS,
+	// SPL 3.0
+	"import":   IMPORT,
+	"parallel": PARALLEL,
+	"image":    IMAGE,
+	"audio":    AUDIO,
+	"video":    VIDEO,
 }
 
 // Token is a single lexical token.

@@ -201,3 +201,135 @@ func TestMissingSelectKeyword(t *testing.T) {
 func TestMissingWorkflowEnd(t *testing.T) {
 	mustFail(t, `WORKFLOW w DO @x := 'hello'`)
 }
+
+// ── SPL 3.0: IMPORT ───────────────────────────────────────────────────────────
+
+func TestImportStatement(t *testing.T) {
+	src := `IMPORT 'helpers.spl'`
+	prog := parse(t, src)
+	if len(prog.Statements) != 1 {
+		t.Fatalf("want 1 statement, got %d", len(prog.Statements))
+	}
+	imp, ok := prog.Statements[0].(*ast.ImportStatement)
+	if !ok {
+		t.Fatalf("want *ast.ImportStatement, got %T", prog.Statements[0])
+	}
+	if imp.Path != "helpers.spl" {
+		t.Errorf("want path 'helpers.spl', got %q", imp.Path)
+	}
+}
+
+func TestImportBeforeWorkflow(t *testing.T) {
+	src := `
+IMPORT 'lib/shared.spl'
+WORKFLOW main
+  INPUT: @topic text
+  OUTPUT: @result text
+DO
+  GENERATE summarize(@topic) INTO @result
+  COMMIT @result
+END`
+	prog := parse(t, src)
+	if len(prog.Statements) != 2 {
+		t.Fatalf("want 2 statements (IMPORT + WORKFLOW), got %d", len(prog.Statements))
+	}
+	if _, ok := prog.Statements[0].(*ast.ImportStatement); !ok {
+		t.Errorf("want first statement to be *ast.ImportStatement, got %T", prog.Statements[0])
+	}
+	if _, ok := prog.Statements[1].(*ast.WorkflowStatement); !ok {
+		t.Errorf("want second statement to be *ast.WorkflowStatement, got %T", prog.Statements[1])
+	}
+}
+
+// ── SPL 3.0: CALL PARALLEL ────────────────────────────────────────────────────
+
+func TestCallParallelStatement(t *testing.T) {
+	src := `
+WORKFLOW orchestrate
+  INPUT:  @code text
+  OUTPUT: @feedback text
+DO
+  CALL PARALLEL
+    review_code(@code) INTO @feedback,
+    test_code(@code)   INTO @test_result
+  END
+  COMMIT @feedback
+END`
+	prog := parse(t, src)
+	if len(prog.Statements) != 1 {
+		t.Fatalf("want 1 statement, got %d", len(prog.Statements))
+	}
+	wf := prog.Statements[0].(*ast.WorkflowStatement)
+	if len(wf.Body) != 2 {
+		t.Fatalf("want 2 body statements, got %d", len(wf.Body))
+	}
+	cp, ok := wf.Body[0].(*ast.CallParallelStatement)
+	if !ok {
+		t.Fatalf("want *ast.CallParallelStatement, got %T", wf.Body[0])
+	}
+	if len(cp.Branches) != 2 {
+		t.Fatalf("want 2 branches, got %d", len(cp.Branches))
+	}
+	if cp.Branches[0].ProcedureName != "review_code" {
+		t.Errorf("branch 0: want 'review_code', got %q", cp.Branches[0].ProcedureName)
+	}
+	if cp.Branches[0].TargetVariable != "feedback" {
+		t.Errorf("branch 0 INTO: want 'feedback', got %q", cp.Branches[0].TargetVariable)
+	}
+	if cp.Branches[1].ProcedureName != "test_code" {
+		t.Errorf("branch 1: want 'test_code', got %q", cp.Branches[1].ProcedureName)
+	}
+	if cp.Branches[1].TargetVariable != "test_result" {
+		t.Errorf("branch 1 INTO: want 'test_result', got %q", cp.Branches[1].TargetVariable)
+	}
+}
+
+func TestCallParallelNoInto(t *testing.T) {
+	// Branches without INTO are valid (fire-and-forget)
+	src := `
+WORKFLOW side_effects
+DO
+  CALL PARALLEL
+    log_event(@data),
+    notify_user(@data)
+  END
+  COMMIT @data
+END`
+	prog := parse(t, src)
+	wf := prog.Statements[0].(*ast.WorkflowStatement)
+	cp := wf.Body[0].(*ast.CallParallelStatement)
+	if len(cp.Branches) != 2 {
+		t.Fatalf("want 2 branches, got %d", len(cp.Branches))
+	}
+	if cp.Branches[0].TargetVariable != "" {
+		t.Errorf("branch 0: expected empty TargetVariable, got %q", cp.Branches[0].TargetVariable)
+	}
+}
+
+// ── SPL 3.0: Multimodal types in WORKFLOW params ──────────────────────────────
+
+func TestMultimodalParamTypes(t *testing.T) {
+	src := `
+WORKFLOW image_restyle
+  INPUT:
+    @photo  IMAGE  DEFAULT 'photo.jpg',
+    @style  text   DEFAULT 'oil painting',
+    @clip   AUDIO  DEFAULT 'clip.wav',
+    @reel   VIDEO  DEFAULT 'reel.mp4'
+  OUTPUT: @restyled IMAGE
+DO
+  COMMIT @photo
+END`
+	prog := parse(t, src)
+	wf := prog.Statements[0].(*ast.WorkflowStatement)
+
+	wantTypes := []string{"IMAGE", "text", "AUDIO", "VIDEO"}
+	for i, param := range wf.Inputs {
+		if param.ParamType != wantTypes[i] {
+			t.Errorf("input[%d] %q: want type %q, got %q", i, param.Name, wantTypes[i], param.ParamType)
+		}
+	}
+	if wf.Outputs[0].ParamType != "IMAGE" {
+		t.Errorf("output[0]: want type 'IMAGE', got %q", wf.Outputs[0].ParamType)
+	}
+}

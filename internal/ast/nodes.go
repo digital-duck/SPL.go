@@ -485,3 +485,34 @@ type StorageAssignStatement struct {
 
 func (*StorageAssignStatement) nodeTag() {}
 func (*StorageAssignStatement) stmtTag() {}
+
+// =============================================================================
+// SPL 3.0 Statement nodes
+// =============================================================================
+
+// ImportStatement represents IMPORT 'path/to/file.spl'
+// The imported file's CREATE FUNCTION and WORKFLOW/PROCEDURE definitions are
+// merged into the calling program's registry before execution begins.
+type ImportStatement struct {
+	Path string // path relative to the calling .spl file's directory
+}
+
+func (*ImportStatement) nodeTag() {}
+func (*ImportStatement) stmtTag() {}
+
+// CallBranch is one branch inside a CALL PARALLEL block.
+type CallBranch struct {
+	ProcedureName  string
+	Arguments      []Expr
+	TargetVariable string // may be empty
+}
+
+// CallParallelStatement represents CALL PARALLEL ... END
+// Each branch executes concurrently. Every branch receives a snapshot of the
+// parent variable scope; only its TargetVariable is written back to the parent.
+type CallParallelStatement struct {
+	Branches []CallBranch
+}
+
+func (*CallParallelStatement) nodeTag() {}
+func (*CallParallelStatement) stmtTag() {}

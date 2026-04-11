@@ -49,6 +49,17 @@ func TestKeywords(t *testing.T) {
 		{"THEN", THEN},
 		{"ELSE", ELSE},
 		{"otherwise", ELSE}, // backward-compat alias
+		// SPL 3.0
+		{"IMPORT", IMPORT},
+		{"import", IMPORT},
+		{"PARALLEL", PARALLEL},
+		{"parallel", PARALLEL},
+		{"IMAGE", IMAGE},
+		{"image", IMAGE},
+		{"AUDIO", AUDIO},
+		{"audio", AUDIO},
+		{"VIDEO", VIDEO},
+		{"video", VIDEO},
 	}
 	for _, tc := range cases {
 		tokens := mustTokenize(t, tc.src)

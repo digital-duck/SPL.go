@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -107,6 +108,7 @@ Examples:
 		// Execute
 		exec := executor.New(adp)
 		exec.MaxWorkers = runWorkers
+		exec.SourceDir = filepath.Dir(filename)
 		ctx := context.Background()
 		results, err := exec.ExecuteProgram(ctx, program, params)
 		if err != nil {

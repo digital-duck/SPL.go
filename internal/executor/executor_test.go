@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -367,5 +368,122 @@ END`
 	r := firstWorkflowResult(t, results)
 	if r.CommittedValue != "updated" {
 		t.Errorf("expected 'updated', got: %s", r.CommittedValue)
+	}
+}
+
+// ── SPL 3.0: CALL PARALLEL ────────────────────────────────────────────────────
+
+func TestCallParallelTwoProcedures(t *testing.T) {
+	// Two procedures run in parallel; both results should appear in parent state.
+	src := `
+PROCEDURE greet(name text) RETURNS text
+DO
+  GENERATE g(name) INTO @out
+  COMMIT @out
+END
+
+PROCEDURE shout(name text) RETURNS text
+DO
+  GENERATE s(name) INTO @out
+  COMMIT @out
+END
+
+WORKFLOW parallel_test
+  INPUT:  @name text DEFAULT 'world'
+  OUTPUT: @result text
+DO
+  CALL PARALLEL
+    greet(@name) INTO @hello,
+    shout(@name) INTO @loud
+  END
+  @result := @hello
+  COMMIT @result
+END`
+	results := runSrc(t, src, map[string]string{"name": "world"})
+	r := firstWorkflowResult(t, results)
+	// With echo adapter, GENERATE returns the prompt text, not empty string.
+	if r.CommittedValue == "" {
+		t.Error("expected non-empty committed value from CALL PARALLEL workflow")
+	}
+}
+
+func TestCallParallelResultsIsolated(t *testing.T) {
+	// Each branch must only write to its own INTO @var, not bleed into sibling state.
+	src := `
+PROCEDURE left_branch() RETURNS text
+DO
+  @private := 'left-only'
+  COMMIT @private
+END
+
+PROCEDURE right_branch() RETURNS text
+DO
+  @private := 'right-only'
+  COMMIT @private
+END
+
+WORKFLOW isolation_test
+  OUTPUT: @result text
+DO
+  CALL PARALLEL
+    left_branch() INTO @left,
+    right_branch() INTO @right
+  END
+  @result := @left
+  COMMIT @result
+END`
+	results := runSrc(t, src, nil)
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "left-only" {
+		t.Errorf("want committed value 'left-only', got %q", r.CommittedValue)
+	}
+}
+
+// ── SPL 3.0: IMPORT ───────────────────────────────────────────────────────────
+
+func TestImportLoadsDefinitions(t *testing.T) {
+	// Write a temporary helper .spl file, then IMPORT it from the main program.
+	dir := t.TempDir()
+	helperPath := dir + "/helpers.spl"
+	helperSrc := `
+PROCEDURE echo_name(name text) RETURNS text
+DO
+  COMMIT name
+END`
+	if err := os.WriteFile(helperPath, []byte(helperSrc), 0600); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+
+	mainSrc := `
+IMPORT 'helpers.spl'
+
+WORKFLOW main
+  INPUT:  @name text DEFAULT 'alice'
+  OUTPUT: @result text
+DO
+  CALL echo_name(@name) INTO @result
+  COMMIT @result
+END`
+
+	l := lexer.New(mainSrc)
+	tokens, err := l.Tokenize()
+	if err != nil {
+		t.Fatalf("lex: %v", err)
+	}
+	p := parser.New(tokens)
+	prog, err := p.Parse()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	exec := newEchoExecutor()
+	exec.SourceDir = dir // so IMPORT resolves relative to the temp dir
+	results, err := exec.ExecuteProgram(context.Background(), prog, map[string]string{"name": "alice"})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	r := firstWorkflowResult(t, results)
+	if r.CommittedValue != "alice" {
+		t.Errorf("want committed value 'alice', got %q", r.CommittedValue)
 	}
 }

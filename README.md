@@ -1,20 +1,49 @@
-# SPL20.go — SPL Go Runtime
+# SPL.go — SPL Go Runtime (v1 · v2 · v3)
 
-- rename SPL20.go to SPL.go
-- port SPL v1.0, v2.0, v3.0 into Go-lang
-
-**spl-go** is the Go implementation of [SPL 2.0](https://github.com/digital-duck/SPL20) (Semantic Prompt Language), a declarative, SQL-inspired language for LLM-powered agentic workflows.
+**spl-go** is the Go implementation of the Semantic Prompt Language (SPL), consolidating SPL v1.0, v2.0, and v3.0 into a single production binary. SPL is a declarative, SQL-inspired language for LLM-powered agentic workflows.
 
 ```sql
-PROMPT greet
-  GENERATE "Write a one-sentence welcome for a {topic} workshop."
-  INTO @response
-  USING MODEL gemma3
+-- SPL 2.0: multi-step workflow
+WORKFLOW self_refine
+  INPUT: @task text, @max_iterations integer DEFAULT 3
+  OUTPUT: @result text
+DO
+  GENERATE draft(@task) INTO @current
+  @iteration := "0"
+  WHILE to_int(@iteration) < @max_iterations DO
+    GENERATE critique(@current) INTO @feedback
+    EVALUATE @feedback
+      WHEN 'satisfactory' THEN COMMIT @current
+      ELSE GENERATE refine(@current, @feedback) INTO @current
+    END
+    @iteration := to_text(to_int(@iteration) + 1)
+  END
+  COMMIT @current
+EXCEPTION MaxIterationsReached
+  COMMIT @current WITH status='partial'
+END
+```
+
+```sql
+-- SPL 3.0: parallel dispatch across imported workflows
+IMPORT 'lib/review.spl'
+IMPORT 'lib/test.spl'
+
+WORKFLOW pipeline
+  INPUT: @code text
+  OUTPUT: @report text
+DO
+  CALL PARALLEL
+    review_code(@code) INTO @style,
+    test_code(@code)   INTO @coverage
+  END
+  @report := concat(@style, "\n---\n", @coverage)
+  COMMIT @report
 END
 ```
 
 ```bash
-spl-go run greet.spl topic="machine learning"
+spl-go run pipeline.spl code="$(cat main.go)" --adapter anthropic -m claude-sonnet-4-6
 ```
 
 ---
@@ -26,6 +55,7 @@ spl-go run greet.spl topic="machine learning"
 | **Purpose** | Development, experimentation | Production, single-binary deployment |
 | **Deploy** | pip + venv | `go build` → one binary |
 | **Momagrid** | Python adapter | Native Go (same language as Momagrid hub) |
+| **Cold start** | 0.5–1.5s | <10ms |
 | **Iteration** | Fast — new features land here first | Stable — proven features ported from Python |
 
 Use `spl` to experiment. Use `spl-go` when you want a self-contained binary next to your Momagrid node.
@@ -77,7 +107,56 @@ spl-go text2spl "summarize a document in three bullet points"
 
 # Inspect what an SPL file contains
 spl-go explain my_workflow.spl
+
+# Show pre-execution resource estimates
+spl-go run my_workflow.spl --plan
 ```
+
+---
+
+## SPL 3.0 Features (ported 2026-04-11)
+
+### IMPORT — compose across files
+
+```sql
+IMPORT 'lib/shared.spl'   -- merges FUNCTION/PROCEDURE/WORKFLOW definitions
+
+WORKFLOW main
+  INPUT: @topic text
+DO
+  CALL shared_helper(@topic) INTO @result
+  COMMIT @result
+END
+```
+
+Paths resolve relative to the calling `.spl` file. Transitive imports supported.
+
+### CALL PARALLEL — concurrent execution
+
+```sql
+CALL PARALLEL
+  summarize(@doc)  INTO @summary,
+  classify(@doc)   INTO @category,
+  extract_kw(@doc) INTO @keywords
+END
+-- All three run concurrently; each branch is fully isolated
+```
+
+### Multimodal type keywords
+
+```sql
+WORKFLOW image_restyle
+  INPUT:
+    @photo IMAGE DEFAULT 'photo.jpg',
+    @style text  DEFAULT 'oil painting'
+  OUTPUT: @result IMAGE
+DO
+  GENERATE analyse(@photo, @style) INTO @result
+  COMMIT @result
+END
+```
+
+`IMAGE`, `AUDIO`, `VIDEO` are valid `INPUT`/`OUTPUT` parameter types. Full codec encoding (Phase 3) is planned once SPL30 stabilizes.
 
 ---
 
@@ -87,8 +166,12 @@ spl-go explain my_workflow.spl
 |---|---|---|
 | `ollama` | Local Ollama server (default) | `http://localhost:11434` |
 | `momagrid` | Distributed LAN inference grid | `http://localhost:9000` |
-| `anthropic` | Anthropic Claude API | `ANTHROPIC_API_KEY` env var |
+| `anthropic` | Anthropic Claude API | `ANTHROPIC_API_KEY` |
 | `claude_cli` | Claude Code CLI (subscription) | `claude` binary in PATH |
+| `openai` | OpenAI API | `OPENAI_API_KEY` |
+| `openrouter` | 100+ models via OpenRouter | `OPENROUTER_API_KEY` |
+| `deepseek` | DeepSeek API | `DEEPSEEK_API_KEY` |
+| `qwen` | Alibaba Cloud DashScope | `DASHSCOPE_API_KEY` |
 | `echo` | Returns prompt as output — for testing | none |
 
 ---
@@ -97,6 +180,8 @@ spl-go explain my_workflow.spl
 
 ```
 spl-go run <file.spl> [KEY=VALUE...]   Execute an SPL program
+spl-go run --plan                      Show pre-execution resource estimates
+spl-go run --workers N                 Parallel step execution (N goroutines)
 spl-go validate <file.spl>             Check syntax
 spl-go explain <file.spl>              Summarize structure
 spl-go text2spl "<description>"        Generate SPL from natural language
@@ -135,7 +220,7 @@ Tested on 37 SPL cookbook recipes:
 | 2-GPU (Momagrid) | 2× GTX 1080 Ti | 5 | 37/37 | 660.4s | 1.8× |
 | 3-GPU (Momagrid) | 3× GTX 1080 Ti | 10 | 37/37 | 383.7s | **3.1×** |
 
-Results from the Python `spl` runtime. The Go runtime targets identical results.
+Results from the Python `spl` runtime. Go runtime benchmark pending on 5-node grid.
 
 ---
 
@@ -187,11 +272,11 @@ doc_rag:
 
 ---
 
-## Relationship to Python SPL 2.0
+## Relationship to Python SPL
 
 `spl-go` follows a **Python-first, Go-second** discipline:
 
-1. New features land in `digital-duck/SPL20` (Python) first
+1. New features land in the Python runtimes (`digital-duck/SPL20`, `digital-duck/SPL30`) first
 2. After validation on the cookbook benchmark, they are ported to Go
 3. Any recipe that passes `spl run` must also pass `spl-go run` — divergences are bugs
 

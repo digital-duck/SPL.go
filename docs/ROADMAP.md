@@ -1,20 +1,18 @@
-# SPL20.go — Port Roadmap
+# SPL.go — Port Roadmap
 
-_Last updated: 2026-04-01 (afternoon)_
+_Last updated: 2026-04-11_
 
-This document tracks what has been ported from the Python implementation
-(`digital-duck/SPL20`) to the Go runtime (`digital-duck/SPL20.go`), what is
+This document tracks what has been ported from the Python implementations
+(SPL v1.0, v2.0, v3.0) to the Go runtime (`digital-duck/SPL.go`), what is
 planned next, and what is intentionally deferred.
-
-Mark items `[ ]` → `[x]` as you complete them.
 
 ---
 
-## Completed (as of 2026-04-01)
+## Completed
 
 ### Core pipeline
-- [x] Lexer — all token types (100% parity with Python)
-- [x] Parser — all 18 statement types
+- [x] Lexer — all token types (SPL v1.0 + v2.0 + v3.0 keywords)
+- [x] Parser — all statement types including SPL 3.0 constructs
 - [x] AST nodes
 - [x] Executor core — statement dispatch, workflow state machine
 - [x] Exception handling — all 8 exception types
@@ -23,6 +21,13 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] Missing-feature warnings — stderr warnings instead of silent failures
 - [x] **Lightweight Planner** — pre-execution resource estimates (LLM calls, tokens, cost) via `--plan`
 - [x] **Idiomatic Error Aggregation** — `errors.Join` for multi-errors in parallel workflows
+
+### SPL 3.0 language features (ported 2026-04-11)
+- [x] **`IMPORT 'file.spl'`** — load external SPL files; merges FUNCTION/PROCEDURE/WORKFLOW definitions; transitive imports supported; paths resolve relative to calling file
+- [x] **`CALL PARALLEL ... END`** — concurrent workflow/procedure fan-out via goroutines; snapshot-per-branch variable isolation; metrics aggregated back to parent
+- [x] **`IMAGE`, `AUDIO`, `VIDEO` type keywords** — valid `INPUT`/`OUTPUT` parameter types; values held as strings (file path or base64 data URL)
+- [x] **`CALL` dispatches `WORKFLOW` definitions** — `CALL workflow_name(args) INTO @var` now resolves registered workflows (previously only procedures/builtins)
+- [x] **`Executor.Workflows` registry** — workflows registered by name at load time, enabling cross-file dispatch
 
 ### Storage
 - [x] Memory store — SQLite-backed `~/.spl/memory.db` (`kv_store` + `prompt_cache`)
@@ -57,13 +62,13 @@ Mark items `[ ]` → `[x]` as you complete them.
 - [x] `tokencount` — model-aware chars/token ratio (claude=3.5, gpt=4.0, gemini=3.8, llama=3.5)
 - [x] `analyzer` — semantic analysis: duplicate names, exception type validation, temperature/budget bounds
 - [x] `functions` — FunctionRegistry: builtins (summarize, list_*, file I/O) + user-defined `CREATE FUNCTION` + `CALL`
-- [x] **Dependency-Aware Parallelization** — improved grouping of non-adjacent independent workflow steps
+- [x] **Dependency-Aware Parallelization** — grouping of independent workflow steps for goroutine pool
 - [x] `WorkflowState` mutex — thread-safe variable reads/writes for concurrent steps
 
 ### CLI
 - [x] `spl-go run` — execute SPL programs
 - [x] `spl-go run --workers N` — parallel step execution via goroutine pool
-- [x] **`spl-go run --plan`** — show resource estimates before execution
+- [x] `spl-go run --plan` — show resource estimates before execution
 - [x] `spl-go validate` — syntax check + semantic analysis warnings
 - [x] `spl-go explain` — structure summary with analysis results
 - [x] `spl-go adapters` — list adapters + env vars
@@ -78,30 +83,40 @@ Mark items `[ ]` → `[x]` as you complete them.
 
 ---
 
-## Pending — mark what to port next
-
-Mark `[ ]` → `[x]` and I will implement.
+## Pending
 
 ### Cloud provider adapters — implement when Momagrid WAN deployment is funded
 
-All three exist in the Python implementation (`spl/adapters/`). Port to Go when
-Momagrid is deployed to cloud infrastructure (AWS, GCP, Azure).
+All three exist in the Python v2.0 runtime. Port to Go when Momagrid is deployed
+to cloud infrastructure (AWS, GCP, Azure).
 
-- [ ] `google` — Google Generative AI SDK / Gemini (`GOOGLE_API_KEY`)
+- [ ] `google` — Google Generative AI / Gemini (`GOOGLE_API_KEY`)
 - [ ] `azure_openai` — Azure OpenAI (`AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY`)
-- [ ] `bedrock` — AWS Bedrock Converse API (AWS credentials: env / profile / IAM role; supports Claude, Llama, Nova, cross-region inference profiles)
+- [ ] `bedrock` — AWS Bedrock Converse API (AWS credentials: env / profile / IAM role; supports Claude, Llama, Nova)
 
----
+### SPL 3.0 multimodal — implement when SPL30 stabilizes
 
-## Benchmark target (2026-03-30)
+- [ ] `internal/codec/image.go` — PNG/JPEG/WebP → base64 data URL (Go stdlib `image/*`)
+- [ ] `internal/codec/audio.go` — WAV/MP3 → base64 bytes
+- [ ] `internal/codec/video.go` — MP4 → frame slice at configurable FPS (ffmpeg subprocess)
+- [ ] `MultimodalAdapter` interface — extends `Adapter` with `GenerateMultimodal(ctx, []ContentBlock, ...)`
+- [ ] `ContentBlock` type — `{Type, Text, Source, MediaType, Data}`
+- [ ] Upgrade `anthropic`, `openai` to implement `MultimodalAdapter`
+- [ ] `internal/adapter/liquid.go` — Liquid inference (native multimodal)
+- [ ] `internal/adapter/snap.go` — Ubuntu AI snap stub (Ubuntu 26.04 not yet GA)
+- [ ] Executor integration — auto-encode IMAGE/AUDIO/VIDEO vars to `ContentBlock` on `GENERATE`
 
-4-node Momagrid grid (3× GTX 1080 Ti + 1× RTX 4060 8 GB):
+### SPL 3.0 workflow registry + hub peering — implement when Momagrid hub API is stable
+
+- [ ] In-process workflow registry (`internal/registry/`) — named workflows resolved at CALL time
+- [ ] Hub-backed registry — `GET /workflows/{name}` for remote dispatch
+- [ ] Hub-to-Hub peering — design work needed
+
+### Benchmark target (4-node Momagrid grid)
 
 - [ ] Run full 40-recipe cookbook with `spl-go` + `--adapter momagrid`
-- [ ] Compare wall-clock vs Python `spl` baseline (1197.6s single-node, 414s 4 nodes)
+- [ ] Compare wall-clock vs Python `spl` baseline (1197.6s single-node, 383.7s 3-node)
 - [ ] Record pass rate — any failure = Go port bug to fix
-
-see https://github.com/digital-duck/dd-arxiv/blob/main/docs/SPL20-arxiv.pdf
 
 ---
 
@@ -111,4 +126,4 @@ see https://github.com/digital-duck/dd-arxiv/blob/main/docs/SPL20-arxiv.pdf
 |---|---|
 | `vertex` adapter | GCP Vertex AI OAuth2 — superseded by `google` adapter via API key |
 | Streamlit UI (`spl ui`) | No Go equivalent planned |
-| `asyncio` concurrency | **Done** — replaced with goroutine pool (`--workers N`) |
+| `asyncio` concurrency | **Done** — replaced with goroutine pool (`--workers N`) and `CALL PARALLEL` |
