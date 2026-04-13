@@ -254,6 +254,24 @@ type SemanticCondition struct {
 	SemanticValue string
 }
 
+// UnaryOp represents NOT <expr> — boolean negation.
+// Currently operator is always "NOT".
+// Implements Expr so it can appear both as a primary expression and as a WHILE condition.
+type UnaryOp struct {
+	Operator string      // "NOT"
+	Operand  interface{} // Expr | *Condition | *UnaryOp | *CompoundCondition
+}
+
+func (*UnaryOp) nodeTag() {}
+func (*UnaryOp) exprTag() {}
+
+// CompoundCondition represents <cond> AND/OR <cond> — compound boolean WHILE condition.
+type CompoundCondition struct {
+	Operator string      // "AND" or "OR"
+	Left     interface{} // *Condition | *UnaryOp | *CompoundCondition | Expr
+	Right    interface{}
+}
+
 // ComparisonCondition is a comparison condition in EVALUATE context.
 type ComparisonCondition struct {
 	Operator string // ">", "<", ">=", "<=", "=", "!="

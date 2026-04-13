@@ -1668,11 +1668,6 @@ func (p *Parser) parseWhileStatement() (*ast.WhileStatement, error) {
 }
 
 func (p *Parser) parseWhileCondition() (interface{}, error) {
-	left, err := p.parseExpression()
-	if err != nil {
-		return nil, err
-	}
-
 	opMap := map[lexer.TokenType]string{
 		lexer.GT:  ">",
 		lexer.LT:  "<",
@@ -1680,6 +1675,35 @@ func (p *Parser) parseWhileCondition() (interface{}, error) {
 		lexer.LTE: "<=",
 		lexer.EQ:  "=",
 		lexer.NEQ: "!=",
+	}
+
+	// NOT <expr> — boolean negation at condition level
+	if p.check(lexer.NOT) {
+		p.advance()
+		operand, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		left := &ast.UnaryOp{Operator: "NOT", Operand: operand}
+		// Check for AND/OR compound after NOT <expr>
+		if p.checkAny(lexer.AND, lexer.OR) {
+			logicalOp := "AND"
+			if p.current().Type == lexer.OR {
+				logicalOp = "OR"
+			}
+			p.advance()
+			right, err := p.parseWhileCondition()
+			if err != nil {
+				return nil, err
+			}
+			return &ast.CompoundCondition{Operator: logicalOp, Left: left, Right: right}, nil
+		}
+		return left, nil
+	}
+
+	left, err := p.parseExpression()
+	if err != nil {
+		return nil, err
 	}
 
 	tok := p.current()
@@ -1691,33 +1715,23 @@ func (p *Parser) parseWhileCondition() (interface{}, error) {
 		}
 		condition := &ast.Condition{Left: left, Operator: op, Right: right}
 
-		// Check for AND/OR compound conditions (simplified: just consume them)
-		for p.checkAny(lexer.AND, lexer.OR) {
+		// Check for AND/OR compound after a comparison condition
+		if p.checkAny(lexer.AND, lexer.OR) {
+			logicalOp := "AND"
+			if p.current().Type == lexer.OR {
+				logicalOp = "OR"
+			}
 			p.advance()
-			if p.check(lexer.NOT) {
-				p.advance()
-				if p.check(lexer.EVALUATE) {
-					p.advance()
-					p.expect(lexer.STRING) //nolint
-					if p.check(lexer.FROM) {
-						p.advance()
-						for !p.check(lexer.DO) && !p.check(lexer.EOF) {
-							p.advance()
-						}
-					}
-					return condition, nil
-				}
+			rightCond, err := p.parseWhileCondition()
+			if err != nil {
+				return nil, err
 			}
-			p.parseExpression() //nolint
-			if _, ok := opMap[p.current().Type]; ok {
-				p.advance()
-				p.parseExpression() //nolint
-			}
+			return &ast.CompoundCondition{Operator: logicalOp, Left: condition, Right: rightCond}, nil
 		}
 		return condition, nil
 	}
 
-	// No operator — expression-based condition or semantic
+	// No operator — expression-based condition (truthy string check)
 	return left, nil
 }
 
@@ -2233,6 +2247,16 @@ func (p *Parser) parseExpression() (ast.Expr, error) {
 
 func (p *Parser) parsePrimary() (ast.Expr, error) {
 	tok := p.current()
+
+	// NOT <expr> — boolean negation
+	if tok.Type == lexer.NOT {
+		p.advance()
+		operand, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.UnaryOp{Operator: "NOT", Operand: operand}, nil
+	}
 
 	// @param reference or storage subscript
 	if tok.Type == lexer.AT {

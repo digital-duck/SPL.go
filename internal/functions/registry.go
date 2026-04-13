@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/digital-duck/spl20go/internal/ast"
@@ -83,6 +84,7 @@ var builtins = map[string]func([]string) string{
 	"list_get":     builtinGet,
 	"write_file":   builtinWriteFile,
 	"read_file":    builtinReadFile,
+	"clean_code":   builtinCleanCode,
 }
 
 // builtinSummarize extracts approximately maxTokens worth of sentences from text.
@@ -294,4 +296,29 @@ func builtinReadFile(args []string) string {
 		return ""
 	}
 	return string(data)
+}
+
+var (
+	reOpenFence  = regexp.MustCompile(`(?m)^` + "```" + `[^\n]*\n`)
+	reCloseFence = regexp.MustCompile("\n```" + `\s*$`)
+)
+
+// builtinCleanCode removes common LLM output artifacts from generated code.
+//
+// Currently handles:
+//   - Markdown fences  (```python ... ``` or ``` ... ```)
+//   - Leading / trailing blank lines
+//
+// Future candidates: shebang lines, stray prose commentary,
+// indentation normalisation, BOM stripping.
+//
+// Usage: clean_code(text)
+func builtinCleanCode(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	text := strings.TrimSpace(args[0])
+	text = reOpenFence.ReplaceAllString(text, "")
+	text = reCloseFence.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
 }

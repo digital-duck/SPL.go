@@ -840,6 +840,30 @@ func (e *Executor) execWhile(ctx context.Context, stmt *ast.WhileStatement, stat
 
 func (e *Executor) evalWhileCondition(ctx context.Context, cond interface{}, state *WorkflowState) (bool, error) {
 	switch c := cond.(type) {
+	case *ast.CompoundCondition:
+		leftVal, err := e.evalWhileCondition(ctx, c.Left, state)
+		if err != nil {
+			return false, err
+		}
+		rightVal, err := e.evalWhileCondition(ctx, c.Right, state)
+		if err != nil {
+			return false, err
+		}
+		if c.Operator == "AND" {
+			return leftVal && rightVal, nil
+		}
+		return leftVal || rightVal, nil
+
+	case *ast.UnaryOp:
+		if c.Operator == "NOT" {
+			val, err := e.evalWhileCondition(ctx, c.Operand, state)
+			if err != nil {
+				return false, err
+			}
+			return !val, nil
+		}
+		return false, nil
+
 	case *ast.Condition:
 		leftStr := e.evalExpression(c.Left, state)
 		rightStr := e.evalExpression(c.Right, state)
