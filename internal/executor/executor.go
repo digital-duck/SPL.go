@@ -29,6 +29,7 @@ import (
 // SPLResult holds the result of executing an SPL PROMPT statement.
 type SPLResult struct {
 	Content      string
+	Prompt       string
 	Model        string
 	InputTokens  int
 	OutputTokens int
@@ -396,6 +397,7 @@ func (e *Executor) ExecutePrompt(ctx context.Context, stmt *ast.PromptStatement,
 
 	return &SPLResult{
 		Content:      genResult.Content,
+		Prompt:       prompt,
 		Model:        genResult.Model,
 		InputTokens:  genResult.InputTokens,
 		OutputTokens: genResult.OutputTokens,
@@ -438,8 +440,14 @@ func (e *Executor) assemblePrompt(contextParts map[string]string, gen *ast.Gener
 			for _, arg := range gen.Arguments {
 				argStrs = append(argStrs, e.evalExpression(arg, dummyState))
 			}
-			parts = append(parts, fmt.Sprintf("\n## Task\nBased on the above context, generate: %s(%s)",
-				gen.FunctionName, strings.Join(argStrs, ", ")))
+			
+			taskPrefix := "Based on the above context, generate: "
+			if len(parts) == 0 {
+				taskPrefix = "Generate: "
+			}
+			
+			parts = append(parts, fmt.Sprintf("\n## Task\n%s%s(%s)",
+				taskPrefix, gen.FunctionName, strings.Join(argStrs, ", ")))
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -115,13 +116,19 @@ Examples:
 			return fmt.Errorf("execution error: %w", err)
 		}
 
-		// Print results
+		// Print and log results
 		for _, res := range results {
 			switch r := res.(type) {
 			case *executor.SPLResult:
 				printSPLResult(r)
+				if logFile, err := logSPLResult(filename, adapterName, string(source), r); err == nil {
+					fmt.Printf("Log: %s\n", logFile)
+				}
 			case *executor.WorkflowResult:
 				printWorkflowResult(r)
+				if logFile, err := logWorkflowResult(filename, adapterName, string(source), r); err == nil {
+					fmt.Printf("Log: %s\n", logFile)
+				}
 			}
 		}
 
@@ -176,4 +183,71 @@ func printWorkflowResult(r *executor.WorkflowResult) {
 		}
 	}
 	fmt.Println(separator)
+}
+
+func logSPLResult(recipePath, adapterName, source string, r *executor.SPLResult) (string, error) {
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, ".spl", "logs")
+	os.MkdirAll(logDir, 0755)
+
+	recipeName := strings.TrimSuffix(filepath.Base(recipePath), ".spl")
+	timestamp := time.Now().Format("20060102-150405")
+	logFileName := fmt.Sprintf("%s-%s-%s-go.md", recipeName, adapterName, timestamp)
+	logFilePath := filepath.Join(logDir, logFileName)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# SPL Run: %s\n\n", recipeName))
+	sb.WriteString(fmt.Sprintf("- **Adapter:** %s\n", adapterName))
+	sb.WriteString(fmt.Sprintf("- **Model:** %s\n", r.Model))
+	sb.WriteString(fmt.Sprintf("- **Tokens:** %d in / %d out\n", r.InputTokens, r.OutputTokens))
+	sb.WriteString(fmt.Sprintf("- **Latency:** %.0fms\n", r.LatencyMs))
+	sb.WriteString(fmt.Sprintf("- **Timestamp:** %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
+
+	sb.WriteString("## SPL Source\n\n```spl\n")
+	sb.WriteString(source)
+	sb.WriteString("\n```\n\n")
+
+	sb.WriteString("## Final Prompt\n\n```prompt\n")
+	sb.WriteString(r.Prompt)
+	sb.WriteString("\n```\n\n")
+
+	sb.WriteString("## Output\n\n```output\n")
+	sb.WriteString(r.Content)
+	sb.WriteString("\n```\n")
+
+	err := os.WriteFile(logFilePath, []byte(sb.String()), 0644)
+	return logFilePath, err
+}
+
+func logWorkflowResult(recipePath, adapterName, source string, r *executor.WorkflowResult) (string, error) {
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, ".spl", "logs")
+	os.MkdirAll(logDir, 0755)
+
+	recipeName := strings.TrimSuffix(filepath.Base(recipePath), ".spl")
+	timestamp := time.Now().Format("20060102-150405")
+	logFileName := fmt.Sprintf("%s-%s-%s-go.md", recipeName, adapterName, timestamp)
+	logFilePath := filepath.Join(logDir, logFileName)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# SPL Workflow Run: %s\n\n", recipeName))
+	sb.WriteString(fmt.Sprintf("- **Status:** %s\n", r.Status))
+	sb.WriteString(fmt.Sprintf("- **Adapter:** %s\n", adapterName))
+	sb.WriteString(fmt.Sprintf("- **LLM Calls:** %d\n", r.TotalLLMCalls))
+	sb.WriteString(fmt.Sprintf("- **Tokens:** %d in / %d out\n", r.TotalInputToks, r.TotalOutputToks))
+	sb.WriteString(fmt.Sprintf("- **Latency:** %.0fms\n", r.TotalLatencyMs))
+	sb.WriteString(fmt.Sprintf("- **Timestamp:** %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
+
+	sb.WriteString("## SPL Source\n\n```spl\n")
+	sb.WriteString(source)
+	sb.WriteString("\n```\n\n")
+
+	if r.CommittedValue != "" {
+		sb.WriteString("## Committed Output\n\n```output\n")
+		sb.WriteString(r.CommittedValue)
+		sb.WriteString("\n```\n")
+	}
+
+	err := os.WriteFile(logFilePath, []byte(sb.String()), 0644)
+	return logFilePath, err
 }

@@ -6,6 +6,14 @@ import (
 	"fmt"
 )
 
+// ContentBlock represents a single part of a multimodal message.
+type ContentBlock struct {
+	Type      string // "text", "image", "audio", "video"
+	Text      string // for Type == "text"
+	Data      []byte // for Type == "image", "audio", "video"
+	MediaType string // e.g., "image/jpeg", "audio/wav"
+}
+
 // GenerationResult holds the result of a single LLM generation call.
 type GenerationResult struct {
 	Content      string
@@ -29,6 +37,13 @@ type Adapter interface {
 	Name() string
 }
 
+// MultimodalAdapter extends Adapter with multimodal capabilities.
+type MultimodalAdapter interface {
+	Adapter
+	// GenerateMultimodal sends a list of content blocks to the LLM.
+	GenerateMultimodal(ctx context.Context, blocks []ContentBlock, model string, maxTokens int, temperature float64, system string) (*GenerationResult, error)
+}
+
 // New creates a new Adapter by name with optional configuration.
 func New(name string, cfg map[string]string) (Adapter, error) {
 	switch name {
@@ -46,6 +61,8 @@ func New(name string, cfg map[string]string) (Adapter, error) {
 		return NewOpenRouterAdapter(cfg), nil
 	case "openai":
 		return NewOpenAIAdapter(cfg), nil
+	case "google":
+		return NewGoogleAdapter(cfg), nil
 	case "deepseek":
 		return NewDeepSeekAdapter(cfg), nil
 	case "qwen":

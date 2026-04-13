@@ -3,11 +3,13 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -58,8 +60,9 @@ type ollamaChatRequest struct {
 }
 
 type ollamaChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string   `json:"role"`
+	Content string   `json:"content,omitempty"`
+	Images  []string `json:"images,omitempty"` // Base64 encoded images for Ollama native/OpenAI-compat
 }
 
 type ollamaChatResponse struct {
@@ -76,6 +79,11 @@ type ollamaChatResponse struct {
 }
 
 func (a *OllamaAdapter) Generate(ctx context.Context, prompt, model string, maxTokens int, temperature float64, system string) (*GenerationResult, error) {
+	blocks := []ContentBlock{{Type: "text", Text: prompt}}
+	return a.GenerateMultimodal(ctx, blocks, model, maxTokens, temperature, system)
+}
+
+func (a *OllamaAdapter) GenerateMultimodal(ctx context.Context, blocks []ContentBlock, model string, maxTokens int, temperature float64, system string) (*GenerationResult, error) {
 	if model == "" {
 		model = a.DefaultModel
 	}
@@ -90,7 +98,19 @@ func (a *OllamaAdapter) Generate(ctx context.Context, prompt, model string, maxT
 	if system != "" {
 		messages = append(messages, ollamaChatMessage{Role: "system", Content: system})
 	}
-	messages = append(messages, ollamaChatMessage{Role: "user", Content: prompt})
+
+	userMsg := ollamaChatMessage{Role: "user"}
+	var textParts []string
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			textParts = append(textParts, b.Text)
+		case "image":
+			userMsg.Images = append(userMsg.Images, base64.StdEncoding.EncodeToString(b.Data))
+		}
+	}
+	userMsg.Content = strings.Join(textParts, "\n")
+	messages = append(messages, userMsg)
 
 	reqBody := ollamaChatRequest{
 		Model:       model,
@@ -106,6 +126,8 @@ func (a *OllamaAdapter) Generate(ctx context.Context, prompt, model string, maxT
 	}
 
 	start := time.Now()
+	// Use Ollama's OpenAI-compatible endpoint or native /api/chat
+	// Ollama 0.1.34+ supports 'images' in the OpenAI-compatible /v1/chat/completions messages
 	req, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL+"/v1/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("ollama: create request: %w", err)
@@ -142,10 +164,10 @@ func (a *OllamaAdapter) Generate(ctx context.Context, prompt, model string, maxT
 	inputTokens := chatResp.Usage.PromptTokens
 	outputTokens := chatResp.Usage.CompletionTokens
 	if inputTokens == 0 {
-		inputTokens = len(prompt) / 4
+		inputTokens = a.CountTokens(userMsg.Content, model)
 	}
 	if outputTokens == 0 {
-		outputTokens = len(content) / 4
+		outputTokens = a.CountTokens(content, model)
 	}
 
 	returnedModel := chatResp.Model

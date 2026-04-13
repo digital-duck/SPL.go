@@ -7,6 +7,9 @@ import (
 
 	"github.com/digital-duck/spl20go/internal/adapter"
 	"github.com/digital-duck/spl20go/internal/config"
+	"github.com/digital-duck/spl20go/internal/executor"
+	"github.com/digital-duck/spl20go/internal/lexer"
+	"github.com/digital-duck/spl20go/internal/parser"
 	"github.com/digital-duck/spl20go/internal/rag"
 	"github.com/digital-duck/spl20go/internal/text2spl"
 	"github.com/spf13/cobra"
@@ -89,7 +92,39 @@ var text2splCmd = &cobra.Command{
 
 		// Optionally execute
 		if text2splExecute {
-			fmt.Fprintln(os.Stderr, "text2spl: --execute not yet implemented; save to file and run: spl run <file.spl>")
+			fmt.Fprintln(os.Stderr, "text2spl: executing generated SPL...")
+
+			// Lex
+			l := lexer.New(splSource)
+			tokens, err := l.Tokenize()
+			if err != nil {
+				return fmt.Errorf("text2spl: execute lexer error: %w", err)
+			}
+
+			// Parse
+			p := parser.New(tokens)
+			program, err := p.Parse()
+			if err != nil {
+				return fmt.Errorf("text2spl: execute parse error: %w", err)
+			}
+
+			// Execute
+			exec := executor.New(adp)
+			ctx := context.Background()
+			results, err := exec.ExecuteProgram(ctx, program, nil)
+			if err != nil {
+				return fmt.Errorf("text2spl: execution error: %w", err)
+			}
+
+			// Print results
+			for _, res := range results {
+				switch r := res.(type) {
+				case *executor.SPLResult:
+					printSPLResult(r)
+				case *executor.WorkflowResult:
+					printWorkflowResult(r)
+				}
+			}
 		}
 
 		return nil
