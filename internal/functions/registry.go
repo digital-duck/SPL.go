@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -279,6 +280,11 @@ func builtinWriteFile(args []string) string {
 	}
 	path := args[0]
 	content := args[1]
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Sprintf("error: mkdir %s: %v", dir, err)
+		}
+	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Sprintf("error: %v", err)
 	}

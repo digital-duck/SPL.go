@@ -69,15 +69,41 @@ func (e *SPLError) Error() string {
 }
 
 const (
-	ErrHallucination   = "HallucinationDetected"
-	ErrRefusal         = "RefusalToAnswer"
-	ErrContextLength   = "ContextLengthExceeded"
-	ErrModelOverloaded = "ModelOverloaded"
-	ErrQuality         = "QualityBelowThreshold"
-	ErrMaxIterations   = "MaxIterationsReached"
-	ErrBudget          = "BudgetExceeded"
-	ErrNodeUnavailable = "NodeUnavailable"
+	ErrHallucination    = "HallucinationDetected"
+	ErrRefusal          = "RefusalToAnswer"
+	ErrContextLength    = "ContextLengthExceeded"
+	ErrModelOverloaded  = "ModelOverloaded"
+	ErrQuality          = "QualityBelowThreshold"
+	ErrMaxIterations    = "MaxIterationsReached"
+	ErrBudget           = "BudgetExceeded"
+	ErrNodeUnavailable  = "NodeUnavailable"
+	ErrModelUnavailable = "ModelUnavailable"
 )
+
+// adapterErrToSPL converts a raw adapter/HTTP error into a catchable *SPLError.
+// This ensures EXCEPTION WHEN ModelUnavailable (and similar) handlers fire
+// instead of the error propagating as an unhandled Go error.
+func adapterErrToSPL(step string, err error) *SPLError {
+	msg := err.Error()
+	var errType string
+	switch {
+	case strings.Contains(msg, "context deadline exceeded"),
+		strings.Contains(msg, "Client.Timeout"),
+		strings.Contains(msg, "timeout"):
+		errType = ErrModelUnavailable
+	case strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "request failed"):
+		errType = ErrModelUnavailable
+	case strings.Contains(msg, "refus"),
+		strings.Contains(msg, "cannot assist"),
+		strings.Contains(msg, "I'm not able"):
+		errType = ErrRefusal
+	default:
+		errType = ErrModelUnavailable
+	}
+	return &SPLError{Type: errType, Message: fmt.Sprintf("GENERATE %s: %s", step, msg)}
+}
 
 // =============================================================================
 // Workflow Execution State
@@ -254,6 +280,10 @@ func (e *Executor) registerProgram(ctx context.Context, program *ast.Program) er
 // definitions into the executor. Path is resolved relative to SourceDir.
 func (e *Executor) execImport(_ context.Context, stmt *ast.ImportStatement) error {
 	importPath := stmt.Path
+	// Auto-add .spl extension if missing (mirrors spl-ts loader behaviour)
+	if filepath.Ext(importPath) == "" {
+		importPath = importPath + ".spl"
+	}
 	if !filepath.IsAbs(importPath) && e.SourceDir != "" {
 		importPath = filepath.Join(e.SourceDir, importPath)
 	}
@@ -786,7 +816,7 @@ func (e *Executor) execGenerateInto(ctx context.Context, stmt *ast.GenerateIntoS
 
 	genResult, err := e.Adapter.Generate(ctx, prompt, model, maxTokens, temperature, "")
 	if err != nil {
-		return fmt.Errorf("GENERATE %s: %w", gen.FunctionName, err)
+		return adapterErrToSPL(gen.FunctionName, err)
 	}
 	state.recordLLMCall(genResult)
 

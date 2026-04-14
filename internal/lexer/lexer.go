@@ -172,6 +172,7 @@ var keywords = map[string]TokenType{
 	"format":               FORMAT,
 	"begin":                BEGIN,
 	"commit":               COMMIT,
+	"return":               COMMIT, // SPL 3.0 alias: RETURN @var = COMMIT @var in workflow body
 	"rollback":             ROLLBACK,
 	"transaction":          TRANSACTION,
 	"on":                   ON,

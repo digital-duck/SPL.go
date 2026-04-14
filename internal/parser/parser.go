@@ -906,11 +906,19 @@ func (p *Parser) parseGenerateClause() (*ast.GenerateClause, error) {
 				if _, err = p.expect(lexer.BUDGET); err != nil {
 					return nil, err
 				}
-				intTok, err := p.expect(lexer.INTEGER)
-				if err != nil {
-					return nil, err
+				// Accept either an integer literal or a @param reference.
+				// @param → budget 0 (no static limit; runtime uses param value).
+				if p.check(lexer.AT) {
+					p.advance() // consume @
+					p.advance() // consume param name identifier
+					outputBudget = 0
+				} else {
+					intTok, err := p.expect(lexer.INTEGER)
+					if err != nil {
+						return nil, err
+					}
+					outputBudget, _ = strconv.Atoi(intTok.Value)
 				}
-				outputBudget, _ = strconv.Atoi(intTok.Value)
 				if _, err = p.expect(lexer.TOKENS); err != nil {
 					return nil, err
 				}
@@ -1054,9 +1062,11 @@ func (p *Parser) parseCreateFunction() (*ast.CreateFunctionStatement, error) {
 		return nil, err
 	}
 
-	if _, err = p.expect(lexer.RETURNS); err != nil {
-		return nil, err
+	// Accept both RETURNS and RETURN (SPL 3.0 alias — "return" lexes to COMMIT)
+	if !p.check(lexer.RETURNS) && !p.check(lexer.COMMIT) {
+		return nil, &ParseError{Message: "Expected RETURNS or RETURN", Token: p.current()}
 	}
+	p.advance()
 	rtTok, err := p.expect(lexer.IDENTIFIER)
 	if err != nil {
 		return nil, err
@@ -2049,14 +2059,19 @@ func (p *Parser) parseCallStatement() (ast.Stmt, error) {
 	target := ""
 	if p.check(lexer.INTO) {
 		p.advance()
-		if _, err = p.expect(lexer.AT); err != nil {
-			return nil, err
+		// INTO NONE — discard result (SPL 3.0); NONE arrives as IDENTIFIER "NONE"
+		if p.check(lexer.IDENTIFIER) && strings.EqualFold(p.current().Value, "none") {
+			p.advance() // consume NONE
+		} else {
+			if _, err = p.expect(lexer.AT); err != nil {
+				return nil, err
+			}
+			targetTok, err := p.expectIdentifierOrKeyword()
+			if err != nil {
+				return nil, err
+			}
+			target = targetTok.Value
 		}
-		targetTok, err := p.expectIdentifierOrKeyword()
-		if err != nil {
-			return nil, err
-		}
-		target = targetTok.Value
 	}
 
 	return &ast.CallStatement{
@@ -2479,7 +2494,23 @@ func (p *Parser) parseIdentifierExpression() (ast.Expr, error) {
 }
 
 func (p *Parser) parseCallArgument() (ast.Expr, error) {
-	if p.current().Type == lexer.IDENTIFIER &&
+	// Support keyword=value named args: key can be IDENTIFIER or a keyword token
+	// (e.g. model=@model, lang=@lang)
+	curIsIdent := p.current().Type == lexer.IDENTIFIER
+	if !curIsIdent {
+		// Accept any keyword token as a named-arg key
+		_, curIsIdent = map[lexer.TokenType]bool{
+			lexer.MODEL: true, lexer.FORMAT: true, lexer.VERSION: true,
+			lexer.SCHEMA: true, lexer.ERROR: true, lexer.OUTPUT: true,
+			lexer.INPUT: true, lexer.TEMPERATURE: true, lexer.PROMPT: true,
+			lexer.BUDGET: true, lexer.TOKENS: true, lexer.LIMIT: true,
+			lexer.RESULT: true, lexer.STORE: true, lexer.CACHE: true,
+			lexer.LOGGING: true, lexer.LEVEL: true, lexer.SET: true,
+			lexer.SECURITY: true, lexer.ACCOUNTING: true,
+			lexer.CLASSIFICATION: true, lexer.LABELS: true,
+		}[p.current().Type]
+	}
+	if curIsIdent &&
 		p.pos+1 < len(p.tokens) &&
 		p.tokens[p.pos+1].Type == lexer.EQ {
 		name := p.advance().Value
@@ -2592,6 +2623,22 @@ func (p *Parser) expectIdentifierOrKeyword() (lexer.Token, error) {
 		lexer.CALL:        true,
 		lexer.DEFAULT:     true,
 		lexer.INTO:        true,
+		// SPL 2.0 security/accounting keywords often used as param/variable names
+		lexer.SECURITY:       true,
+		lexer.ACCOUNTING:     true,
+		lexer.CLASSIFICATION: true,
+		lexer.LABELS:         true,
+		lexer.LOGGING:        true,
+		lexer.LEVEL:          true,
+		lexer.SET:            true,
+		lexer.TO:             true,
+		lexer.ON:             true,
+		lexer.BY:             true,
+		lexer.AS:             true,
+		lexer.IN:             true,
+		lexer.AND:            true,
+		lexer.OR:             true,
+		lexer.NOT:            true,
 		// SPL 3.0
 		lexer.IMPORT:   true,
 		lexer.PARALLEL: true,

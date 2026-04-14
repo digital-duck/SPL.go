@@ -65,9 +65,10 @@ Use `spl` to experiment. Use `spl-go` when you want a self-contained binary next
 ## Installation
 
 ```bash
-git clone git@github.com:digital-duck/SPL20.go.git
-cd SPL20.go
-go build -o ~/bin/spl-go .
+git clone git@github.com:digital-duck/SPL.go.git
+cd SPL.go
+go build -o ./spl-go .
+
 alias spl-go=~/bin/spl-go
 ```
 
