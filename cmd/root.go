@@ -32,7 +32,7 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&flagAdapter, "adapter", "a", "", "LLM adapter (echo, ollama, momagrid)")
-	rootCmd.PersistentFlags().StringVarP(&flagModel, "model", "m", "", "LLM model name")
+	rootCmd.PersistentFlags().StringVar(&flagModel, "model", "", "LLM model name")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Enable verbose output")
 
 	rootCmd.AddCommand(runCmd)

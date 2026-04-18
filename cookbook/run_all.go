@@ -157,12 +157,10 @@ func applyOverrides(args []string, adapter, model string) []string {
 		}
 	}
 	if model != "" {
-		if i := indexOf(result, "-m"); i >= 0 {
-			result[i+1] = model
-		} else if i := indexOf(result, "--model"); i >= 0 {
+		if i := indexOf(result, "--model"); i >= 0 {
 			result[i+1] = model
 		} else {
-			result = append(result, "-m", model)
+			result = append(result, "--model", model)
 		}
 	}
 	return result

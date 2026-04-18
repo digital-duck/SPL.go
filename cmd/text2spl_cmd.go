@@ -136,7 +136,7 @@ func init() {
 	text2splCmd.Flags().StringVarP(&text2splOutput, "output", "o", "", "Write generated SPL to file")
 	text2splCmd.Flags().BoolVar(&text2splExecute, "execute", false, "Execute the generated SPL immediately")
 	text2splCmd.Flags().StringVar(&text2splAdapter, "adapter", "", "LLM adapter to use for generation")
-	text2splCmd.Flags().StringVarP(&text2splModel, "model", "m", "", "LLM model to use for generation")
+	text2splCmd.Flags().StringVar(&text2splModel, "model", "", "LLM model to use for generation")
 	text2splCmd.Flags().BoolVar(&text2splNoCodeRAG, "no-code-rag", false, "Disable Code-RAG example injection")
 	text2splCmd.Flags().BoolVar(&text2splNoValidate, "no-validate", false, "Skip SPL validation (no retry on parse error)")
 }
