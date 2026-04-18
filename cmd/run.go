@@ -15,11 +15,14 @@ import (
 	"github.com/digital-duck/spl20go/internal/executor"
 	"github.com/digital-duck/spl20go/internal/lexer"
 	"github.com/digital-duck/spl20go/internal/parser"
+	"github.com/digital-duck/spl20go/internal/tools"
 )
 
 var runParams []string
 var runWorkers int
 var runPlan bool
+var runToolsFile string
+var runAllowedTools []string
 
 var runCmd = &cobra.Command{
 	Use:   "run <file.spl> [KEY=VALUE...]",
@@ -30,7 +33,7 @@ Parameters can be passed as KEY=VALUE arguments or via -p KEY=VALUE flags.
 
 Examples:
   spl run my_workflow.spl topic="machine learning"
-  spl run my_workflow.spl -p topic="machine learning" -m llama3.2
+  spl run my_workflow.spl -p topic="machine learning" --model gemma3
   spl run my_prompt.spl --adapter echo`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -100,6 +103,9 @@ Examples:
 		} else if cfg.Model != "" {
 			adapterCfg["model"] = cfg.Model
 		}
+		if len(runAllowedTools) > 0 {
+			adapterCfg["allowed_tools"] = strings.Join(runAllowedTools, ",")
+		}
 
 		adp, err := adapter.New(adapterName, adapterCfg)
 		if err != nil {
@@ -110,6 +116,19 @@ Examples:
 		exec := executor.New(adp)
 		exec.MaxWorkers = runWorkers
 		exec.SourceDir = filepath.Dir(filename)
+
+		// Load Python tools if --tools was specified
+		if runToolsFile != "" {
+			toolMap, err := tools.Load(runToolsFile)
+			if err != nil {
+				return fmt.Errorf("--tools: %w", err)
+			}
+			for name, fn := range toolMap {
+				exec.Tools[name] = fn
+			}
+			fmt.Printf("Tools: loaded %d function(s) from %s\n", len(toolMap), runToolsFile)
+		}
+
 		ctx := context.Background()
 		results, err := exec.ExecuteProgram(ctx, program, params)
 		if err != nil {
@@ -140,6 +159,8 @@ func init() {
 	runCmd.Flags().StringArrayVarP(&runParams, "param", "p", nil, "Parameter as KEY=VALUE (repeatable)")
 	runCmd.Flags().IntVar(&runWorkers, "workers", 0, "Number of parallel workers for independent workflow steps (0 = sequential)")
 	runCmd.Flags().BoolVar(&runPlan, "plan", false, "Show pre-execution plan and resource estimates")
+	runCmd.Flags().StringVar(&runToolsFile, "tools", "", "Path to Python tools file (.py) — registers @spl_tool functions as CALL-able tools")
+	runCmd.Flags().StringArrayVar(&runAllowedTools, "allowed-tools", nil, "Tools to allow for claude_cli adapter (e.g. --allowed-tools WebSearch Bash)")
 }
 
 const separator = "============================================================"

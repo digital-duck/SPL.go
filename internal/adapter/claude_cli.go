@@ -13,6 +13,7 @@ import (
 type ClaudeCLIAdapter struct {
 	CLIPath      string
 	DefaultModel string
+	AllowedTools []string // e.g. ["WebSearch", "Bash"] → --allowed-tools WebSearch Bash
 	Timeout      time.Duration
 }
 
@@ -34,9 +35,21 @@ func NewClaudeCLIAdapter(cfg map[string]string) *ClaudeCLIAdapter {
 		}
 	}
 
+	var allowedTools []string
+	if cfg != nil {
+		if v, ok := cfg["allowed_tools"]; ok && v != "" {
+			for _, t := range strings.Split(v, ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					allowedTools = append(allowedTools, t)
+				}
+			}
+		}
+	}
+
 	return &ClaudeCLIAdapter{
 		CLIPath:      cliPath,
 		DefaultModel: defaultModel,
+		AllowedTools: allowedTools,
 		Timeout:      300 * time.Second,
 	}
 }
@@ -61,12 +74,16 @@ func (a *ClaudeCLIAdapter) Generate(ctx context.Context, prompt, model string, m
 	timeoutCtx, cancel := context.WithTimeout(ctx, a.Timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(timeoutCtx, a.CLIPath,
+	cliArgs := []string{
 		"-p", fullPrompt,
 		"--no-session-persistence",
 		"--model", model,
-		"--tools", "",
-	)
+	}
+	if len(a.AllowedTools) > 0 {
+		cliArgs = append(cliArgs, "--allowed-tools")
+		cliArgs = append(cliArgs, a.AllowedTools...)
+	}
+	cmd := exec.CommandContext(timeoutCtx, a.CLIPath, cliArgs...)
 
 	// Strip sensitive env vars
 	env := os.Environ()
