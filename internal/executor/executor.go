@@ -78,6 +78,7 @@ const (
 	ErrBudget           = "BudgetExceeded"
 	ErrNodeUnavailable  = "NodeUnavailable"
 	ErrModelUnavailable = "ModelUnavailable"
+	ErrGenerationError  = "GenerationError"
 )
 
 // adapterErrToSPL converts a raw adapter/HTTP error into a catchable *SPLError.
@@ -756,6 +757,17 @@ func (e *Executor) executeStatement(ctx context.Context, stmt ast.Stmt, state *W
 		return e.execDoBlock(ctx, s, state)
 	case *ast.SelectIntoStatement:
 		return e.execSelectInto(ctx, s, state)
+	case *ast.ProcedureStatement:
+		e.Procedures[s.Name] = s
+		e.Registry.RegisterProcedure(s)
+		return nil
+	case *ast.WorkflowStatement:
+		e.Workflows[s.Name] = s
+		return nil
+	case *ast.CreateFunctionStatement:
+		e.Functions[s.Name] = s
+		e.Registry.RegisterFunction(s)
+		return nil
 	default:
 		warnNotImplemented(fmt.Sprintf("unknown statement type %T", stmt))
 		return nil
@@ -1354,7 +1366,11 @@ func (e *Executor) execGenerateIntoPrompt(ctx context.Context, promptStmt *ast.P
 func (e *Executor) handleException(ctx context.Context, err *SPLError, handlers []ast.ExceptionHandler, state *WorkflowState) (bool, error) {
 	for _, handler := range handlers {
 		ht := handler.ExceptionType
-		if ht == err.Type || strings.EqualFold(ht, "OTHERS") || strings.EqualFold(ht, "Others") {
+		match := ht == err.Type || strings.EqualFold(ht, "OTHERS") || strings.EqualFold(ht, "Others")
+		if !match && ht == "GenerationError" {
+			match = err.Type == ErrModelUnavailable || err.Type == ErrNodeUnavailable || err.Type == ErrModelOverloaded
+		}
+		if match {
 			if execErr := e.executeBody(ctx, handler.Statements, state); execErr != nil {
 				return true, execErr
 			}

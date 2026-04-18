@@ -1389,7 +1389,7 @@ func (p *Parser) parseProcedureStatement() (*ast.ProcedureStatement, error) {
 	}
 
 	returnType := ""
-	if p.check(lexer.RETURNS) {
+	if p.check(lexer.RETURNS) || p.check(lexer.COMMIT) {
 		p.advance()
 		rtTok, err := p.expect(lexer.IDENTIFIER)
 		if err != nil {

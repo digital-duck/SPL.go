@@ -95,6 +95,7 @@ var Registry = map[string]Func{
 	"list_join":     listJoin,
 	"list_contains": listContains,
 	"trim_turns":    trimTurns,
+	"count":         listLength, // COUNT(@list) — alias for list_length; case-folded by stdlib.Call
 }
 
 // Call invokes a stdlib function by name. Returns (result, ok).

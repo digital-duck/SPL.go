@@ -40,6 +40,7 @@ var validExceptionTypes = map[string]bool{
 	"MaxIterationsReached":   true,
 	"BudgetExceeded":         true,
 	"NodeUnavailable":        true,
+	"GenerationError":        true,
 	"OTHERS":                 true,
 	"Others":                 true,
 }

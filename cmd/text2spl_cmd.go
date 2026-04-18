@@ -71,7 +71,7 @@ var text2splCmd = &cobra.Command{
 
 		maxRetries := cfg.Text2SPL.MaxRetries
 		if text2splNoValidate {
-			maxRetries = 0
+			maxRetries = -1 // sentinel: skip validation entirely, return raw output
 		}
 
 		compiler := text2spl.New(adp, codeStore, maxRetries)

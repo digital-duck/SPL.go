@@ -223,6 +223,15 @@ If you include code fences (` + "```" + `) they will be stripped automatically.
 
 	userPrompt := fmt.Sprintf("Generate SPL 2.0 code for the following task:\n\n%s", description)
 
+	// --no-validate (maxRetries == -1): single attempt, skip parse check entirely
+	if c.maxRetries < 0 {
+		result, err := c.adapter.Generate(ctx, userPrompt, "", 2000, 0.2, systemPrompt)
+		if err != nil {
+			return "", fmt.Errorf("text2spl: LLM error: %w", err)
+		}
+		return stripFences(result.Content), nil
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		prompt := userPrompt
