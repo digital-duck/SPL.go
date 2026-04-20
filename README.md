@@ -69,7 +69,8 @@ git clone git@github.com:digital-duck/SPL.go.git
 cd SPL.go
 go build -o ./spl-go .
 
-alias spl-go=~/bin/spl-go
+ln -s ~/projects/digital-duck/SPL.go/spl-go ~/.local/bin/spl-go
+
 ```
 
 **Requirements:** Go 1.22+
