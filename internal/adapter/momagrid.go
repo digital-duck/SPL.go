@@ -84,14 +84,21 @@ type momagridTaskRequest struct {
 	Priority    int     `json:"priority"`
 }
 
+type momagridTaskResult struct {
+	Content    string  `json:"content"`
+	Error      string  `json:"error"`
+	InputToks  int     `json:"input_tokens"`
+	OutputToks int     `json:"output_tokens"`
+	LatencyMs  float64 `json:"latency_ms"`
+	Model      string  `json:"model"`
+	AgentName  string  `json:"agent_name"`
+}
+
 type momagridTaskResponse struct {
-	TaskID    string `json:"task_id"`
-	State     string `json:"state"`
-	Result    string `json:"result"`
-	InputToks int    `json:"input_tokens"`
-	OutputToks int   `json:"output_tokens"`
-	LatencyMs float64 `json:"latency_ms"`
-	Error     string `json:"error"`
+	TaskID string             `json:"task_id"`
+	State  string             `json:"state"`
+	Result momagridTaskResult `json:"result"`
+	Error  string             `json:"error"`
 }
 
 func (a *MomagridAdapter) Generate(ctx context.Context, prompt, model string, maxTokens int, temperature float64, system string) (*GenerationResult, error) {
@@ -180,20 +187,20 @@ func (a *MomagridAdapter) Generate(ctx context.Context, prompt, model string, ma
 
 		switch taskResp.State {
 		case "COMPLETE":
-			latencyMs := taskResp.LatencyMs
+			latencyMs := taskResp.Result.LatencyMs
 			if latencyMs == 0 {
 				latencyMs = float64(time.Since(start).Milliseconds())
 			}
-			inputToks := taskResp.InputToks
-			outputToks := taskResp.OutputToks
+			inputToks := taskResp.Result.InputToks
+			outputToks := taskResp.Result.OutputToks
 			if inputToks == 0 {
 				inputToks = len(prompt) / 4
 			}
 			if outputToks == 0 {
-				outputToks = len(taskResp.Result) / 4
+				outputToks = len(taskResp.Result.Content) / 4
 			}
 			return &GenerationResult{
-				Content:      taskResp.Result,
+				Content:      taskResp.Result.Content,
 				Model:        model,
 				InputTokens:  inputToks,
 				OutputTokens: outputToks,
@@ -203,7 +210,11 @@ func (a *MomagridAdapter) Generate(ctx context.Context, prompt, model string, ma
 			}, nil
 
 		case "FAILED":
-			return nil, fmt.Errorf("momagrid: task failed: %s", taskResp.Error)
+			errMsg := taskResp.Result.Error
+			if errMsg == "" {
+				errMsg = taskResp.Error
+			}
+			return nil, fmt.Errorf("momagrid: task failed: %s", errMsg)
 
 		// Active states: PENDING, DISPATCHED, IN_FLIGHT, FORWARDED — keep polling
 		default:
