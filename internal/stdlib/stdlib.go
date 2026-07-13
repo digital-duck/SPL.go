@@ -96,6 +96,7 @@ var Registry = map[string]Func{
 	"list_contains": listContains,
 	"trim_turns":    trimTurns,
 	"count":         listLength, // COUNT(@list) — alias for list_length; case-folded by stdlib.Call
+	"len_val":       lenVal,     // polymorphic length: string chars, JSON array elements, JSON object keys
 }
 
 // Call invokes a stdlib function by name. Returns (result, ok).
@@ -888,6 +889,29 @@ func trimTurns(args []string) string {
 		return conversationJSON
 	}
 	return string(result)
+}
+
+// lenVal is a polymorphic length function.
+// - JSON array  → number of elements
+// - JSON object → number of keys
+// - string      → number of characters
+func lenVal(args []string) string {
+	if len(args) == 0 {
+		return "0"
+	}
+	s := args[0]
+	// Try array
+	var arr []interface{}
+	if json.Unmarshal([]byte(s), &arr) == nil {
+		return strconv.Itoa(len(arr))
+	}
+	// Try object
+	var obj map[string]interface{}
+	if json.Unmarshal([]byte(s), &obj) == nil {
+		return strconv.Itoa(len(obj))
+	}
+	// Fall back to string character count
+	return strconv.Itoa(len([]rune(s)))
 }
 
 // =============================================================================

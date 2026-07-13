@@ -69,6 +69,7 @@ func (e *SPLError) Error() string {
 }
 
 const (
+	// SPL 2.0 exception types
 	ErrHallucination    = "HallucinationDetected"
 	ErrRefusal          = "RefusalToAnswer"
 	ErrContextLength    = "ContextLengthExceeded"
@@ -79,6 +80,13 @@ const (
 	ErrNodeUnavailable  = "NodeUnavailable"
 	ErrModelUnavailable = "ModelUnavailable"
 	ErrGenerationError  = "GenerationError"
+	ErrToolFailed       = "ToolFailed"
+	// SPL 3.0 exception types — model availability and media codec errors
+	ErrFileNotFound      = "FileNotFound"
+	ErrUnsupportedFormat = "UnsupportedFormat"
+	ErrCodecError        = "CodecError"
+	ErrNoAudioTrack      = "NoAudioTrack"
+	ErrInvalidTimestamp  = "InvalidTimestamp"
 )
 
 // adapterErrToSPL converts a raw adapter/HTTP error into a catchable *SPLError.
@@ -114,8 +122,9 @@ func adapterErrToSPL(step string, err error) *SPLError {
 type WorkflowState struct {
 	mu              sync.RWMutex
 	Variables       map[string]string
-	Memory          map[string]string    // in-process cache
-	MemStore        *storage.MemoryStore // nil if not opened
+	StorageConns    map[string]*storage.StorageConn // STORAGE-typed vars → persistent backends
+	Memory          map[string]string               // in-process cache
+	MemStore        *storage.MemoryStore            // nil if not opened
 	Committed       bool
 	CommittedValue  string
 	CommittedOpts   map[string]string
@@ -130,6 +139,7 @@ type WorkflowState struct {
 func newWorkflowState(params map[string]string) *WorkflowState {
 	s := &WorkflowState{
 		Variables:     make(map[string]string),
+		StorageConns:  make(map[string]*storage.StorageConn),
 		Memory:        make(map[string]string),
 		CommittedOpts: make(map[string]string),
 	}
@@ -500,7 +510,14 @@ func (e *Executor) ExecuteWorkflow(ctx context.Context, stmt *ast.WorkflowStatem
 	// Initialize input variables from params and defaults
 	for _, inp := range stmt.Inputs {
 		if inp.ParamType == "STORAGE" {
-			warnNotImplemented(fmt.Sprintf("STORAGE parameter '@%s' in WORKFLOW INPUT — persistent storage params not supported", inp.Name))
+			if spec, ok := inp.DefaultValue.(*ast.StorageSpec); ok {
+				conn, err := storage.OpenStorageConn(spec.Backend, spec.Path)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "WARN: STORAGE(@%s, %s, %s): %v — falling back to in-memory map\n", inp.Name, spec.Backend, spec.Path, err)
+				} else {
+					state.StorageConns[inp.Name] = conn
+				}
+			}
 			continue
 		}
 		if v, ok := params[inp.Name]; ok {
@@ -530,6 +547,11 @@ func (e *Executor) ExecuteWorkflow(ctx context.Context, stmt *ast.WorkflowStatem
 		} else {
 			return nil, err
 		}
+	}
+
+	// Close any STORAGE connections opened for this workflow
+	for _, conn := range state.StorageConns {
+		conn.Close()
 	}
 
 	status := "complete"
@@ -735,8 +757,15 @@ func (e *Executor) executeStatement(ctx context.Context, stmt ast.Stmt, state *W
 	case *ast.StorageAssignStatement:
 		key := e.evalExpression(s.Key, state)
 		value := e.evalExpression(s.Value, state)
+		// STORAGE-backed variable: persist to backend
+		if conn, ok := state.StorageConns[s.StorageVar]; ok {
+			if err := conn.Set(key, value); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: STORAGE set @%s[%q]: %v\n", s.StorageVar, key, err)
+			}
+			return nil
+		}
+		// MAP variable: update JSON dict
 		varVal := state.getVar(s.StorageVar)
-		// Try updating an existing JSON dict (MAP variable)
 		var obj map[string]interface{}
 		if json.Unmarshal([]byte(varVal), &obj) == nil {
 			obj[key] = value
@@ -1611,6 +1640,11 @@ func (e *Executor) evalExpression(expr ast.Expr, state *WorkflowState) string {
 
 	case *ast.StorageSubscript:
 		key := e.evalExpression(ex.Key, state)
+		// STORAGE-backed variable: read from backend
+		if conn, ok := state.StorageConns[ex.StorageVar]; ok {
+			val, _ := conn.Get(key)
+			return val
+		}
 		varVal := state.getVar(ex.StorageVar)
 		// Try JSON dict (MAP variable)
 		var obj map[string]interface{}
@@ -1660,7 +1694,8 @@ func (e *Executor) evalExpression(expr ast.Expr, state *WorkflowState) string {
 		return ex.Description
 
 	case *ast.StorageSpec:
-		warnNotImplemented(fmt.Sprintf("StorageSpec (STORAGE(%s, %s) — persistent backend)", ex.Backend, ex.Path))
+		// StorageSpec is handled at INPUT binding time; evaluating one as an expression
+		// returns a placeholder string (it should not normally appear here).
 		return fmt.Sprintf("STORAGE(%s, %s)", ex.Backend, ex.Path)
 	}
 

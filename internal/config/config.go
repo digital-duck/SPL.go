@@ -53,6 +53,9 @@ type Config struct {
 	Model          string                   `yaml:"model"`
 	MaxLLMCalls    int                      `yaml:"max_llm_calls"`
 	MaxTotalTokens int                      `yaml:"max_total_tokens"`
+	StorageDir     string                   `yaml:"storage_dir"`  // base dir for STORAGE backends (default: .spl)
+	LogLevel       string                   `yaml:"log_level"`    // debug|info|warn|error
+	LogConsole     bool                     `yaml:"log_console"`  // also write logs to console
 	Adapters       map[string]AdapterConfig `yaml:"adapters"`
 	Text2SPL       Text2SPLConfig           `yaml:"text2spl"`
 	CodeRAG        CodeRAGConfig            `yaml:"code_rag"`
@@ -64,8 +67,11 @@ func Default() *Config {
 	return &Config{
 		Adapter:        "ollama",
 		Model:          "",
-		MaxLLMCalls:    100,
-		MaxTotalTokens: 500000,
+		MaxLLMCalls:    25,
+		MaxTotalTokens: 100000,
+		StorageDir:     ".spl",
+		LogLevel:       "info",
+		LogConsole:     false,
 		Adapters: map[string]AdapterConfig{
 			"ollama": {
 				BaseURL:      "http://localhost:11434",
@@ -171,6 +177,15 @@ func (c *Config) Get(key string) string {
 		return strconv.Itoa(c.MaxLLMCalls)
 	case "max_total_tokens":
 		return strconv.Itoa(c.MaxTotalTokens)
+	case "storage_dir":
+		return c.StorageDir
+	case "log_level":
+		return c.LogLevel
+	case "log_console":
+		if c.LogConsole {
+			return "true"
+		}
+		return "false"
 	default:
 		return ""
 	}
@@ -195,8 +210,14 @@ func (c *Config) Set(key, value string) error {
 			return fmt.Errorf("config: max_total_tokens must be an integer: %w", err)
 		}
 		c.MaxTotalTokens = n
+	case "storage_dir":
+		c.StorageDir = value
+	case "log_level":
+		c.LogLevel = value
+	case "log_console":
+		c.LogConsole = value == "true" || value == "1" || value == "yes"
 	default:
-		return fmt.Errorf("config: unknown key %q (valid: adapter, model, max_llm_calls, max_total_tokens)", key)
+		return fmt.Errorf("config: unknown key %q (valid: adapter, model, max_llm_calls, max_total_tokens, storage_dir, log_level, log_console)", key)
 	}
 	return nil
 }

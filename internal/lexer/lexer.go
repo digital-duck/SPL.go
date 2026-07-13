@@ -130,6 +130,8 @@ const (
 	PERCENT
 	SEMICOLON
 	DOLLAR_DOLLAR
+	NONE  // NONE literal (null / discard target)
+	TILDE // ~ semantic operator
 
 	EOF
 )
@@ -225,6 +227,8 @@ var keywords = map[string]TokenType{
 	"image":    IMAGE,
 	"audio":    AUDIO,
 	"video":    VIDEO,
+	// Literals that are also keywords
+	"none": NONE,
 }
 
 // Token is a single lexical token.
@@ -284,8 +288,22 @@ func (l *Lexer) Tokenize() ([]Token, error) {
 			if err := l.readDollarDollar(); err != nil {
 				return nil, err
 			}
+		case ch == '~':
+			l.emit(TILDE, "~")
+			l.advance()
 		case ch == '"' || ch == '\'':
-			if err := l.readString(ch); err != nil {
+			// Triple-quoted string: """...""" or '''...'''
+			if l.peek(1) == ch && l.peek(2) == ch {
+				if err := l.readTripleString(ch); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := l.readString(ch); err != nil {
+					return nil, err
+				}
+			}
+		case (ch == 'f' || ch == 'F') && l.peek(1) == '"' && l.peek(2) == '"' && l.peek(3) == '"':
+			if err := l.readTripleFString(); err != nil {
 				return nil, err
 			}
 		case (ch == 'f' || ch == 'F') && (l.peek(1) == '"' || l.peek(1) == '\''):
@@ -427,9 +445,21 @@ func (l *Lexer) skipWhitespaceAndComments() {
 		ch := l.source[l.pos]
 		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
 			l.advance()
-		} else if ch == '-' && l.peek(1) == '-' {
-			// Line comment: skip until end of line
+		} else if (ch == '-' && l.peek(1) == '-') || ch == '#' {
+			// Line comment (-- or #): skip until end of line
 			for l.pos < len(l.source) && l.source[l.pos] != '\n' {
+				l.advance()
+			}
+		} else if ch == '/' && l.peek(1) == '*' {
+			// Block comment: skip until */
+			l.advance() // /
+			l.advance() // *
+			for l.pos < len(l.source) {
+				if l.source[l.pos] == '*' && l.peek(1) == '/' {
+					l.advance() // *
+					l.advance() // /
+					break
+				}
 				l.advance()
 			}
 		} else {
@@ -560,6 +590,49 @@ func (l *Lexer) readIdentifier() {
 		tt = IDENTIFIER
 	}
 	l.tokens = append(l.tokens, Token{Type: tt, Value: value, Line: startLine, Column: startCol})
+}
+
+func (l *Lexer) readTripleString(quote rune) error {
+	startLine := l.line
+	startCol := l.column
+	l.advance() // first quote
+	l.advance() // second quote
+	l.advance() // third quote
+	var chars []rune
+	for l.pos < len(l.source) {
+		if l.source[l.pos] == quote && l.peek(1) == quote && l.peek(2) == quote {
+			l.advance()
+			l.advance()
+			l.advance()
+			l.tokens = append(l.tokens, Token{Type: STRING, Value: string(chars), Line: startLine, Column: startCol})
+			return nil
+		}
+		chars = append(chars, l.source[l.pos])
+		l.advance()
+	}
+	return &LexerError{Message: "Unterminated triple-quoted string", Line: startLine, Column: startCol}
+}
+
+func (l *Lexer) readTripleFString() error {
+	startLine := l.line
+	startCol := l.column
+	l.advance() // f prefix
+	l.advance() // first "
+	l.advance() // second "
+	l.advance() // third "
+	var chars []rune
+	for l.pos < len(l.source) {
+		if l.source[l.pos] == '"' && l.peek(1) == '"' && l.peek(2) == '"' {
+			l.advance()
+			l.advance()
+			l.advance()
+			l.tokens = append(l.tokens, Token{Type: FSTRING, Value: string(chars), Line: startLine, Column: startCol})
+			return nil
+		}
+		chars = append(chars, l.source[l.pos])
+		l.advance()
+	}
+	return &LexerError{Message: "Unterminated triple-quoted f-string", Line: startLine, Column: startCol}
 }
 
 func (l *Lexer) readDollarDollar() error {

@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/digital-duck/spl20go/internal/config"
 	"github.com/digital-duck/spl20go/internal/rag"
@@ -32,11 +36,11 @@ var docRAGAddCmd = &cobra.Command{
 		text := args[0]
 		// If it looks like a readable file path, read its contents.
 		if _, err := os.Stat(text); err == nil {
-			data, err := os.ReadFile(text)
+			extracted, err := readDocFile(text)
 			if err != nil {
 				return fmt.Errorf("doc-rag add: read file: %w", err)
 			}
-			text = string(data)
+			text = extracted
 		}
 
 		n, err := dr.Add(context.Background(), text, map[string]string{})
@@ -93,6 +97,36 @@ var docRAGCountCmd = &cobra.Command{
 		fmt.Printf("doc-rag: %d chunk(s) indexed\n", n)
 		return nil
 	},
+}
+
+// readDocFile reads a file, extracting text from PDFs via pdftotext (poppler).
+// Falls back to raw bytes for all other file types.
+func readDocFile(path string) (string, error) {
+	if strings.EqualFold(filepath.Ext(path), ".pdf") {
+		// Try pdftotext (from poppler-utils) first
+		if out, err := extractPDFText(path); err == nil {
+			return out, nil
+		}
+		// Fall back: warn and read raw bytes (will contain binary noise)
+		fmt.Fprintf(os.Stderr, "WARN: pdftotext not found — reading PDF as raw bytes. Install poppler-utils for proper extraction.\n")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// extractPDFText calls pdftotext -layout - <path> and returns stdout.
+func extractPDFText(path string) (string, error) {
+	var buf bytes.Buffer
+	cmd := exec.Command("pdftotext", "-layout", path, "-")
+	cmd.Stdout = &buf
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 func init() {

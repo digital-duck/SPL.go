@@ -1578,7 +1578,17 @@ func (p *Parser) parseEvaluateStatement() (*ast.EvaluateStatement, error) {
 }
 
 func (p *Parser) parseEvaluateCondition() (interface{}, error) {
-	// Semantic condition: string literal
+	// Semantic condition: ~ 'semantic value' (TILDE prefix)
+	if p.check(lexer.TILDE) {
+		p.advance()
+		valTok, err := p.expect(lexer.STRING)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.SemanticCondition{SemanticValue: valTok.Value}, nil
+	}
+
+	// Semantic condition: bare string literal
 	if p.check(lexer.STRING) {
 		value := p.advance().Value
 		return &ast.SemanticCondition{SemanticValue: value}, nil
@@ -1601,6 +1611,72 @@ func (p *Parser) parseEvaluateCondition() (interface{}, error) {
 			return nil, err
 		}
 		return &ast.ComparisonCondition{Operator: op, Right: right}, nil
+	}
+
+	// IS 'value' / IS NOT 'value' — natural-language sugar for = / !=
+	if tok.Type == lexer.IDENTIFIER && strings.EqualFold(tok.Value, "is") {
+		p.advance() // IS
+		op := "="
+		if p.check(lexer.NOT) {
+			p.advance() // NOT
+			op = "!="
+		}
+		right, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.ComparisonCondition{Operator: op, Right: right}, nil
+	}
+
+	// BOOLEAN literal: WHEN TRUE / WHEN FALSE
+	if tok.Type == lexer.TRUE {
+		p.advance()
+		return &ast.ComparisonCondition{Operator: "=", Right: &ast.Literal{Value: "true", LitType: "bool"}}, nil
+	}
+	if tok.Type == lexer.FALSE {
+		p.advance()
+		return &ast.ComparisonCondition{Operator: "=", Right: &ast.Literal{Value: "false", LitType: "bool"}}, nil
+	}
+
+	// IN ('a', 'b') / NOT IN ('a', 'b') — deterministic membership test
+	if tok.Type == lexer.NOT || tok.Type == lexer.IN {
+		negate := false
+		if tok.Type == lexer.NOT {
+			p.advance() // NOT
+			if _, err := p.expect(lexer.IN); err != nil {
+				return nil, err
+			}
+			negate = true
+		} else {
+			p.advance() // IN
+		}
+		if _, err := p.expect(lexer.LPAREN); err != nil {
+			return nil, err
+		}
+		first, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		inValues := []ast.Expr{first}
+		for p.check(lexer.COMMA) {
+			p.advance()
+			v, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			inValues = append(inValues, v)
+		}
+		if _, err := p.expect(lexer.RPAREN); err != nil {
+			return nil, err
+		}
+		op := "IN"
+		if negate {
+			op = "NOT IN"
+		}
+		return &ast.ComparisonCondition{
+			Operator: op,
+			Right:    &ast.FunctionCall{Name: "__in_list__", Arguments: inValues},
+		}, nil
 	}
 
 	// contains('value') [OR contains('value')]*
@@ -2000,14 +2076,33 @@ func (p *Parser) parseGenerateIntoStatement() (*ast.GenerateIntoStatement, error
 	target := ""
 	if p.check(lexer.INTO) {
 		p.advance()
-		if _, err = p.expect(lexer.AT); err != nil {
+		// INTO NONE — discard output
+		if p.check(lexer.NONE) || (p.check(lexer.IDENTIFIER) && strings.EqualFold(p.current().Value, "none")) {
+			p.advance()
+			target = "NONE"
+		} else {
+			if _, err = p.expect(lexer.AT); err != nil {
+				return nil, err
+			}
+			targetTok, err := p.expectIdentifierOrKeyword()
+			if err != nil {
+				return nil, err
+			}
+			target = targetTok.Value
+		}
+	}
+
+	// USING MODEL after INTO (LLMs sometimes place it here)
+	if p.check(lexer.USING) {
+		p.advance()
+		if _, err = p.expect(lexer.MODEL); err != nil {
 			return nil, err
 		}
-		targetTok, err := p.expectIdentifierOrKeyword()
-		if err != nil {
-			return nil, err
+		if p.check(lexer.STRING) {
+			genClause.Model = p.advance().Value
+		} else if p.check(lexer.IDENTIFIER) {
+			genClause.Model = p.advance().Value
 		}
-		target = targetTok.Value
 	}
 
 	return &ast.GenerateIntoStatement{
@@ -2059,8 +2154,8 @@ func (p *Parser) parseCallStatement() (ast.Stmt, error) {
 	target := ""
 	if p.check(lexer.INTO) {
 		p.advance()
-		// INTO NONE — discard result (SPL 3.0); NONE arrives as IDENTIFIER "NONE"
-		if p.check(lexer.IDENTIFIER) && strings.EqualFold(p.current().Value, "none") {
+		// INTO NONE — discard result (SPL 3.0)
+		if p.check(lexer.NONE) || (p.check(lexer.IDENTIFIER) && strings.EqualFold(p.current().Value, "none")) {
 			p.advance() // consume NONE
 		} else {
 			if _, err = p.expect(lexer.AT); err != nil {
@@ -2110,14 +2205,20 @@ func (p *Parser) parseSelectIntoStatement() (*ast.SelectIntoStatement, error) {
 	target := ""
 	if p.check(lexer.INTO) {
 		p.advance()
-		if _, err = p.expect(lexer.AT); err != nil {
-			return nil, err
+		// INTO NONE — discard output
+		if p.check(lexer.NONE) || (p.check(lexer.IDENTIFIER) && strings.EqualFold(p.current().Value, "none")) {
+			p.advance()
+			target = "NONE"
+		} else {
+			if _, err = p.expect(lexer.AT); err != nil {
+				return nil, err
+			}
+			targetTok, err := p.expectIdentifierOrKeyword()
+			if err != nil {
+				return nil, err
+			}
+			target = targetTok.Value
 		}
-		targetTok, err := p.expectIdentifierOrKeyword()
-		if err != nil {
-			return nil, err
-		}
-		target = targetTok.Value
 	}
 
 	return &ast.SelectIntoStatement{
