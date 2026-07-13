@@ -1,20 +1,21 @@
 # SPL.py → SPL.go Sync Plan (2026-07-13)
 
 Reference commit in SPL.py: `4bc6135` (latest as of 2026-07-13)  
-Last Go sync point: mid-April 2025
+Last Go sync point: mid-April 2025  
+**Completed:** 2026-07-13 — commit `9962fa1`
 
 ## dd-* Dependency Mapping
 
-| dd-* Library | Used for in SPL.py | Go treatment |
-|---|---|---|
-| `dd-db` | `STORAGE(sqlite/duckdb/postgres, path)` SPL feature | Native Go via `database/sql` + drivers |
-| `dd-cache` | `DiskCache` prompt_cache in `storage/memory.py` | Already done — `storage/memory.go` uses SQLite |
-| `dd-embed` | Embeddings for RAG | Go uses Ollama — equivalent |
-| `dd-extract` | PDF text extraction in doc-rag | Port using `pdfcpu` or similar Go lib |
-| `dd-logging` | `setup_logging()` / `get_logger()` in CLI | Go stdlib `log`; add `log_level`/`log_console` config fields |
-| `dd-llm` | Python bridge adapter `dd_llm_bridge.py` | Python-only; Go uses native adapters instead |
-| `dd-vectordb` | Vector store for RAG | Go uses ChromaDB REST — equivalent |
-| `dd-config` | Config management | Go YAML config; add new fields as needed |
+| dd-* Library | Used for in SPL.py | Go treatment | Done? |
+|---|---|---|---|
+| `dd-db` | `STORAGE(sqlite/duckdb/postgres, path)` SPL feature | `internal/storage/storage_conn.go` — SQLite wired, DuckDB/Postgres stubs | ✓ |
+| `dd-cache` | `DiskCache` prompt_cache in `storage/memory.py` | Already done — `storage/memory.go` uses SQLite | ✓ |
+| `dd-embed` | Embeddings for RAG | Go uses Ollama — equivalent, no change needed | ✓ |
+| `dd-extract` | PDF text extraction in doc-rag | `cmd/docrag_cmd.go` — calls `pdftotext` (poppler) subprocess with graceful fallback | ✓ |
+| `dd-logging` | `setup_logging()` / `get_logger()` in CLI | `log_level` + `log_console` config fields added; Go uses stdlib `log` | ✓ |
+| `dd-llm` | Python bridge adapter `dd_llm_bridge.py` | Python-only concept; Go has native adapters — no port needed | n/a |
+| `dd-vectordb` | Vector store for RAG | Go uses ChromaDB REST directly — equivalent, no change needed | ✓ |
+| `dd-config` | Config management | `storage_dir`, `log_level`, `log_console` added; defaults aligned with Python | ✓ |
 
 ## Work Items
 
@@ -70,3 +71,25 @@ Last Go sync point: mid-April 2025
 - IR: `spl/ir.py`
 - Config: `spl/config.py`
 - CLI: `spl/cli.py`
+
+## Implementation Notes (shipped 2026-07-13)
+
+### Files modified
+| File | Change |
+|---|---|
+| `internal/lexer/lexer.go` | `NONE` token, `TILDE` operator, triple-quoted strings (`"""/'''`), `#` line + `/* */` block comments |
+| `internal/parser/parser.go` | `INTO NONE`, `~'cond'` semantic EVALUATE, `IS`/`IS NOT` WHEN sugar, `IN`/`NOT IN`, boolean `WHEN TRUE/FALSE`, `USING MODEL` after `INTO` |
+| `internal/stdlib/stdlib.go` | `len_val()` — polymorphic length for string / JSON array / JSON object |
+| `internal/executor/executor.go` | Six new SPL 3.0 exception constants; STORAGE wiring (`StorageConns` map on `WorkflowState`, open/close lifecycle, subscript read/write routing) |
+| `internal/config/config.go` | `storage_dir`, `log_level`, `log_console` fields; defaults aligned with Python (`max_llm_calls`→25, `max_total_tokens`→100000) |
+| `internal/executor/planner.go` | `WorkflowStep`, `WorkflowBranch`, `WorkflowPlan` types; `PlanWorkflow` / `PlanProcedure` methods |
+| `cmd/docrag_cmd.go` | `readDocFile` + `extractPDFText` — PDF text via `pdftotext` subprocess (poppler) with graceful fallback |
+
+### New files
+| File | Purpose |
+|---|---|
+| `internal/storage/storage_conn.go` | SQLite-backed STORAGE key-value conn; DuckDB/Postgres stubs with actionable error messages |
+| `internal/ir/ir.go` | Full AST→JSON serialization (`ProgramToJSON`, `MarshalProgram`, `MarshalProgramIndent`) compatible with Python `spl.ir` |
+
+### Skipped (deferred)
+Items #5–#8 (Bedrock, Gemini CLI, Vertex AI, Azure OpenAI adapters) and #10 (their config sections) are open for a future sync pass.
