@@ -100,6 +100,12 @@ const (
 	AUDIO
 	VIDEO
 
+	// SPL 3.0 deterministic-mode keywords (SOLVE/ASSERT verifier ladder)
+	SOLVE
+	ASSERT
+	TOOL_API
+	KERNEL
+
 	// Literals
 	INTEGER
 	FLOAT
@@ -227,6 +233,10 @@ var keywords = map[string]TokenType{
 	"image":    IMAGE,
 	"audio":    AUDIO,
 	"video":    VIDEO,
+	"solve":    SOLVE,
+	"assert":   ASSERT,
+	"tool_api": TOOL_API,
+	"kernel":   KERNEL,
 	// Literals that are also keywords
 	"none": NONE,
 }

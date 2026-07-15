@@ -88,6 +88,39 @@ func parseSplToolFunctions(path string) ([]string, error) {
 	return names, scanner.Err()
 }
 
+// LoadInline wraps a single Python function body (as captured verbatim from
+// a CREATE TOOL_API ... AS PYTHON $$ ... $$ statement) as a Go callable.
+// Unlike Load, there is no external .py file: the body is piped to the
+// python3 subprocess over stdin and exec'd into a fresh namespace, then the
+// named function is invoked from that namespace. This mirrors Load's
+// subprocess-per-call model so CALL <tool_api_name>(...) works the same way
+// for inline TOOL_API declarations as it does for external --tools files.
+func LoadInline(fnName, body string) func(args []string) string {
+	return func(args []string) string {
+		return callPythonToolInline(fnName, body, args)
+	}
+}
+
+// callPythonToolInline is LoadInline's per-call implementation.
+func callPythonToolInline(fnName, body string, args []string) string {
+	snippet := fmt.Sprintf(
+		"import sys; _ns = {}; exec(sys.stdin.read(), _ns); "+
+			"result = _ns[%q](*sys.argv[1:]); print('' if result is None else str(result))",
+		fnName,
+	)
+	cmdArgs := append([]string{"-c", snippet}, args...)
+	cmd := exec.Command("python3", cmdArgs...)
+	cmd.Stdin = strings.NewReader(body)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return fmt.Sprintf("tool_error: %s: %s", fnName, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return fmt.Sprintf("tool_error: %s: %v", fnName, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // callPythonTool invokes a single Python tool function via subprocess and
 // returns its string output (trimmed). Returns an error string on failure.
 //

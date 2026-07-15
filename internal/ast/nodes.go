@@ -320,12 +320,42 @@ type PromptStatement struct {
 func (*PromptStatement) nodeTag() {}
 func (*PromptStatement) stmtTag() {}
 
+// SolveStatement represents SOLVE @var [TYPE] := python_template.
+// Routes python_template to the deterministic kernel; the result (always a
+// string) is assigned to @var. TYPE is an optional documentation-only
+// annotation (SPL 3.0 does not yet perform type coercion on SOLVE results).
+// Mirrors spl3/ast_nodes.py SolveStatement.
+type SolveStatement struct {
+	Variable string
+	VarType  string
+	Template string
+}
+
+func (*SolveStatement) nodeTag() {}
+func (*SolveStatement) stmtTag() {}
+
+// AssertStatement represents ASSERT python_template [OTHERWISE statement_or_block].
+// Routes python_template to the deterministic kernel; if the result is falsy,
+// executes Otherwise (or raises an SPL EXCEPTION if Otherwise is empty).
+// Mirrors spl3/ast_nodes.py AssertStatement.
+type AssertStatement struct {
+	Template  string
+	Otherwise []Stmt
+}
+
+func (*AssertStatement) nodeTag() {}
+func (*AssertStatement) stmtTag() {}
+
 // CreateFunctionStatement represents CREATE FUNCTION <name>(...) RETURNS <type> AS $$ ... $$
+// or CREATE TOOL_API <name>(...) RETURNS <type> AS PYTHON $$ ... $$ (IsToolAPI=true).
+// Both forms register a Python-backed callable; TOOL_API is SPL 3.0's deterministic-mode
+// tool declaration, invoked via CALL and (for SOLVE-adjacent tools) the kernel bridge.
 type CreateFunctionStatement struct {
 	Name       string
 	Parameters []Parameter
 	ReturnType string
 	Body       string
+	IsToolAPI  bool
 }
 
 func (*CreateFunctionStatement) nodeTag() {}

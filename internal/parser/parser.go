@@ -96,6 +96,10 @@ func (p *Parser) parseStatement() (ast.Stmt, error) {
 		return p.parseAssignmentStatement()
 	case lexer.SET:
 		return p.parseSetStatement()
+	case lexer.SOLVE:
+		return p.parseSolveStatement()
+	case lexer.ASSERT:
+		return p.parseAssertStatement()
 	}
 	tok := p.current()
 	return nil, &ParseError{
@@ -1031,7 +1035,10 @@ func (p *Parser) parseCreateFunction() (*ast.CreateFunctionStatement, error) {
 	if _, err := p.expect(lexer.CREATE); err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(lexer.FUNCTION); err != nil {
+	isToolAPI := p.check(lexer.TOOL_API)
+	if isToolAPI {
+		p.advance()
+	} else if _, err := p.expect(lexer.FUNCTION); err != nil {
 		return nil, err
 	}
 	nameTok, err := p.expect(lexer.IDENTIFIER)
@@ -1075,6 +1082,11 @@ func (p *Parser) parseCreateFunction() (*ast.CreateFunctionStatement, error) {
 	if _, err = p.expect(lexer.AS); err != nil {
 		return nil, err
 	}
+	// CREATE TOOL_API bodies are conventionally "AS PYTHON $$ ... $$"; the
+	// language marker is a plain identifier, not a keyword — skip it if present.
+	if p.check(lexer.IDENTIFIER) {
+		p.advance()
+	}
 	if _, err = p.expect(lexer.DOLLAR_DOLLAR); err != nil {
 		return nil, err
 	}
@@ -1088,7 +1100,166 @@ func (p *Parser) parseCreateFunction() (*ast.CreateFunctionStatement, error) {
 		Parameters: parameters,
 		ReturnType: rtTok.Value,
 		Body:       bodyTok.Value,
+		IsToolAPI:  isToolAPI,
 	}, nil
+}
+
+// =============================================================================
+// SOLVE / ASSERT — deterministic-mode kernel dispatch (SPL 3.0)
+// =============================================================================
+
+// parseSolveStatement parses SOLVE @var [TYPE] := python_template.
+// Mirrors spl3/parser.py _parse_solve_statement.
+func (p *Parser) parseSolveStatement() (*ast.SolveStatement, error) {
+	if _, err := p.expect(lexer.SOLVE); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lexer.AT); err != nil {
+		return nil, err
+	}
+	targetTok, err := p.expectIdentifierOrKeyword()
+	if err != nil {
+		return nil, err
+	}
+
+	varType := ""
+	if p.checkAny(lexer.IDENTIFIER, lexer.SET) && !p.check(lexer.ASSIGN) {
+		varType = strings.ToUpper(p.advance().Value)
+	}
+
+	if _, err = p.expect(lexer.ASSIGN); err != nil {
+		return nil, err
+	}
+	template := p.parsePythonTemplate()
+
+	return &ast.SolveStatement{
+		Variable: targetTok.Value,
+		VarType:  varType,
+		Template: template,
+	}, nil
+}
+
+// parseAssertStatement parses ASSERT python_template [OTHERWISE statement_or_block].
+// OTHERWISE lexes as lexer.ELSE (backward-compat alias). Mirrors
+// spl3/parser.py _parse_assert_statement.
+func (p *Parser) parseAssertStatement() (*ast.AssertStatement, error) {
+	if _, err := p.expect(lexer.ASSERT); err != nil {
+		return nil, err
+	}
+	template := p.parsePythonTemplate()
+
+	var otherwise []ast.Stmt
+	if p.check(lexer.ELSE) {
+		p.advance()
+		if p.check(lexer.DO) {
+			p.advance()
+			for !p.checkAny(lexer.END, lexer.EOF) {
+				stmt, err := p.parseStatement()
+				if err != nil {
+					return nil, err
+				}
+				otherwise = append(otherwise, stmt)
+				for p.check(lexer.SEMICOLON) {
+					p.advance()
+				}
+			}
+			if _, err := p.expect(lexer.END); err != nil {
+				return nil, err
+			}
+		} else {
+			stmt, err := p.parseStatement()
+			if err != nil {
+				return nil, err
+			}
+			otherwise = append(otherwise, stmt)
+		}
+	}
+
+	return &ast.AssertStatement{
+		Template:  template,
+		Otherwise: otherwise,
+	}, nil
+}
+
+// pythonTemplateStop is the set of token types that end a SOLVE/ASSERT
+// python_template at paren/bracket/brace depth 0 — either a hard statement
+// terminator or a keyword that starts the next SPL statement. Mirrors the
+// _STOP set in spl3/parser.py _parse_python_call_template.
+var pythonTemplateStop = map[lexer.TokenType]bool{
+	lexer.EOF:       true,
+	lexer.SEMICOLON: true,
+	lexer.END:       true,
+	lexer.ELSE:      true, // OTHERWISE
+	lexer.COMMIT:    true,
+	lexer.LOGGING:   true,
+	lexer.WHILE:     true,
+	lexer.EVALUATE:  true,
+	lexer.WORKFLOW:  true,
+	lexer.RETRY:     true,
+	lexer.RAISE:     true,
+	lexer.CALL:      true,
+	lexer.GENERATE:  true,
+	lexer.SOLVE:     true,
+	lexer.ASSERT:    true,
+	lexer.IMPORT:    true,
+	lexer.CREATE:    true,
+	lexer.SET:       true,
+	lexer.SELECT:    true,
+	lexer.STORE:     true,
+	lexer.DO:        true,
+}
+
+// parsePythonTemplate collects raw tokens until a statement boundary
+// (tracking paren/bracket/brace depth so commas and keywords inside a call
+// don't terminate early) and reconstructs them as Python source text, with
+// @var references rendered as @var (the kernel bridge substitutes these
+// from the workflow's variable store before dispatch, matching the
+// {@var}/@@var@@ interpolation used elsewhere in SPL).
+func (p *Parser) parsePythonTemplate() string {
+	var b strings.Builder
+	depth := 0
+	first := true
+	for {
+		tok := p.current()
+		if depth == 0 && pythonTemplateStop[tok.Type] {
+			break
+		}
+		switch tok.Type {
+		case lexer.LPAREN, lexer.LBRACKET, lexer.LBRACE:
+			depth++
+		case lexer.RPAREN, lexer.RBRACKET, lexer.RBRACE:
+			depth--
+		}
+		if !first {
+			switch tok.Type {
+			case lexer.LPAREN, lexer.RPAREN, lexer.LBRACKET, lexer.RBRACKET,
+				lexer.DOT, lexer.COMMA:
+				// no leading space before these
+			default:
+				b.WriteString(" ")
+			}
+		}
+		switch tok.Type {
+		case lexer.STRING:
+			b.WriteString(strconv.Quote(tok.Value))
+		case lexer.AT:
+			b.WriteString("@")
+			p.advance()
+			// Variable names may collide with reserved keywords (e.g. @result,
+			// @input) — expectIdentifierOrKeyword accepts both, matching how
+			// @-references are parsed everywhere else in the grammar.
+			if nameTok, err := p.expectIdentifierOrKeyword(); err == nil {
+				b.WriteString(nameTok.Value)
+			}
+			first = false
+			continue
+		default:
+			b.WriteString(tok.Value)
+		}
+		first = false
+		p.advance()
+	}
+	return b.String()
 }
 
 func (p *Parser) parseParameter() (ast.Parameter, error) {
@@ -1207,28 +1378,34 @@ func (p *Parser) parseWorkflowStatement() (*ast.WorkflowStatement, error) {
 		return nil, err
 	}
 
+	// INPUT/OUTPUT accept two forms: a single keyword followed by a
+	// comma-separated list ("INPUT: @a TYPE, @b TYPE"), or SPL 3.0's
+	// repeated-keyword-per-line style ("INPUT @a TYPE\n  INPUT @b TYPE").
+	// Both are supported by looping on the leading keyword.
 	var inputs []ast.Parameter
-	if p.check(lexer.INPUT) {
+	for p.check(lexer.INPUT) {
 		p.advance()
 		if p.check(lexer.COLON) {
 			p.advance()
 		}
-		inputs, err = p.parseWorkflowParamList()
-		if err != nil {
-			return nil, err
+		params, perr := p.parseWorkflowParamList()
+		if perr != nil {
+			return nil, perr
 		}
+		inputs = append(inputs, params...)
 	}
 
 	var outputs []ast.Parameter
-	if p.check(lexer.OUTPUT) {
+	for p.check(lexer.OUTPUT) {
 		p.advance()
 		if p.check(lexer.COLON) {
 			p.advance()
 		}
-		outputs, err = p.parseWorkflowParamList()
-		if err != nil {
-			return nil, err
+		params, perr := p.parseWorkflowParamList()
+		if perr != nil {
+			return nil, perr
 		}
+		outputs = append(outputs, params...)
 	}
 
 	var security map[string]string
@@ -1341,7 +1518,7 @@ func (p *Parser) parseWorkflowParam() (ast.Parameter, error) {
 		}
 	}
 
-	if p.check(lexer.DEFAULT) {
+	if p.check(lexer.DEFAULT) || p.check(lexer.ASSIGN) {
 		p.advance()
 		defaultValue, err = p.parseExpression()
 		if err != nil {

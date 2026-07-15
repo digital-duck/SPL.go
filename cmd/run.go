@@ -22,6 +22,7 @@ var runParams []string
 var runWorkers int
 var runPlan bool
 var runToolsFile string
+var runKernel bool
 var runAllowedTools []string
 
 var runCmd = &cobra.Command{
@@ -116,6 +117,10 @@ Examples:
 		exec := executor.New(adp)
 		exec.MaxWorkers = runWorkers
 		exec.SourceDir = filepath.Dir(filename)
+		exec.KernelEnabled = runKernel
+		if runKernel {
+			defer exec.CloseKernel()
+		}
 
 		// Load Python tools if --tools was specified
 		if runToolsFile != "" {
@@ -161,6 +166,7 @@ func init() {
 	runCmd.Flags().BoolVar(&runPlan, "plan", false, "Show pre-execution plan and resource estimates")
 	runCmd.Flags().StringVar(&runToolsFile, "tools", "", "Path to Python tools file (.py) — registers @spl_tool functions as CALL-able tools")
 	runCmd.Flags().StringArrayVar(&runAllowedTools, "allowed-tools", nil, "Tools to allow for claude_cli adapter (e.g. --allowed-tools WebSearch Bash)")
+	runCmd.Flags().BoolVar(&runKernel, "kernel", false, "Start a persistent python3 kernel session for SOLVE/ASSERT (deterministic-mode dispatch)")
 }
 
 const separator = "============================================================"

@@ -20,6 +20,7 @@ import (
 	"github.com/digital-duck/spl20go/internal/parser"
 	"github.com/digital-duck/spl20go/internal/stdlib"
 	"github.com/digital-duck/spl20go/internal/storage"
+	"github.com/digital-duck/spl20go/internal/tools"
 )
 
 // =============================================================================
@@ -215,6 +216,18 @@ type Executor struct {
 	Procedures     map[string]*ast.ProcedureStatement
 	Workflows      map[string]*ast.WorkflowStatement
 	Registry       *functions.Registry
+	// ToolBodies holds the raw Python source of every CREATE TOOL_API
+	// function registered so far, keyed by name. ASSERT's kernel-free path
+	// (no --kernel flag) needs all of them available in one eval namespace,
+	// mirroring Python's `ns.update(self.functions._tools)`.
+	ToolBodies map[string]string
+	// Kernel is the persistent deterministic-mode subprocess used by SOLVE
+	// and ASSERT's kernel path. Nil until --kernel is passed and the first
+	// SOLVE/ASSERT statement starts it.
+	Kernel *kernelSession
+	// KernelEnabled mirrors Python's --kernel CLI flag: gates SOLVE (which
+	// errors without it) and selects ASSERT's kernel vs. kernel-free path.
+	KernelEnabled bool
 }
 
 // New creates a new Executor with the given adapter.
@@ -225,6 +238,7 @@ func New(a adapter.Adapter) *Executor {
 		MaxTotalTokens: defaultMaxTotalTokens,
 		MaxWorkers:     0,
 		Tools:          make(map[string]func(args []string) string),
+		ToolBodies:     make(map[string]string),
 		Functions:      make(map[string]*ast.CreateFunctionStatement),
 		Procedures:     make(map[string]*ast.ProcedureStatement),
 		Workflows:      make(map[string]*ast.WorkflowStatement),
@@ -275,8 +289,7 @@ func (e *Executor) registerProgram(ctx context.Context, program *ast.Program) er
 				return err
 			}
 		case *ast.CreateFunctionStatement:
-			e.Functions[s.Name] = s
-			e.Registry.RegisterFunction(s)
+			e.registerFunction(s)
 		case *ast.ProcedureStatement:
 			e.Procedures[s.Name] = s
 			e.Registry.RegisterProcedure(s)
@@ -285,6 +298,25 @@ func (e *Executor) registerProgram(ctx context.Context, program *ast.Program) er
 		}
 	}
 	return nil
+}
+
+// registerFunction registers a CREATE FUNCTION or CREATE TOOL_API statement.
+// Called from all three sites a definition can be discovered (top-level
+// registration pass, IMPORT'd file registration, and in-body execution) so
+// TOOL_API's Tools/ToolBodies wiring is never skipped depending on where a
+// recipe happens to declare its tools (e.g. cookbook/77_neurosymbolic
+// imports sympolic_tools.spl for exactly this reason).
+func (e *Executor) registerFunction(s *ast.CreateFunctionStatement) {
+	e.Functions[s.Name] = s
+	e.Registry.RegisterFunction(s)
+	if s.IsToolAPI {
+		// CREATE TOOL_API registers a Python-backed callable, invoked via
+		// CALL and (for ASSERT's kernel-free path) eval. Mirrors the
+		// external --tools file mechanism (internal/tools/loader.go) but
+		// for a body captured inline from the .spl source.
+		e.Tools[s.Name] = tools.LoadInline(s.Name, s.Body)
+		e.ToolBodies[s.Name] = s.Body
+	}
 }
 
 // execImport loads an imported .spl file, parses it, and registers its
@@ -320,8 +352,7 @@ func (e *Executor) execImport(_ context.Context, stmt *ast.ImportStatement) erro
 	for _, s := range prog.Statements {
 		switch def := s.(type) {
 		case *ast.CreateFunctionStatement:
-			e.Functions[def.Name] = def
-			e.Registry.RegisterFunction(def)
+			e.registerFunction(def)
 		case *ast.ProcedureStatement:
 			e.Procedures[def.Name] = def
 			e.Registry.RegisterProcedure(def)
@@ -794,9 +825,12 @@ func (e *Executor) executeStatement(ctx context.Context, stmt ast.Stmt, state *W
 		e.Workflows[s.Name] = s
 		return nil
 	case *ast.CreateFunctionStatement:
-		e.Functions[s.Name] = s
-		e.Registry.RegisterFunction(s)
+		e.registerFunction(s)
 		return nil
+	case *ast.SolveStatement:
+		return e.execSolve(ctx, s, state)
+	case *ast.AssertStatement:
+		return e.execAssert(ctx, s, state)
 	default:
 		warnNotImplemented(fmt.Sprintf("unknown statement type %T", stmt))
 		return nil
@@ -811,6 +845,119 @@ func (e *Executor) execAssignment(_ context.Context, stmt *ast.AssignmentStateme
 	value := e.evalExpression(stmt.Expression, state)
 	state.setVar(stmt.Variable, value)
 	return nil
+}
+
+// varRefPattern matches @varname references inside a SOLVE/ASSERT python
+// template — the parser preserves them verbatim as "@name" tokens.
+var varRefPattern = regexp.MustCompile(`@([A-Za-z_][A-Za-z0-9_]*)`)
+
+// resolvePythonTemplate substitutes @var with its raw string value — no
+// quoting. Used for the kernel path (SOLVE, and ASSERT when a kernel
+// session is active), mirroring spl3/executor.py's _resolve_python_template.
+func resolvePythonTemplate(template string, state *WorkflowState) string {
+	return varRefPattern.ReplaceAllStringFunc(template, func(m string) string {
+		return state.getVar(varRefPattern.FindStringSubmatch(m)[1])
+	})
+}
+
+// resolvePythonTemplateQuoted substitutes @var with a Python-string-literal
+// quoted form of its value. Used for ASSERT's kernel-free path (no --kernel
+// flag), mirroring spl3/executor.py's repr()-quoted substitution so state
+// values become proper Python string literals rather than bare identifiers.
+func resolvePythonTemplateQuoted(template string, state *WorkflowState) string {
+	return varRefPattern.ReplaceAllStringFunc(template, func(m string) string {
+		return strconv.Quote(state.getVar(varRefPattern.FindStringSubmatch(m)[1]))
+	})
+}
+
+// execSolve executes SOLVE @var [TYPE] := python_template via the
+// persistent kernel session (Option A: subprocess REPL — see kernel.go).
+// Mirrors spl3/executor.py _exec_solve. Requires --kernel (KernelEnabled);
+// matches Python's behavior of raising ToolFailed otherwise rather than
+// silently no-op'ing.
+func (e *Executor) execSolve(_ context.Context, stmt *ast.SolveStatement, state *WorkflowState) error {
+	if !e.KernelEnabled {
+		return &SPLError{Type: ErrToolFailed, Message: "SOLVE requires --kernel flag; run with 'spl-go run --kernel ...'"}
+	}
+	if err := e.ensureKernel(); err != nil {
+		return &SPLError{Type: ErrToolFailed, Message: fmt.Sprintf("SOLVE kernel start error: %v", err)}
+	}
+	code := resolvePythonTemplate(stmt.Template, state)
+	kernelCode := fmt.Sprintf("_spl_solve_result = %s\nprint(str(_spl_solve_result))", code)
+	result, err := e.Kernel.execute(kernelCode)
+	if err != nil {
+		return &SPLError{Type: ErrToolFailed, Message: fmt.Sprintf("SOLVE kernel error: %v", err)}
+	}
+	state.setVar(stmt.Variable, strings.TrimSpace(result))
+	return nil
+}
+
+// execAssert executes ASSERT python_template [OTHERWISE ...]. Two paths,
+// matching spl3/executor.py _exec_assert exactly:
+//   - kernel path (KernelEnabled): send to the persistent kernel session.
+//   - kernel-free path (default): eval locally via a one-shot subprocess
+//     with every registered CREATE TOOL_API function in scope — covers
+//     TOOL_API predicates like ASSERT is_optimal(@solution) without
+//     requiring --kernel.
+func (e *Executor) execAssert(ctx context.Context, stmt *ast.AssertStatement, state *WorkflowState) error {
+	var passed bool
+	if e.KernelEnabled {
+		if err := e.ensureKernel(); err != nil {
+			return &SPLError{Type: ErrToolFailed, Message: fmt.Sprintf("ASSERT kernel start error: %v", err)}
+		}
+		code := resolvePythonTemplate(stmt.Template, state)
+		kernelCode := fmt.Sprintf("_spl_assert_result = bool(%s)\nprint(_spl_assert_result)", code)
+		result, err := e.Kernel.execute(kernelCode)
+		if err != nil {
+			return &SPLError{Type: ErrToolFailed, Message: fmt.Sprintf("ASSERT kernel error: %v", err)}
+		}
+		passed = strings.TrimSpace(result) == "True"
+	} else {
+		code := resolvePythonTemplateQuoted(stmt.Template, state)
+		result := evalWithTools(code, e.ToolBodies)
+		if strings.HasPrefix(result, "assert_error: ") {
+			return &SPLError{Type: ErrToolFailed, Message: strings.TrimPrefix(result, "assert_error: ")}
+		}
+		passed = result == "True"
+	}
+
+	if passed {
+		return nil
+	}
+	if len(stmt.Otherwise) == 0 {
+		return &SPLError{Type: ErrToolFailed, Message: fmt.Sprintf("ASSERT failed: %s", stmt.Template)}
+	}
+	for _, s := range stmt.Otherwise {
+		if err := e.executeStatement(ctx, s, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureKernel lazily starts the persistent kernel subprocess on first use.
+func (e *Executor) ensureKernel() error {
+	if e.Kernel != nil {
+		return nil
+	}
+	k, err := startKernelSession()
+	if err != nil {
+		return err
+	}
+	e.Kernel = k
+	return nil
+}
+
+// CloseKernel terminates the persistent kernel subprocess, if one was
+// started. Safe to call even if --kernel was never used. Callers should
+// defer this after a run so the python3 subprocess doesn't leak.
+func (e *Executor) CloseKernel() error {
+	if e.Kernel == nil {
+		return nil
+	}
+	err := e.Kernel.close()
+	e.Kernel = nil
+	return err
 }
 
 func (e *Executor) execGenerateInto(ctx context.Context, stmt *ast.GenerateIntoStatement, state *WorkflowState) error {
