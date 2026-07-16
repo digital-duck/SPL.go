@@ -221,13 +221,22 @@ type Executor struct {
 	// (no --kernel flag) needs all of them available in one eval namespace,
 	// mirroring Python's `ns.update(self.functions._tools)`.
 	ToolBodies map[string]string
-	// Kernel is the persistent deterministic-mode subprocess used by SOLVE
+	// Kernel is the persistent deterministic-mode session used by SOLVE
 	// and ASSERT's kernel path. Nil until --kernel is passed and the first
-	// SOLVE/ASSERT statement starts it.
-	Kernel *kernelSession
+	// SOLVE/ASSERT statement starts it. Backed by either kernelSession
+	// (Option A) or jupyterKernelSession (Option B) depending on
+	// KernelProtocol — see kernelBackend in kernel.go.
+	Kernel kernelBackend
 	// KernelEnabled mirrors Python's --kernel CLI flag: gates SOLVE (which
 	// errors without it) and selects ASSERT's kernel vs. kernel-free path.
 	KernelEnabled bool
+	// KernelProtocol selects the kernel backend: "" or "subprocess" (Option
+	// A, default) vs "zmq" (Option B, real Jupyter/ZMQ protocol). Lets the
+	// two implementations be run side by side for cross-comparison.
+	KernelProtocol string
+	// KernelName is the Jupyter kernelspec to launch when KernelProtocol is
+	// "zmq" (e.g. "python3", "sagemath"). Ignored by Option A.
+	KernelName string
 }
 
 // New creates a new Executor with the given adapter.
@@ -935,16 +944,30 @@ func (e *Executor) execAssert(ctx context.Context, stmt *ast.AssertStatement, st
 	return nil
 }
 
-// ensureKernel lazily starts the persistent kernel subprocess on first use.
+// ensureKernel lazily starts the persistent kernel session on first use,
+// choosing the backend named by KernelProtocol.
 func (e *Executor) ensureKernel() error {
 	if e.Kernel != nil {
 		return nil
 	}
-	k, err := startKernelSession()
-	if err != nil {
-		return err
+	switch e.KernelProtocol {
+	case "zmq":
+		kernelName := e.KernelName
+		if kernelName == "" {
+			kernelName = "python3"
+		}
+		k, err := startJupyterKernelSession(context.Background(), kernelName)
+		if err != nil {
+			return err
+		}
+		e.Kernel = k
+	default:
+		k, err := startKernelSession()
+		if err != nil {
+			return err
+		}
+		e.Kernel = k
 	}
-	e.Kernel = k
 	return nil
 }
 

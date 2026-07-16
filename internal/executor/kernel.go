@@ -9,11 +9,21 @@ import (
 	"sync"
 )
 
+// kernelBackend is the common surface both kernel implementations satisfy:
+// Option A (kernelSession, this file — a custom stdin/stdout REPL protocol)
+// and Option B (jupyterKernelSession, kernel_zmq.go — a real Jupyter wire
+// protocol client over ZeroMQ). Executor.Kernel holds whichever one
+// --kernel-protocol selected, so SOLVE/ASSERT dispatch is identical either way.
+type kernelBackend interface {
+	execute(code string) (string, error)
+	close() error
+}
+
 // kernelSession is a persistent python3 subprocess used by SOLVE and
 // ASSERT's kernel path (Option A: a stdin/stdout REPL protocol over a
-// long-lived process, not a full Jupyter/ZMQ client — see Task #5 for the
-// planned Option B). State (imported modules, variables, TOOL_API function
-// defs) persists across calls within a workflow, matching the semantics of
+// long-lived process, not a full Jupyter/ZMQ client — see kernel_zmq.go for
+// Option B). State (imported modules, variables, TOOL_API function defs)
+// persists across calls within a workflow, matching the semantics of
 // Python's spl3/kernel.py KernelSession/IPythonKernel.
 type kernelSession struct {
 	mu     sync.Mutex

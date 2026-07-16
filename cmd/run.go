@@ -23,6 +23,8 @@ var runWorkers int
 var runPlan bool
 var runToolsFile string
 var runKernel bool
+var runKernelProtocol string
+var runKernelName string
 var runAllowedTools []string
 
 var runCmd = &cobra.Command{
@@ -118,6 +120,8 @@ Examples:
 		exec.MaxWorkers = runWorkers
 		exec.SourceDir = filepath.Dir(filename)
 		exec.KernelEnabled = runKernel
+		exec.KernelProtocol = runKernelProtocol
+		exec.KernelName = runKernelName
 		if runKernel {
 			defer exec.CloseKernel()
 		}
@@ -167,6 +171,8 @@ func init() {
 	runCmd.Flags().StringVar(&runToolsFile, "tools", "", "Path to Python tools file (.py) — registers @spl_tool functions as CALL-able tools")
 	runCmd.Flags().StringArrayVar(&runAllowedTools, "allowed-tools", nil, "Tools to allow for claude_cli adapter (e.g. --allowed-tools WebSearch Bash)")
 	runCmd.Flags().BoolVar(&runKernel, "kernel", false, "Start a persistent python3 kernel session for SOLVE/ASSERT (deterministic-mode dispatch)")
+	runCmd.Flags().StringVar(&runKernelProtocol, "kernel-protocol", "subprocess", "Kernel backend for --kernel: 'subprocess' (Option A, custom REPL protocol) or 'zmq' (Option B, real Jupyter wire protocol)")
+	runCmd.Flags().StringVar(&runKernelName, "kernel-name", "python3", "Jupyter kernelspec name to launch when --kernel-protocol=zmq (e.g. python3, sagemath)")
 }
 
 const separator = "============================================================"
