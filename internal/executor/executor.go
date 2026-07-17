@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -276,6 +277,61 @@ func (e *Executor) ExecuteProgram(ctx context.Context, program *ast.Program, par
 			}
 			results = append(results, res)
 		case *ast.WorkflowStatement:
+			res, err := e.ExecuteWorkflow(ctx, s, params)
+			if err != nil {
+				return results, err
+			}
+			results = append(results, res)
+		case *ast.CreateFunctionStatement, *ast.ProcedureStatement, *ast.ImportStatement:
+			// Already handled in registration pass; skip execution.
+		}
+	}
+	return results, nil
+}
+
+// ExecuteProgramEntry behaves like ExecuteProgram but, matching spl3's CLI
+// convention (spl3/cli.py: prefer the workflow whose name matches the
+// source file's stem, dashes as underscores, else fall back to the
+// last-defined workflow), executes only ONE entry WORKFLOW at the top
+// level -- the one named entryName, or the last-defined workflow if no
+// name matches. Every WORKFLOW in the program is still registered via
+// registerProgram exactly as ExecuteProgram does, so CALL dispatch to a
+// helper workflow (e.g. solve_chain_step, CALLed from neurosymbolic_solver
+// in cookbook/77_neurosymbolic/symbolic_math.spl) keeps working -- only
+// which workflows ALSO run standalone at the top level is restricted.
+// PROMPT statements are unaffected and all still execute.
+func (e *Executor) ExecuteProgramEntry(ctx context.Context, program *ast.Program, params map[string]string, entryName string) ([]interface{}, error) {
+	if params == nil {
+		params = make(map[string]string)
+	}
+
+	if err := e.registerProgram(ctx, program); err != nil {
+		return nil, err
+	}
+
+	var target *ast.WorkflowStatement
+	for _, stmt := range program.Statements {
+		if ws, ok := stmt.(*ast.WorkflowStatement); ok {
+			target = ws // last-defined wins as the fallback
+			if ws.Name == entryName {
+				break // exact stem match wins outright
+			}
+		}
+	}
+
+	var results []interface{}
+	for _, stmt := range program.Statements {
+		switch s := stmt.(type) {
+		case *ast.PromptStatement:
+			res, err := e.ExecutePrompt(ctx, s, params)
+			if err != nil {
+				return results, err
+			}
+			results = append(results, res)
+		case *ast.WorkflowStatement:
+			if target != nil && s != target {
+				continue // registered above for CALL dispatch, not run standalone
+			}
 			res, err := e.ExecuteWorkflow(ctx, s, params)
 			if err != nil {
 				return results, err
@@ -1170,6 +1226,31 @@ func (e *Executor) execCommit(_ context.Context, stmt *ast.CommitStatement, stat
 	state.Committed = true
 	state.CommittedValue = value
 	state.CommittedOpts = opts
+
+	// Mirrors spl3/executor.py's `_log.info("RETURN: %d chars | %s", ...)`
+	// line verbatim (same "N chars | k=v, k=v, ..." shape) so a driver
+	// script parsing WITH-clause metadata off stdout (status, steps,
+	// roundtrip, etc.) sees an identical format regardless of which
+	// runtime (spl3 or spl-go) produced it. stmt.Options is a Go map (the
+	// parser does not preserve WITH-clause declaration order, unlike
+	// spl3's Python dict), so keys are sorted here for a deterministic,
+	// diffable line -- a driver parsing "status=" out of this line must
+	// not assume it is the first key (see run_experiment.py's stream_run).
+	optsStr := "none"
+	if len(stmt.Options) > 0 {
+		keys := make([]string, 0, len(stmt.Options))
+		for k := range stmt.Options {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%s", k, opts[k]))
+		}
+		optsStr = strings.Join(parts, ", ")
+	}
+	fmt.Fprintf(os.Stdout, "RETURN: %d chars | %s\n", len(value), optsStr)
+
 	return nil
 }
 
@@ -1620,6 +1701,20 @@ func (e *Executor) evalCondition(ctx context.Context, cond interface{}, evalValu
 		return strings.Contains(strings.ToLower(judgeResult.Content), "yes"), nil
 
 	case *ast.ComparisonCondition:
+		// Membership test: WHEN IN ('a', 'b', ...) / WHEN NOT IN (...) --
+		// Right is the parser's __in_list__ FunctionCall sentinel, not a
+		// real callable, so it must be special-cased before the generic
+		// evalExpression(c.Right, ...) fallback below (which would try to
+		// invoke it as an actual function call and never match). Mirrors
+		// spl/executor.py's _in_values_equal: boolean shorthand, then
+		// numeric, then exact string, per candidate.
+		if c.Operator == "IN" || c.Operator == "NOT IN" {
+			matched := e.inListMatch(evalValue, c.Right, state)
+			if c.Operator == "NOT IN" {
+				matched = !matched
+			}
+			return matched, nil
+		}
 		rightStr := e.evalExpression(c.Right, state)
 		// Boolean shorthand
 		if (rightStr == "true" || rightStr == "false") && c.Operator == "=" {
@@ -1665,6 +1760,37 @@ func compareFloat(left float64, op string, right float64) bool {
 		return left != right
 	}
 	return false
+}
+
+// inListMatch evaluates an IN/NOT IN right-hand side (the parser's
+// __in_list__ FunctionCall sentinel) and checks evalValue for membership.
+func (e *Executor) inListMatch(evalValue string, right ast.Expr, state *WorkflowState) bool {
+	fc, ok := right.(*ast.FunctionCall)
+	if !ok || fc.Name != "__in_list__" {
+		return false
+	}
+	for _, argExpr := range fc.Arguments {
+		candidate := e.evalExpression(argExpr, state)
+		if inValuesEqual(evalValue, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// inValuesEqual is the per-element equality used by IN / NOT IN, mirroring
+// spl/executor.py's _in_values_equal: boolean shorthand (case-insensitive
+// 'true'/'false'), then numeric, then exact string.
+func inValuesEqual(left, right string) bool {
+	if strings.EqualFold(right, "true") || strings.EqualFold(right, "false") {
+		return strings.EqualFold(left, right)
+	}
+	leftF, leftErr := strconv.ParseFloat(left, 64)
+	rightF, rightErr := strconv.ParseFloat(right, 64)
+	if leftErr == nil && rightErr == nil {
+		return leftF == rightF
+	}
+	return left == right
 }
 
 func compareStrings(left, op, right string) bool {

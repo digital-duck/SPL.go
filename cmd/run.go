@@ -26,6 +26,7 @@ var runKernel bool
 var runKernelProtocol string
 var runKernelName string
 var runAllowedTools []string
+var runLLM string
 
 var runCmd = &cobra.Command{
 	Use:   "run <file.spl> [KEY=VALUE...]",
@@ -79,6 +80,7 @@ Examples:
 			return fmt.Errorf("parse error in %q: %w", filename, err)
 		}
 
+
 		// Run Planner if requested
 		if runPlan {
 			planner := executor.NewPlanner(flagModel)
@@ -90,9 +92,20 @@ Examples:
 			fmt.Println()
 		}
 
+		// --llm ADAPTER[:MODEL] is a spl3-compatible shorthand for
+		// --adapter ADAPTER --model MODEL; it wins over both if given.
+		llmAdapter, llmModel := flagAdapter, flagModel
+		if runLLM != "" {
+			if idx := strings.Index(runLLM, ":"); idx > 0 {
+				llmAdapter, llmModel = runLLM[:idx], runLLM[idx+1:]
+			} else {
+				llmAdapter = runLLM
+			}
+		}
+
 		// Select adapter
 		cfg, _ := config.Load()
-		adapterName := flagAdapter
+		adapterName := llmAdapter
 		if adapterName == "" {
 			adapterName = cfg.Adapter
 		}
@@ -101,8 +114,8 @@ Examples:
 		}
 
 		adapterCfg := cfg.AdapterConfig(adapterName)
-		if flagModel != "" {
-			adapterCfg["model"] = flagModel
+		if llmModel != "" {
+			adapterCfg["model"] = llmModel
 		} else if cfg.Model != "" {
 			adapterCfg["model"] = cfg.Model
 		}
@@ -139,7 +152,16 @@ Examples:
 		}
 
 		ctx := context.Background()
-		results, err := exec.ExecuteProgram(ctx, program, params)
+		// Mirrors spl3's CLI convention (spl3/cli.py: prefer the workflow
+		// whose name matches the file's stem, dashes as underscores, else
+		// fall back to the last-defined workflow): only that ONE workflow
+		// runs at the top level. Every WORKFLOW in the file is still
+		// registered for CALL dispatch either way, so a helper workflow
+		// (e.g. solve_chain_step in symbolic_math.spl, CALLed from
+		// neurosymbolic_solver) keeps working -- it just no longer also
+		// executes standalone with empty/default parameters.
+		stem := strings.ReplaceAll(strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename)), "-", "_")
+		results, err := exec.ExecuteProgramEntry(ctx, program, params, stem)
 		if err != nil {
 			return fmt.Errorf("execution error: %w", err)
 		}
@@ -173,6 +195,7 @@ func init() {
 	runCmd.Flags().BoolVar(&runKernel, "kernel", false, "Start a persistent python3 kernel session for SOLVE/ASSERT (deterministic-mode dispatch)")
 	runCmd.Flags().StringVar(&runKernelProtocol, "kernel-protocol", "subprocess", "Kernel backend for --kernel: 'subprocess' (Option A, custom REPL protocol) or 'zmq' (Option B, real Jupyter wire protocol)")
 	runCmd.Flags().StringVar(&runKernelName, "kernel-name", "python3", "Jupyter kernelspec name to launch when --kernel-protocol=zmq (e.g. python3, sagemath)")
+	runCmd.Flags().StringVar(&runLLM, "llm", "", "Combined adapter[:model] shorthand (e.g. ollama:gemma3, claude_cli) -- spl3-compatible alternative to --adapter/--model; takes precedence over both if set")
 }
 
 const separator = "============================================================"
