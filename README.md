@@ -162,6 +162,29 @@ END
 
 ---
 
+## Neurosymbolic Verifier Mode — `SOLVE` / `ASSERT` (ported 2026-07-13)
+
+Mirrors the Python `spl3` verifier ladder: an LLM step proposes a solution and a
+deterministic kernel checks it, so the answer is never taken on the model's word.
+
+```bash
+# Persistent python3 subprocess (default) — custom stdin/stdout REPL protocol
+spl-go run verify.spl --kernel
+
+# Real Jupyter wire protocol over ZeroMQ — supports non-Python kernelspecs (e.g. SageMath)
+spl-go run verify.spl --kernel --kernel-protocol zmq --kernel-name sagemath
+```
+
+State (imports, variables, TOOL_API function defs) persists across `SOLVE`/`ASSERT`
+steps within the same kernel session. `--tools <file.py>` registers `@spl_tool`-decorated
+Python functions as CALL-able tools, dispatched via subprocess the same way the Python
+runtime's `--tools` flag works.
+
+`STORAGE` workflow params are backed by SQLite (`modernc.org/sqlite`) out of the box;
+DuckDB/Postgres backends print install instructions rather than failing silently.
+
+---
+
 ## Adapters
 
 | Adapter | Description | Config |
@@ -172,6 +195,7 @@ END
 | `claude_cli` | Claude Code CLI (subscription) | `claude` binary in PATH |
 | `openai` | OpenAI API | `OPENAI_API_KEY` |
 | `openrouter` | 100+ models via OpenRouter | `OPENROUTER_API_KEY` |
+| `google` | Google Gemini API | `GOOGLE_API_KEY` |
 | `deepseek` | DeepSeek API | `DEEPSEEK_API_KEY` |
 | `qwen` | Alibaba Cloud DashScope | `DASHSCOPE_API_KEY` |
 | `echo` | Returns prompt as output — for testing | none |
@@ -184,11 +208,16 @@ END
 spl-go run <file.spl> [KEY=VALUE...]   Execute an SPL program
 spl-go run --plan                      Show pre-execution resource estimates
 spl-go run --workers N                 Parallel step execution (N goroutines)
+spl-go run --tools <file.py>           Register @spl_tool Python functions as CALL-able tools
+spl-go run --allowed-tools T1 T2       Tools to allow for claude_cli adapter (e.g. WebSearch, Bash)
+spl-go run --kernel                    Persistent kernel session for SOLVE/ASSERT (deterministic mode)
+spl-go run --llm adapter:model         Combined adapter[:model] shorthand (spl3-compatible)
 spl-go validate <file.spl>             Check syntax
 spl-go explain <file.spl>              Summarize structure
 spl-go text2spl "<description>"        Generate SPL from natural language
 spl-go adapters                        List adapters
 spl-go version                         Show runtime version
+spl-go init                            Initialize ~/.spl/ and write default config.yaml
 
 spl-go config show                     Print current config
 spl-go config get <key>                Get a config value
@@ -199,6 +228,9 @@ spl-go memory list                     List all memory keys
 spl-go memory get <key>                Get a memory value
 spl-go memory set <key> <value>        Set a memory value
 spl-go memory delete <key>             Delete a memory entry
+
+spl-go cache list                      List all entries in the prompt cache
+spl-go cache clear                     Clear the prompt cache
 
 spl-go doc-rag add <text_or_file>      Index a document
 spl-go doc-rag query "<search>"        Semantic search
@@ -235,6 +267,9 @@ adapter: ollama
 model: ""
 max_llm_calls: 100
 max_total_tokens: 500000
+storage_dir: .spl        # base dir for STORAGE-backed workflow params
+log_level: info          # debug|info|warn|error
+log_console: false
 
 adapters:
   ollama:
@@ -248,6 +283,9 @@ adapters:
     cli_path: claude
     default_model: claude-sonnet-4-6
     timeout_secs: 300
+  google:
+    default_model: gemini-2.5-flash
+    timeout_secs: 180
   momagrid:
     base_url: http://localhost:9000
     timeout_secs: 600
@@ -276,13 +314,7 @@ doc_rag:
 
 ## Relationship to Python SPL
 
-`spl-go` follows a **Python-first, Go-second** discipline:
-
-1. New features land in the Python runtimes (`digital-duck/SPL20`, `digital-duck/SPL30`) first
-2. After validation on the cookbook benchmark, they are ported to Go
-3. Any recipe that passes `spl run` must also pass `spl-go run` — divergences are bugs
-
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design rationale and [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for detailed usage.
+`spl-go` is ported from `spl3` (see `digital-duck/SPL.py`) 
 
 ---
 
