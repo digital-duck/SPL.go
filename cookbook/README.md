@@ -62,9 +62,13 @@ spl-go run cookbook/05_self_refine/self_refine.spl \
 
 | Recipes | Status | Notes |
 |---|---|---|
-| 01–21 | Active, approved | Run as-is |
-| 23–37 | Active, new | Run as-is |
+| 01–35 | Active, approved | echo verified 2026-08-30 |
+| 45 `vision_to_action` | Active, approved | echo verified 2026-08-30 |
 | 22 | Active — **spl-go native** | See [recipe 22](#recipe-22-text2spl-demo) below |
+| 36 `tool_use` | Active, new | Requires `--tools tools.py` (Python subprocess) |
+| 37 `headline_news` | Active, new | Uses `claude_cli` adapter |
+| 41–44 | Active, new | Requires `--tools` (Python subprocess) |
+| 47–49 | Active, new | Requires `--tools` (Python subprocess) |
 | 38 — bedrock | **Inactive** | Requires AWS credentials |
 | 39 — vertex | **Inactive** | Requires GCP credentials |
 | 40 — azure_openai | **Inactive** | Requires Azure credentials |
@@ -74,10 +78,21 @@ spl-go run cookbook/05_self_refine/self_refine.spl \
 | Recipe | Description | spl-go status | Notes |
 |---|---|---|---|
 | 05 `self_refine` | CALL sub-workflow, WHILE, EVALUATE | `[DONE]` ¹ | ollama verified 2026-04-14 |
-| 50 `code_pipeline` | CALL chain, WHILE @item IN @items | `[DONE]` ¹ | echo verified |
-| 51–62 | Multimodal (IMAGE/AUDIO/VIDEO) | `[TODO]` | codec pipeline not yet ported |
-| 63 `parallel_code_review` | CALL PARALLEL (3 concurrent reviews) | `[DONE]` ¹ | echo verified |
-| 64 `parallel_news_digest` | CALL PARALLEL (3 topics, merge) | `[DONE]` ¹ | echo verified |
+| 50 `code_pipeline` | CALL chain, WHILE @item IN @items | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 54 `text_to_image` | Text → IMAGE OUTPUT | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 55 `text_to_speech` | Text → AUDIO OUTPUT | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 56 `text_to_video` | Text → VIDEO OUTPUT | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 57 `image_convert` | IMAGE → converted format | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 59 `audio_convert` | AUDIO → converted format | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 61 `video_to_audio` | VIDEO → AUDIO extraction | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 63 `parallel_code_review` | CALL PARALLEL (3 concurrent reviews) | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 64 `parallel_news_digest` | CALL PARALLEL (3 topics, merge) | `[DONE]` ¹ | echo verified 2026-08-30 |
+| 51 `image_caption` | IMAGE INPUT → caption | **Disabled** | IMAGE INPUT type not parsed by spl-go (OUTPUT only) |
+| 52 `audio_summary` | AUDIO INPUT → summary | **Disabled** | AUDIO INPUT type not parsed by spl-go (OUTPUT only) |
+| 53 `video_summary` | VIDEO INPUT → summary | **Disabled** | VIDEO INPUT type not parsed by spl-go (OUTPUT only) |
+| 58 `image_restyle` | IMAGE IN+OUT restyle | **Disabled** | IMAGE INPUT type not parsed by spl-go (OUTPUT only) |
+| 60 `voice_dialogue` | AUDIO IN+Out voice agent | **Disabled** | AUDIO INPUT type not parsed by spl-go (OUTPUT only) |
+| 62 `video_to_image` | VIDEO INPUT → frame | **Disabled** | VIDEO INPUT type not parsed by spl-go (OUTPUT only) |
 
 ¹ Parser fixes merged 2026-04-14. Run `spl-go run ... --adapter echo` for NDD oracle (deterministic, no LLM needed).
 
