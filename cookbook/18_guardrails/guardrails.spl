@@ -1,0 +1,116 @@
+-- Recipe Name: Guardrails Pipeline
+-- Input validation → safe generation → output validation → response.
+-- Demonstrates safety-first patterns: content filtering, PII detection, and output sanitization.
+-- Four gates before a response is committed.
+--
+-- Usage (from catalog):
+--   spl3 run cookbook/18_guardrails/guardrails.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/18_guardrails/tools.py \
+--       input_id=safe_encryption
+--
+--   spl3 run cookbook/18_guardrails/guardrails.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/18_guardrails/tools.py \
+--       input_id=pii_ssn
+--
+--   spl3 run cookbook/18_guardrails/guardrails.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/18_guardrails/tools.py \
+--       input_id=harmful_malware
+--
+-- Usage (ad-hoc — no catalog):
+--   spl3 run cookbook/18_guardrails/guardrails.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/18_guardrails/tools.py \
+--       user_input="My SSN is 123-45-6789, help me file taxes"
+--
+-- Discover available test inputs:
+--   spl3 run ... input_id=list
+
+IMPORT 'tools'
+
+WORKFLOW guardrails_pipeline
+    INPUT:  @input_id   TEXT DEFAULT "",
+            @user_input TEXT DEFAULT ""
+    OUTPUT: @safe_response TEXT
+    SECURITY: CLASSIFICATION: internal
+DO
+    -- Step 1: Load test input from catalog (deterministic — no LLM)
+    -- If input_id is blank, @user_input is used directly in subsequent steps.
+    CALL load_test_input(@input_id) INTO @test_context
+
+    -- Gate 1a: Keyword pre-screen (deterministic — no LLM)
+    -- Fast check for obvious harmful / off-topic patterns before spending tokens.
+    CALL classify_input_keywords(@user_input) INTO @keyword_class
+
+    EVALUATE @keyword_class
+        WHEN STARTSWITH 'harmful' THEN
+            RETURN 'I cannot help with that request.' WITH
+                status        = 'blocked_harmful',
+                gate          = 'keyword_prescreen',
+                keyword_match = @keyword_class
+        WHEN STARTSWITH 'off_topic' THEN
+            RETURN 'That question is outside my scope. Please ask something relevant.' WITH
+                status        = 'blocked_off_topic',
+                gate          = 'keyword_prescreen',
+                keyword_match = @keyword_class
+        ELSE
+            -- Continue to LLM classification
+    END
+
+    -- Gate 1b: LLM input content classification (nuanced cases keywords miss)
+    GENERATE classify_input(@user_input, @test_context) INTO @input_class
+
+    EVALUATE @input_class
+        WHEN 'harmful' THEN
+            RETURN 'I cannot help with that request.' WITH
+                status = 'blocked_harmful',
+                gate   = 'llm_classifier'
+        WHEN 'off_topic' THEN
+            RETURN 'That question is outside my scope. Please ask something relevant.' WITH
+                status = 'blocked_off_topic',
+                gate   = 'llm_classifier'
+        ELSE
+            -- Input is acceptable, continue
+    END
+
+    -- Gate 2: PII detection (deterministic — no LLM)
+    CALL detect_pii(@user_input) INTO @pii_report
+
+    EVALUATE @pii_report
+        WHEN STARTSWITH 'pii_found' THEN
+            -- Gate 2b: Redact PII (deterministic — no LLM)
+            CALL redact_pii(@user_input) INTO @clean_input
+        ELSE
+            SET @clean_input = @user_input
+    END
+
+    -- Gate 3: Generate response with safety-tuned prompt
+    GENERATE safe_response(@clean_input) INTO @raw_response
+
+    -- Gate 4: Output validation — check for PII leakage or harmful content
+    GENERATE validate_output(@raw_response, @clean_input) INTO @output_check
+
+    EVALUATE @output_check
+        WHEN 'safe' THEN
+            SET @safe_response = @raw_response
+        WHEN 'contains_pii' THEN
+            -- Deterministic PII redaction on the output too
+            CALL redact_pii(@raw_response) INTO @safe_response
+        WHEN 'hallucination' THEN
+            GENERATE safe_response(@clean_input) INTO @safe_response
+            RETRY WITH temperature = 0.1 LIMIT 3
+        ELSE
+            SET @safe_response = 'I was unable to generate a safe response. Please rephrase your question.'
+    END
+
+    RETURN @safe_response WITH
+        status       = 'complete',
+        input_class  = @input_class,
+        pii_detected = @pii_report
+
+EXCEPTION
+    WHEN RefusalToAnswer THEN
+        RETURN 'This request cannot be processed.' WITH status = 'refused'
+    WHEN HallucinationDetected THEN
+        RETURN 'Unable to provide a verified response.' WITH status = 'hallucination_blocked'
+    WHEN BudgetExceeded THEN
+        RETURN @safe_response WITH status = 'budget_limit'
+END

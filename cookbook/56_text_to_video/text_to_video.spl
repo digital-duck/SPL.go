@@ -1,0 +1,84 @@
+-- Recipe 59: Text to Video
+-- Category: multimodal / generative
+-- Generate a short video clip from a text prompt.
+--
+-- Pipeline:
+--   [text prompt]
+--         │
+--         ▼  gemma4 (optional prompt enhancement)
+--   [enhanced video prompt]
+--         │
+--         ▼  video generation model (Google Veo 2 / RunwayML Gen-3 / Kling)
+--   [video file]
+--
+-- SPL INPUT type:  TEXT (prompt, style, duration)
+-- SPL OUTPUT type: VIDEO (file path of generated video)
+--
+-- DODA targets:
+--   cloud → Google Veo 2 (via Vertex AI), RunwayML Gen-3, Kling AI
+--   local → (no local video-gen model at this scale; cloud only for now)
+--
+-- Physical execution: run.py
+-- Note: VIDEO is a first-class SPL 3.0 type (spl/types.py SPL3Type.VIDEO)
+
+CREATE FUNCTION enhance_video_prompt(prompt TEXT, style TEXT, duration INT, aspect TEXT)
+RETURN TEXT
+AS $$
+You are a professional prompt engineer for AI video generation models.
+
+Enhance the following video prompt to be cinematic, vivid, and specific.
+
+Original prompt: {prompt}
+Desired style:   {style}
+Duration:        {duration} seconds
+Aspect ratio:    {aspect}
+
+Rules:
+- Describe motion, camera movement, and temporal progression explicitly
+- Add lighting, mood, and environmental details
+- Specify camera angle (wide shot, close-up, tracking shot, etc.)
+- Keep it under 250 words
+- Return ONLY the enhanced prompt, no explanation
+$$;
+
+
+WORKFLOW text_to_video
+    INPUT:
+        @prompt      TEXT    DEFAULT 'A duck walking through a quiet forest at dawn, soft morning light',
+        @style       TEXT    DEFAULT 'cinematic, realistic',
+        @aspect      TEXT    DEFAULT 'landscape',
+        @duration    INT     DEFAULT 5,
+        @enhance     BOOL    DEFAULT TRUE,
+        @video_model TEXT    DEFAULT 'google/veo-2',
+        @llm_model   TEXT    DEFAULT 'gemma4',
+        @output_dir  TEXT    DEFAULT 'cookbook/56_text_to_video/outputs',
+        @log_dir     TEXT    DEFAULT 'cookbook/56_text_to_video/logs-spl'
+    OUTPUT: @video_path VIDEO
+DO
+    LOGGING f'[text_to_video] prompt="{@prompt}" style={@style} duration={@duration}s' LEVEL INFO
+
+    EVALUATE @enhance
+        WHEN = TRUE THEN
+            GENERATE enhance_video_prompt(@prompt, @style, @duration, @aspect)
+                WITH OUTPUT BUDGET 512 TOKENS
+                USING MODEL @llm_model
+                INTO @final_prompt
+            LOGGING '[text_to_video] prompt enhanced' LEVEL DEBUG
+        ELSE
+            @final_prompt := @prompt
+    END
+
+    -- VIDEO generation is handled by the physical runner (run.py)
+    -- The runner calls the appropriate backend and saves the video file.
+    -- @video_path receives the saved file path as a TEXT-encoded VIDEO value.
+    LOGGING f'[text_to_video] generating video via {@video_model} ({@duration}s, {@aspect})' LEVEL INFO
+    RETURN @final_prompt
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING f'[text_to_video] video model unavailable: {@video_model}' LEVEL ERROR
+        RETURN '[ERROR] Video generation model unavailable.' WITH status = 'failed'
+    WHEN BudgetExceeded THEN
+        LOGGING '[text_to_video] token budget exceeded during prompt enhancement' LEVEL WARN
+        RETURN @prompt WITH status = 'budget_limit'
+END

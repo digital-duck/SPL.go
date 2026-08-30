@@ -1,0 +1,410 @@
+-- ============================================================
+-- Recipe 94: Text-to-SQL with Data-Quality Gates
+--
+-- Opens Domain 3 (Data Engineering) from the post-TMLR roadmap. Recipe
+-- 84 already showed "run it and check the rows" for a single query;
+-- this recipe extends that into the Great-Expectations-style
+-- data-quality gates that make text-to-SQL enterprise-viable: it isn't
+-- enough that the LLM's SQL executes and returns rows — those rows
+-- must also pass invariant checks that a data-governance team would
+-- demand before trusting a number: referential integrity of the
+-- underlying tables, non-empty results, and (the classic data-quality
+-- trick) computing the SAME statistic two structurally independent
+-- ways and asserting they agree.
+--
+--   Probabilistic (LLM)   — read the natural-language question and
+--                            write a SQL SELECT statement
+--   Deterministic (SQLite)— stdlib sqlite3 executes the LLM's SQL
+--                            against a seeded in-memory database
+--   Deterministic (quality— (a) referential integrity: every order's
+--    gates)                  customer_id exists in customers;
+--                            (b) non-empty result set;
+--                            (c) the same aggregate recomputed via TWO
+--                            independent SQL formulations (AVG(x) vs
+--                            SUM(x)/COUNT(x)) must agree within 1e-6
+--   Deterministic (ASSERT)— formal gate: only continue when the LLM's
+--                            SQL executed cleanly AND all quality
+--                            gates above passed
+--   Deterministic (row    — order-insensitive row diff between the
+--    diff / round-trip)     LLM's result set and an independently
+--                            authored ground-truth query
+--   Probabilistic (LLM)   — narrate the verified, quality-gated result
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — the model
+-- answers from the printed schema/rows alone, with no SQL execution
+-- and no quality gates at all (this is where LLMs silently miscount
+-- rows or misread a JOIN in their head).
+--
+-- Requires: stdlib sqlite3 only — no new pip dependency
+-- Run:
+--   spl3 run cookbook/94_data_eng_text2spl/text2sql_quality.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/94_data_eng_text2spl/text2sql_quality.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: seeded SQLite database + quality gates ──
+
+CREATE TOOL_API schema_description()
+RETURNS TEXT AS PYTHON $$
+def schema_description() -> str:
+    """Human-readable schema + sample rows, shown to the LLM (and to the
+    unaided baseline arm) so it can write/reason about SQL without ever
+    seeing the live database connection."""
+    return (
+        "Table: customers(id INTEGER, name TEXT, segment TEXT)\n"
+        "Rows:\n"
+        "  1, Acme Corp,     Enterprise\n"
+        "  2, Globex Inc,    Enterprise\n"
+        "  3, Initech,       SMB\n"
+        "  4, Umbrella LLC,  SMB\n"
+        "  5, Wayne Retail,  Consumer\n"
+        "\n"
+        "Table: orders(id INTEGER, customer_id INTEGER, amount REAL, order_date TEXT)\n"
+        "Rows:\n"
+        "  1, 1, 5000.00, 2026-01-10\n"
+        "  2, 1, 7000.00, 2026-02-14\n"
+        "  3, 2, 6000.00, 2026-02-20\n"
+        "  4, 3,  800.00, 2026-01-15\n"
+        "  5, 4, 1200.00, 2026-03-01\n"
+        "  6, 5,  150.00, 2026-01-05\n"
+        "  7, 5,  250.00, 2026-03-12\n"
+    )
+$$;
+
+CREATE TOOL_API run_quality_gated_sql(sql TEXT, ground_truth_sql TEXT, stat_sql_a TEXT, stat_sql_b TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_quality_gated_sql(sql: str, ground_truth_sql: str, stat_sql_a: str, stat_sql_b: str) -> str:
+    """Execute the LLM's SQL against a freshly-seeded in-memory SQLite
+    database, then run three independent data-quality gates that a
+    data-governance team would demand before trusting the number:
+
+      1. Referential integrity: every orders.customer_id exists in
+         customers.id (checked against the seeded data itself).
+      2. Non-empty result: the LLM's query must return at least one row.
+      3. Two-independent-ways agreement: `stat_sql_a` and `stat_sql_b`
+         are two structurally different SQL formulations of the SAME
+         statistic (e.g. AVG(x) vs SUM(x)/COUNT(x)) — both are executed
+         against the seeded data and must agree within 1e-6.
+
+    Also row-diffs the LLM's result set against `ground_truth_sql`
+    (an independently-authored query over the same seeded data),
+    order-insensitive, tolerant of float rounding.
+    """
+    import json
+    import re
+    import sqlite3
+
+    def strip_fences(s):
+        s = re.sub(r'^```(?:sql)?\s*\n?', '', s.strip(), flags=re.IGNORECASE)
+        return re.sub(r'\n?```\s*;?\s*$', '', s).rstrip(';').strip()
+
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, segment TEXT)")
+    cur.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, order_date TEXT)")
+    customers = [
+        (1, "Acme Corp", "Enterprise"), (2, "Globex Inc", "Enterprise"),
+        (3, "Initech", "SMB"), (4, "Umbrella LLC", "SMB"), (5, "Wayne Retail", "Consumer"),
+    ]
+    orders = [
+        (1, 1, 5000.00, "2026-01-10"), (2, 1, 7000.00, "2026-02-14"),
+        (3, 2, 6000.00, "2026-02-20"), (4, 3, 800.00, "2026-01-15"),
+        (5, 4, 1200.00, "2026-03-01"), (6, 5, 150.00, "2026-01-05"),
+        (7, 5, 250.00, "2026-03-12"),
+    ]
+    cur.executemany("INSERT INTO customers VALUES (?,?,?)", customers)
+    cur.executemany("INSERT INTO orders VALUES (?,?,?,?)", orders)
+    conn.commit()
+
+    try:
+        # Gate 1: referential integrity
+        cur.execute(
+            "SELECT COUNT(*) FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE c.id IS NULL"
+        )
+        orphan_count = cur.fetchone()[0]
+        referential_ok = (orphan_count == 0)
+
+        # Gate 3: same statistic, two independent SQL formulations
+        cur.execute(strip_fences(stat_sql_a))
+        val_a = cur.fetchone()[0]
+        cur.execute(strip_fences(stat_sql_b))
+        val_b = cur.fetchone()[0]
+        two_way_ok = (val_a is not None and val_b is not None and abs(float(val_a) - float(val_b)) < 1e-6)
+
+        if not referential_ok or not two_way_ok:
+            reasons = []
+            if not referential_ok:
+                reasons.append(f"referential integrity violated: {orphan_count} orphan order(s)")
+            if not two_way_ok:
+                reasons.append(f"two-way stat mismatch: {val_a} != {val_b}")
+            return json.dumps({"status": "Error", "error": "; ".join(reasons),
+                               "referential_ok": referential_ok, "two_way_ok": two_way_ok})
+
+        # Execute the LLM''s SQL
+        clean_sql = strip_fences(sql)
+        try:
+            cur.execute(clean_sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows_llm = cur.fetchall()
+        except sqlite3.Error as e:
+            return json.dumps({"status": "Error", "error": f"SQL error: {e}",
+                               "referential_ok": referential_ok, "two_way_ok": two_way_ok})
+
+        # Gate 2: non-empty result
+        if len(rows_llm) == 0:
+            return json.dumps({"status": "Error", "error": "query returned zero rows",
+                               "referential_ok": referential_ok, "two_way_ok": two_way_ok})
+
+        # Row diff against independently-authored ground truth
+        cur.execute(strip_fences(ground_truth_sql))
+        rows_truth = cur.fetchall()
+
+        def normalize(rows):
+            out = []
+            for row in rows:
+                norm = tuple(round(v, 2) if isinstance(v, float) else v for v in row)
+                out.append(norm)
+            return sorted(out, key=lambda t: [str(x) for x in t])
+
+        row_match = normalize(rows_llm) == normalize(rows_truth)
+
+        return json.dumps({
+            "status": "OK",
+            "answer": len(rows_llm),
+            "columns": cols,
+            "rows_llm": rows_llm,
+            "rows_truth": rows_truth,
+            "row_match": row_match,
+            "referential_ok": referential_ok,
+            "two_way_ok": two_way_ok,
+            "stat_a": val_a, "stat_b": val_b,
+        }, default=str)
+    finally:
+        conn.close()
+$$;
+
+CREATE TOOL_API classify_roundtrip(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(result_json: str) -> str:
+    """Round-trip check: does the LLM's SQL result set row-diff-match
+    (order-insensitive, float-tolerant) an independently-authored
+    ground-truth query over the same seeded data?
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import json
+    try:
+        d = json.loads(result_json)
+    except Exception:
+        return "unverifiable"
+    if "row_match" not in d:
+        return "unverifiable"
+    return "match" if d["row_match"] else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, sql TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, sql: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Text-to-SQL with Data-Quality Gates Report",
+        "",
+        f"**Question:** {problem.strip()}",
+        "",
+        f"**Verifier status:** `{sol.get('status', 'Unknown')}`",
+        f"**Rows returned:** `{sol.get('answer', '?')}`",
+        f"**Referential integrity:** `{sol.get('referential_ok', '?')}`",
+        f"**Two-independent-ways stat agreement:** `{sol.get('two_way_ok', '?')}` "
+        f"(AVG={sol.get('stat_a', '?')}, SUM/COUNT={sol.get('stat_b', '?')})",
+        f"**Row-level round-trip vs ground truth:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Generated SQL (LLM)", "",
+        "```sql", sql.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_sql(schema TEXT, question TEXT)
+RETURNS TEXT AS $$
+You are a data engineer. Given this schema, write a single SQL SELECT
+statement (SQLite dialect) that answers the question.
+
+{schema}
+
+Question: {question}
+
+Output ONLY the raw SQL statement — no markdown fences, no commentary,
+no trailing semicolon required but allowed.
+$$;
+
+CREATE FUNCTION repair_sql(schema TEXT, question TEXT, sql TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This SQL query failed a data-quality or execution check.
+
+{schema}
+
+Question: {question}
+
+Previous SQL:
+{sql}
+
+Error:
+{error_info}
+
+Fix the SQL. Common causes:
+- Wrong JOIN condition or missing JOIN entirely
+- Aggregating over the wrong GROUP BY column, or missing it
+- WHERE clause filtering out all rows (check exact segment/name spelling)
+- Selecting the wrong column
+
+Output ONLY the corrected raw SQL statement — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_sql_result(question TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a data engineer. Interpret this VERIFIED, quality-gated SQL
+result for a general audience.
+
+Question: {question}
+
+Verified result (JSON — referential integrity confirmed, the same
+statistic independently recomputed two structurally different ways
+and confirmed to agree, and the result set row-diffed against an
+independently-authored ground-truth query — trust it completely, do
+not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate what the question asks
+2. State the answer, referencing the exact rows/values from the JSON
+3. One sentence on why the two-independent-ways and referential-
+   integrity checks matter for trusting this number in production
+
+End your response with a line in EXACTLY this format (no extra words):
+Final answer: verified
+$$;
+
+CREATE FUNCTION solve_directly(schema TEXT, question TEXT)
+RETURNS TEXT AS $$
+A colleague asked this data question: "{question}"
+
+There is no SQL execution or data-quality checker backing you up this
+time — read the schema and rows below and work out the answer
+yourself, in your head.
+
+{schema}
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the question
+2. Shows which rows you are using and how you aggregate them
+3. Gives the final answer plainly
+
+End your response with a line in EXACTLY this format (no extra words):
+Final answer: <value>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW text2sql_quality
+  -- Default: average order amount for the Enterprise segment.
+  -- Known ground truth: (5000+7000+6000)/3 = 6000.00
+  INPUT @question TEXT := "What is the average order amount for customers in the Enterprise segment?"
+  INPUT @ground_truth_sql TEXT := "SELECT AVG(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.segment = 'Enterprise'"
+  INPUT @stat_sql_a TEXT := "SELECT AVG(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.segment = 'Enterprise'"
+  INPUT @stat_sql_b TEXT := "SELECT SUM(o.amount) * 1.0 / COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.segment = 'Enterprise'"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/94_data_eng_text2spl/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  CALL schema_description() INTO @schema;
+  LOGGING f"[text2sql_quality] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no SQL execution, no quality gates ──
+        LOGGING "[arm=llm_only] answering with NO SQL execution or quality gates" LEVEL INFO
+        GENERATE solve_directly(@schema, @question) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM writes SQL; quality-gated + row-diffed execution ──
+        LOGGING "[arm=solver] Stage 1 — LLM SQL + quality-gated execution" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @sql      := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_sql(@schema, @question) INTO @sql;
+                CALL run_quality_gated_sql(@sql, @ground_truth_sql, @stat_sql_a, @stat_sql_b) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_sql(@schema, @question, @sql, @error_info) INTO @sql;
+                CALL run_quality_gated_sql(@sql, @ground_truth_sql, @stat_sql_a, @stat_sql_b) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[text2sql_quality] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[text2sql_quality] ASSERT passed — quality gates + clean execution confirmed" LEVEL INFO
+
+        CALL classify_roundtrip(@solution) INTO @roundtrip;
+        LOGGING f"[text2sql_quality] round-trip check: {@roundtrip}" LEVEL INFO
+
+        GENERATE interpret_sql_result(@question, @solution) INTO @narrative;
+
+        CALL format_report(@question, @sql, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/text2sql_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[text2sql_quality] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "SQL could not pass quality gates after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/text2sql_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[text2sql_quality] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

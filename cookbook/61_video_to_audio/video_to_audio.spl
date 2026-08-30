@@ -1,0 +1,41 @@
+-- Recipe 61: Video to Audio
+-- Category: media / codec
+-- Extract the audio track from a video file (.mp4 → .mp3 / .wav / .flac).
+--
+-- This is a deterministic codec operation — no LLM involved.
+-- Common use case: extract audio for transcription, summarisation, or archiving.
+-- The output AUDIO can be piped directly into recipe 52 (audio_summary)
+-- or recipe 60 (voice_dialogue) via CALL in an orchestrator workflow.
+--
+-- SPL INPUT type:  VIDEO (source file path)
+-- SPL OUTPUT type: AUDIO (extracted audio file path)
+--
+-- Physical execution: run.py  (uses ffmpeg via pydub or subprocess)
+-- DODA targets: python (local), go (Intel Mini-PC via ffmpeg)
+
+WORKFLOW video_to_audio
+    INPUT:
+        @video         VIDEO  DEFAULT 'cookbook/61_video_to_audio/sample/clip.mp4',
+        @target_format TEXT   DEFAULT 'mp3',
+        @bitrate       TEXT   DEFAULT '192k',
+        @sample_rate   INT    DEFAULT 44100,
+        @output_dir    TEXT   DEFAULT 'cookbook/61_video_to_audio/outputs',
+        @log_dir       TEXT   DEFAULT 'cookbook/61_video_to_audio/logs-spl'
+    OUTPUT: @audio AUDIO
+DO
+    LOGGING f'[video_to_audio] {@video} → {@target_format} (bitrate={@bitrate})' LEVEL INFO
+    CALL video_extract_audio(@video, @target_format, @bitrate, @sample_rate, @output_dir) INTO @audio
+    LOGGING f'[video_to_audio] done → {@audio}' LEVEL INFO
+    RETURN @audio
+
+EXCEPTION
+    WHEN FileNotFound THEN
+        LOGGING f'[video_to_audio] video file not found: {@video}' LEVEL ERROR
+        RETURN '[ERROR] Video file not found.' WITH status = 'failed'
+    WHEN NoAudioTrack THEN
+        LOGGING f'[video_to_audio] video has no audio track: {@video}' LEVEL WARN
+        RETURN '[ERROR] No audio track found in video.' WITH status = 'failed'
+    WHEN CodecError THEN
+        LOGGING '[video_to_audio] ffmpeg codec error — check ffmpeg is installed' LEVEL ERROR
+        RETURN '[ERROR] Codec error during audio extraction.' WITH status = 'failed'
+END

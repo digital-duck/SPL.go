@@ -1119,28 +1119,41 @@ func (e *Executor) execWhile(ctx context.Context, stmt *ast.WhileStatement, stat
 		maxIter = defaultMaxIterations
 	}
 
-	for iteration := 0; iteration < maxIter; iteration++ {
-		if state.Committed {
-			return nil
+	bumped := false
+	iteration := 0
+	for {
+		for ; iteration < maxIter; iteration++ {
+			if state.Committed {
+				return nil
+			}
+
+			shouldContinue, err := e.evalWhileCondition(ctx, stmt.Condition, state)
+			if err != nil {
+				return err
+			}
+			if !shouldContinue {
+				return nil
+			}
+
+			if err = e.executeBody(ctx, stmt.Body, state); err != nil {
+				return err
+			}
 		}
 
-		shouldContinue, err := e.evalWhileCondition(ctx, stmt.Condition, state)
-		if err != nil {
-			return err
+		// Hit the cap without the condition going false. Auto-extend by 50%
+		// exactly once — not a repeating backoff. If still not converged after
+		// the bumped cap, that's a real non-convergence.
+		if bumped {
+			return &SPLError{Type: ErrMaxIterations, Message: fmt.Sprintf(
+				"WHILE loop exceeded %d iterations (already auto-extended once by 50%%; still did not converge)", maxIter)}
 		}
-		if !shouldContinue {
-			break
+		bumped = true
+		newMax := maxIter + maxIter/2
+		if newMax < maxIter+1 {
+			newMax = maxIter + 1
 		}
-
-		if err = e.executeBody(ctx, stmt.Body, state); err != nil {
-			return err
-		}
-
-		if iteration == maxIter-1 {
-			return &SPLError{Type: ErrMaxIterations, Message: fmt.Sprintf("WHILE loop exceeded %d iterations", maxIter)}
-		}
+		maxIter = newMax
 	}
-	return nil
 }
 
 func (e *Executor) evalWhileCondition(ctx context.Context, cond interface{}, state *WorkflowState) (bool, error) {
@@ -1836,7 +1849,13 @@ func (e *Executor) checkBudget(state *WorkflowState) error {
 // Expression Evaluation
 // =============================================================================
 
-var fstringPattern = regexp.MustCompile(`\{@(\w+)\}`)
+// fstringPattern matches {@...} interpolation holes in f-strings.
+// Captures the content after the opening brace so we can try to evaluate
+// it as an expression (e.g. {@i + 1}) rather than only a bare variable name.
+var fstringPattern = regexp.MustCompile(`\{(@[^{}]+)\}`)
+
+// bareVarPattern matches a bare @varname (entire string).
+var bareVarPattern = regexp.MustCompile(`^@([A-Za-z_][A-Za-z0-9_]*)$`)
 
 // evalExpression evaluates an AST expression to a string value.
 func (e *Executor) evalExpression(expr ast.Expr, state *WorkflowState) string {
@@ -1858,8 +1877,22 @@ func (e *Executor) evalExpression(expr ast.Expr, state *WorkflowState) string {
 
 	case *ast.FStringLiteral:
 		return fstringPattern.ReplaceAllStringFunc(ex.Template, func(match string) string {
-			varName := match[2 : len(match)-1] // strip {@ and }
-			return state.getVar(varName)
+			inner := match[1 : len(match)-1] // strip outer { and }
+			// Fast path: bare {@varname}
+			if m := bareVarPattern.FindStringSubmatch(inner); m != nil {
+				return state.getVar(m[1])
+			}
+			// Expression path: {@i + 1}, {@i - 1}, etc.
+			tokens, err := lexer.New(inner).Tokenize()
+			if err != nil {
+				return match
+			}
+			p := parser.New(tokens)
+			subExpr, err := p.ParseExpression()
+			if err != nil || !p.AtEOF() {
+				return match
+			}
+			return e.evalExpression(subExpr, state)
 		})
 
 	case *ast.ListLiteral:

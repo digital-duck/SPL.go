@@ -1,0 +1,420 @@
+-- ============================================================
+-- Recipe 92: Crystal Structure Check — LLM computes, symmetry + mass proves
+--
+-- Third recipe in the computational-science domain (companion to
+-- 90_compsci_physics and 91_compsci_chemistry). Given a unit cell's
+-- lattice parameters and a claimed crystal system, the LLM's most
+-- common failure mode is computing a plausible-looking theoretical
+-- density while silently (a) using lattice parameters inconsistent
+-- with the claimed crystal system's own symmetry constraints (e.g.
+-- calling something "cubic" with a != b), or (b) getting the
+-- density formula's unit conversions wrong (Angstrom^3 -> cm^3,
+-- g/mol -> g via Avogadro's number). Both are machine-checkable:
+-- symmetry constraints are a categorical oracle (per Appendix I,
+-- Pattern 1-style: holds or it doesn't), and density is an
+-- independently-recomputed numeric oracle (Pattern 2: round-trip
+-- against physics, not just re-reading the LLM's own arithmetic).
+--
+--   Probabilistic (LLM)   — read the natural-language crystallography
+--                            problem and write runnable Python code
+--                            reporting lattice parameters + density
+--   Deterministic (check) — verify the claimed crystal system's own
+--                            symmetry constraints hold on (a,b,c,
+--                            alpha,beta,gamma); independently compute
+--                            cell volume (general triclinic formula)
+--                            and theoretical density from Z, molar
+--                            mass, and Avogadro's number
+--   Deterministic (ASSERT)— formal gate: only continue when symmetry
+--                            constraints hold AND the LLM's reported
+--                            density matches the independently
+--                            computed value within tolerance
+--   Probabilistic (LLM)   — narrate the result, restating the
+--                            final density explicitly
+--   Deterministic (round- — regex-and-compare classifier confirms the
+--    trip classifier)       LLM's stated final answer matches the
+--                            verified computed density (WITH roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — density
+-- word problems are exactly where models silently mismatch symmetry
+-- or drop an Angstrom^3 -> cm^3 conversion factor (1e-24).
+--
+-- Requires: numpy only (already a project dependency) — no new pip install
+-- Run:
+--   spl3 run cookbook/92_compsci_materials/materials_crystal.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/92_compsci_materials/materials_crystal.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: symmetry + density verifier ────────
+
+CREATE TOOL_API run_materials_check(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_materials_check(code: str) -> str:
+    """Execute LLM-generated Python code and INDEPENDENTLY verify both
+    the crystal-system symmetry constraints and the theoretical density
+    from the raw lattice parameters — the code's own arithmetic is
+    never trusted.
+
+    The LLM's code must set:
+        _result = {"system": <"cubic"|"tetragonal"|"orthorhombic"|
+                     "hexagonal"|"monoclinic"|"triclinic">,
+                   "a": .., "b": .., "c": ..  (Angstrom),
+                   "alpha": .., "beta": .., "gamma": ..  (degrees),
+                   "Z": <formula units per cell, int>,
+                   "molar_mass": <g/mol>,
+                   "density": <the LLM's computed density, g/cm^3>}
+
+    This function independently:
+      1. Checks the stated crystal `system`'s own symmetry constraints
+         hold on (a,b,c,alpha,beta,gamma) within 0.5% / 0.5 degree
+         tolerance.
+      2. Computes the unit-cell volume via the general triclinic
+         volume formula (valid for all 7 crystal systems).
+      3. Computes theoretical density = Z * molar_mass / (N_A * V),
+         converting Angstrom^3 -> cm^3 (factor 1e-24) and comparing
+         against the LLM's reported density within 1% relative
+         tolerance.
+    """
+    import json
+    import re
+    import math
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"math": math}
+    try:
+        exec(code, namespace)
+        r = namespace.get("_result")
+        if r is None:
+            return json.dumps({"status": "Error", "error": "code did not set _result"})
+
+        system = str(r["system"]).strip().lower()
+        a, b, c = float(r["a"]), float(r["b"]), float(r["c"])
+        alpha, beta, gamma = float(r["alpha"]), float(r["beta"]), float(r["gamma"])
+        Z = float(r["Z"])
+        molar_mass = float(r["molar_mass"])
+        density_reported = float(r["density"])
+
+        def close(x, y, tol=0.005):
+            return abs(x - y) <= max(tol, tol * abs(y))
+
+        sym_ok, sym_reason = True, ""
+        if system == "cubic":
+            if not (close(a, b) and close(b, c) and close(alpha, 90, 0.5)
+                    and close(beta, 90, 0.5) and close(gamma, 90, 0.5)):
+                sym_ok, sym_reason = False, "cubic requires a=b=c and alpha=beta=gamma=90"
+        elif system == "tetragonal":
+            if not (close(a, b) and close(alpha, 90, 0.5)
+                    and close(beta, 90, 0.5) and close(gamma, 90, 0.5)):
+                sym_ok, sym_reason = False, "tetragonal requires a=b and alpha=beta=gamma=90"
+        elif system == "orthorhombic":
+            if not (close(alpha, 90, 0.5) and close(beta, 90, 0.5) and close(gamma, 90, 0.5)):
+                sym_ok, sym_reason = False, "orthorhombic requires alpha=beta=gamma=90"
+        elif system == "hexagonal":
+            if not (close(a, b) and close(alpha, 90, 0.5)
+                    and close(beta, 90, 0.5) and close(gamma, 120, 0.5)):
+                sym_ok, sym_reason = False, "hexagonal requires a=b, alpha=beta=90, gamma=120"
+        elif system == "monoclinic":
+            if not (close(alpha, 90, 0.5) and close(gamma, 90, 0.5)):
+                sym_ok, sym_reason = False, "monoclinic requires alpha=gamma=90 (beta free)"
+        elif system == "triclinic":
+            pass  # triclinic has no symmetry constraints
+        else:
+            sym_ok, sym_reason = False, f"unrecognized crystal system '{system}'"
+
+        alpha_r, beta_r, gamma_r = math.radians(alpha), math.radians(beta), math.radians(gamma)
+        vol_factor = (
+            1 - math.cos(alpha_r) ** 2 - math.cos(beta_r) ** 2 - math.cos(gamma_r) ** 2
+            + 2 * math.cos(alpha_r) * math.cos(beta_r) * math.cos(gamma_r)
+        )
+        if vol_factor <= 0:
+            return json.dumps({"status": "Error",
+                               "error": f"invalid cell angles for {system}: non-physical volume"})
+        volume_ang3 = a * b * c * math.sqrt(vol_factor)
+        volume_cm3 = volume_ang3 * 1e-24
+        N_A = 6.02214076e23
+        density_truth = (Z * molar_mass) / (N_A * volume_cm3)
+
+        density_ok = close(density_reported, density_truth, 0.01)
+
+        status = "OK" if (sym_ok and density_ok) else "Error"
+        out = {
+            "status": status,
+            "answer": round(density_truth, 4),
+            "unit": "g/cm^3",
+            "system": system,
+            "volume_ang3": round(volume_ang3, 3),
+            "symmetry_ok": sym_ok,
+            "density_ok": density_ok,
+            "density_reported": density_reported,
+        }
+        if status == "Error":
+            reasons = []
+            if not sym_ok:
+                reasons.append(f"symmetry violation: {sym_reason}")
+            if not density_ok:
+                reasons.append(f"density mismatch: reported {density_reported} vs computed {density_truth:.4f} g/cm^3")
+            out["error"] = "; ".join(reasons)
+        return json.dumps(out, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own 'Final answer: ...' line, in
+    its narration of the VERIFIED result, match the ground-truth
+    theoretical density (within 1% relative tolerance)?
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.').lower()
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+
+    def _num(s):
+        try:
+            return float(re.sub(r'[^0-9.\-]', '', str(s)))
+        except Exception:
+            return None
+
+    ln, tn = _num(llm_val), _num(truth)
+    if ln is None or tn is None:
+        return "unverifiable"
+    if tn == 0:
+        return "match" if abs(ln) < 1e-6 else "mismatch"
+    rel_err = abs(ln - tn) / abs(tn)
+    return "match" if rel_err < 0.01 else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, code TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, code: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Crystal Structure Check Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Verifier status:** `{sol.get('status', 'Unknown')}`",
+        f"**Theoretical density:** `{sol.get('answer', '?')} {sol.get('unit', '')}`",
+        f"**Crystal system:** `{sol.get('system', '?')}` "
+        f"(symmetry_ok={sol.get('symmetry_ok', '?')})",
+        f"**Unit cell volume:** `{sol.get('volume_ang3', '?')} Å³`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Solver Code (LLM-generated, Python)", "",
+        "```python", code.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_materials_code(problem TEXT)
+RETURNS TEXT AS $$
+You are a materials scientist / crystallographer. Convert this
+crystallography word problem into runnable Python code.
+
+Rules:
+- `math` is already imported — do NOT add import statements
+- Identify the crystal system, lattice parameters (a, b, c in
+  Angstrom; alpha, beta, gamma in degrees), Z (formula units per
+  unit cell), and molar mass (g/mol) from the problem
+- Compute the unit-cell volume using the general triclinic formula:
+    V = a*b*c*sqrt(1 - cos(alpha)^2 - cos(beta)^2 - cos(gamma)^2
+                     + 2*cos(alpha)*cos(beta)*cos(gamma))
+  (angles in radians; this formula is valid for any crystal system,
+  including the simpler cubic/tetragonal/orthorhombic special cases)
+- Compute theoretical density (g/cm^3) as:
+    density = Z * molar_mass / (N_A * V_cm3)
+  where N_A = 6.02214076e23 and V_cm3 = V_angstrom3 * 1e-24
+- Store the result EXACTLY as:
+    _result = {
+        "system": "<cubic|tetragonal|orthorhombic|hexagonal|monoclinic|triclinic>",
+        "a": <float, Angstrom>, "b": <float, Angstrom>, "c": <float, Angstrom>,
+        "alpha": <float, degrees>, "beta": <float, degrees>, "gamma": <float, degrees>,
+        "Z": <int>, "molar_mass": <float, g/mol>,
+        "density": <your computed theoretical density, g/cm^3, 4 significant figures>
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_materials_code(problem TEXT, code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This crystallography code produced a symmetry violation, a density
+mismatch, or an error.
+
+Problem: {problem}
+
+Previous code:
+{code}
+
+Error:
+{error_info}
+
+Fix the code. Common causes:
+- Symmetry violation: the claimed crystal `system` requires specific
+  relationships (cubic: a=b=c, all angles 90; tetragonal: a=b, all
+  angles 90; orthorhombic: all angles 90; hexagonal: a=b, alpha=beta=90,
+  gamma=120; monoclinic: alpha=gamma=90) — re-check the lattice
+  parameters against the stated system, or correct the system name
+- Density mismatch: check the Angstrom^3 -> cm^3 conversion (factor
+  1e-24, i.e. (1e-8 cm/Angstrom)^3), and that N_A = 6.02214076e23
+  is used correctly: density = Z*molar_mass / (N_A * V_cm3)
+- Angles must be converted to radians before calling math.cos()
+- Missing or duplicate _result assignment
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_materials_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a materials scientist. Interpret this VERIFIED crystal-structure
+result for a general audience.
+
+Problem: {problem}
+
+Verified result (JSON, independently confirmed: the claimed crystal
+system''s symmetry constraints hold, and the density was independently
+recomputed from the raw lattice parameters — trust it completely, do
+not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate the crystal system and unit-cell volume
+2. State the theoretical density, referencing the exact value from the JSON
+3. One sentence on why this cross-check (symmetry + independent
+   density recomputation) matters for materials data quality
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A student asked this crystallography question: "{problem}"
+
+There is no symmetry/density checker backing you up this time — work
+it out yourself, from scratch.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the crystal system and lattice parameters
+2. Shows your volume and density calculation step by step
+3. Gives the final theoretical density plainly, with its unit
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW materials_crystal
+  -- Default: rock-salt NaCl, cubic, a well-known textbook density
+  -- check (theoretical density ~2.17 g/cm^3).
+  INPUT @problem TEXT := "NaCl crystallizes in a cubic (rock-salt) structure with lattice parameter a = 5.640 Angstrom, all angles 90 degrees, Z = 4 formula units per unit cell, and molar mass 58.44 g/mol. What is its theoretical density, in g/cm^3?"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/92_compsci_materials/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[materials_crystal] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no symmetry/density checker ──
+        LOGGING "[arm=llm_only] solving with NO symmetry/density checker" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM formulates code; symmetry+density-checked solve ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + materials check" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @code     := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_materials_code(@problem) INTO @code;
+                CALL run_materials_check(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_materials_code(@problem, @code, @error_info) INTO @code;
+                CALL run_materials_check(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[materials_crystal] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[materials_crystal] ASSERT passed — symmetry + density confirmed" LEVEL INFO
+
+        GENERATE interpret_materials_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[materials_crystal] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @code, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/materials_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[materials_crystal] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Symmetry/density could not be verified after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/materials_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[materials_crystal] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

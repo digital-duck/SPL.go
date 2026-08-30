@@ -1,0 +1,58 @@
+-- Recipe 12: Plan and Execute
+-- A planner agent decomposes a complex task into steps, then an executor runs each step.
+-- Demonstrates agentic planning, sequential execution, and progress tracking.
+--
+-- Usage:
+--   spl3 run cookbook/12_plan_and_execute/plan_execute.spl --adapter ollama --model gemma3 task="Build a REST API for a todo app"
+--   spl3 run cookbook/12_plan_and_execute/plan_execute.spl --adapter ollama task="Set up a CI/CD pipeline for a Python project"
+--   spl3 run cookbook/12_plan_and_execute/plan_execute.spl --adapter ollama task="Migrate a MySQL database to PostgreSQL"
+
+WORKFLOW plan_and_execute
+    INPUT: @task TEXT
+    OUTPUT: @final_report TEXT
+DO
+    @step_index := 0
+    @results := ""
+
+    -- Phase 1: Planning — decompose task into numbered steps
+    GENERATE plan(@task) INTO @plan
+
+    -- Phase 2: Count steps in plan
+    GENERATE count_steps(@plan) INTO @step_count
+
+    -- Phase 3: Execute each step sequentially
+    WHILE @step_index < @step_count DO
+        -- Extract current step from plan
+        GENERATE extract_step(@plan, @step_index) INTO @current_step
+
+        -- Execute the step with context from prior results
+        GENERATE execute_step(@current_step, @results) INTO @step_result
+
+        -- Validate step output
+        GENERATE validate_step(@current_step, @step_result) INTO @validation
+
+        EVALUATE @validation
+            WHEN 'failed' THEN
+                -- Re-plan remaining steps given the failure
+                GENERATE replan(@task, @plan, @step_index, @step_result) INTO @plan
+                GENERATE count_steps(@plan) INTO @step_count
+                @step_index := 0
+                @results := ""
+            ELSE
+                @results := @results + '\n## Step ' + @step_index + '\n' + @step_result
+                @step_index := @step_index + 1
+        END
+    END
+
+    -- Phase 4: Synthesize final report
+    GENERATE synthesize(@task, @results) INTO @final_report
+
+    RETURN @final_report WITH status = 'complete', steps_executed = @step_index
+
+EXCEPTION
+    WHEN MaxIterationsReached THEN
+        GENERATE synthesize(@task, @results) INTO @final_report
+        RETURN @final_report WITH status = 'partial'
+    WHEN BudgetExceeded THEN
+        RETURN @results WITH status = 'budget_limit'
+END

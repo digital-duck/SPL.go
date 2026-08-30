@@ -1,0 +1,303 @@
+-- ============================================================
+-- Recipe 81: Graph Reasoning — LLM formulates, networkx proves
+--
+-- Extends the verifier ladder (67/75/78/79/80) into discrete /
+-- combinatorial math — shortest path, bipartite check, cycle
+-- detection — a distinct problem class from the continuous math
+-- (SymPy/Sage) and LP (PuLP) rungs already in the cookbook.
+--
+--   Probabilistic (LLM)   — read a natural-language graph problem
+--                            and write runnable networkx code
+--   Deterministic (nx)    — networkx computes the EXACT answer
+--                            (shortest path, bipartite?, has cycle?)
+--   Deterministic (ASSERT)— formal gate: only continue when the
+--                            tool reports success
+--   Probabilistic (LLM)   — narrate the result, restating the
+--                            final answer explicitly
+--   Deterministic (round- — a regex-and-compare classifier confirms
+--    trip classifier)       the LLM's stated final answer actually
+--                            matches the networkx-computed ground
+--                            truth (WITH roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm: no
+-- networkx call at all, the model reasons over the graph in prose.
+--
+-- Requires: networkx (already installed — no pip install needed)
+-- Run:
+--   spl3 run cookbook/81_graph_reasoning/graph_reasoning.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/81_graph_reasoning/graph_reasoning.spl \
+--       --llm ollama:gemma3 \
+--       --param problem="..." --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: networkx solver tool ───────────────
+
+CREATE TOOL_API run_networkx(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_networkx(code: str) -> str:
+    """Execute LLM-generated networkx code and return a JSON result dict.
+
+    The LLM writes the code; this function is the deterministic oracle.
+    The code must build a graph, answer the question, and set:
+        _result = {"status": "OK", "query": "<shortest_path|bipartite|has_cycle|...>",
+                   "answer": <scalar>, ...extra fields...}
+    On any error returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json
+    import re
+    import networkx as nx
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"nx": nx}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own stated 'Final answer: ...' line
+    (in its narration of the VERIFIED result) actually match the ground-truth
+    value networkx computed? This catches the LLM mis-restating or
+    hallucinating a different number than the one it was just given.
+
+    Returns 'match' / 'mismatch' / 'unverifiable' (no parseable final answer
+    or no ground truth to compare against).
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.').lower()
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+    truth_str = str(truth).strip().lower()
+
+    def _num(s):
+        try:
+            return float(re.sub(r'[^0-9.\-]', '', s))
+        except Exception:
+            return None
+
+    ln, tn = _num(llm_val), _num(truth_str)
+    if ln is not None and tn is not None:
+        return "match" if abs(ln - tn) < 1e-6 else "mismatch"
+    if truth_str in llm_val or llm_val in truth_str:
+        return "match"
+    return "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, code TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, code: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Graph Reasoning Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**networkx status:** `{sol.get('status', 'Unknown')}`",
+        f"**Query type:** `{sol.get('query', '?')}`",
+        f"**Ground-truth answer:** `{sol.get('answer', '?')}`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Solver Code (LLM-generated, networkx)", "",
+        "```python", code.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_graph_code(problem TEXT)
+RETURNS TEXT AS $$
+You are a graph-theory expert. Convert this natural-language graph problem
+into runnable Python code using the `networkx` library.
+
+Rules:
+- The module is already imported and in scope as `nx` — do NOT add import statements
+- Build the graph from the problem description (nx.Graph or nx.DiGraph as appropriate)
+- Answer the specific question asked (shortest path, path length, whether the
+  graph is bipartite, whether it contains a cycle, etc.) using networkx functions
+  such as nx.shortest_path, nx.shortest_path_length, nx.is_bipartite, nx.find_cycle,
+  nx.has_path, nx.connected_components, etc. — do not reimplement graph algorithms
+  by hand
+- Store the result EXACTLY as:
+    _result = {
+        "status": "OK",
+        "query": "<short label for the question asked>",
+        "answer": <the single scalar answer — a number, list, or boolean>,
+        ...any other useful fields (e.g. "path": [...])
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_graph_code(problem TEXT, code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This networkx code produced an error.
+
+Problem: {problem}
+
+Previous code:
+{code}
+
+Error:
+{error_info}
+
+Fix the code. Common causes:
+- Wrong node names (must match problem exactly)
+- Using an undirected function on a directed graph or vice versa
+- Missing or duplicate _result assignment
+- Calling a networkx function that does not exist or has different args
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_graph_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a graph-theory expert. Interpret this VERIFIED networkx result for a
+general audience.
+
+Problem: {problem}
+
+Verified result (JSON, computed exactly by networkx — trust it completely):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate the question in plain English
+2. State the answer, referencing the exact value from the JSON
+3. One sentence on why it makes sense (e.g. which edges/path it uses)
+
+End your response with a line in EXACTLY this format (no extra words):
+Final answer: <value>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A student asked this graph-theory question: "{problem}"
+
+There is no graph library backing you up this time — reason about the graph
+yourself, from scratch, in plain English.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the problem
+2. Shows your reasoning step by step (which nodes/edges you consider)
+3. Gives the final answer plainly
+
+End your response with a line in EXACTLY this format (no extra words):
+Final answer: <value>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW graph_reasoning
+  -- Default: a 6-node weighted logistics network with a known shortest
+  -- path (A-C-B-D-E-F, length 13) that can be hand-verified by summing
+  -- edge weights, but is easy to get wrong without a real graph traversal.
+  INPUT @problem TEXT := "A logistics network connects 6 warehouses (A, B, C, D, E, F) by roads with these distances in miles: A-B:4, A-C:2, B-C:1, B-D:5, C-D:8, C-E:10, D-E:2, D-F:6, E-F:3. What is the shortest route from warehouse A to warehouse F, and what is its total distance?"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/81_graph_reasoning/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[graph_reasoning] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no networkx call at all ──
+        LOGGING "[arm=llm_only] solving with NO graph solver" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM formulates networkx code; kernel proves it ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + networkx" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @code     := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_graph_code(@problem) INTO @code;
+                CALL run_networkx(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_graph_code(@problem, @code, @error_info) INTO @code;
+                CALL run_networkx(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[graph_reasoning] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[graph_reasoning] ASSERT passed — networkx confirmed OK" LEVEL INFO
+
+        GENERATE interpret_graph_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[graph_reasoning] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @code, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/graph_reasoning_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[graph_reasoning] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "networkx did not reach status OK after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/graph_reasoning_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[graph_reasoning] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

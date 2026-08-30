@@ -1,0 +1,82 @@
+-- Recipe 55: Voice Dialogue
+-- Category: multimodal
+-- Full audio-in / audio-out pipeline: listen → understand → respond → speak.
+--
+-- SPL INPUT types:  AUDIO (voice question) + TEXT (optional context)
+-- SPL OUTPUT types: TEXT (LLM response) + AUDIO (spoken response file)
+--
+-- Pipeline:
+--   [voice question audio]
+--         │
+--         ▼  LFM-2.5 (OpenRouter)  [AUDIO → TEXT]
+--   [transcription]
+--         │
+--         ▼  Gemma4 / any LLM       [TEXT → TEXT]
+--   [text response]
+--         │
+--         ▼  OpenAI TTS / espeak    [TEXT → AUDIO]
+--   [spoken response audio file]
+--
+-- This is the DODA logical view — the physical pipeline is in run.py.
+-- splc target: python/liquid (edge voice assistant on ARM / laptop)
+
+CREATE FUNCTION transcribe_audio(clip AUDIO)
+RETURN TEXT
+AS $$
+Transcribe the audio accurately. Return only the verbatim transcript.
+If the audio is unclear, mark uncertain parts with [?].
+$$;
+
+CREATE FUNCTION respond(transcript TEXT, context TEXT, persona TEXT)
+RETURN TEXT
+AS $$
+You are {persona}.
+
+Context provided: {context}
+
+User said: {transcript}
+
+Respond helpfully and concisely. Write in natural spoken language
+(avoid bullet points, markdown, or complex formatting — this will be read aloud).
+$$;
+
+
+WORKFLOW voice_dialogue
+    INPUT:
+        @audio_in     AUDIO  DEFAULT 'cookbook/60_voice_dialogue/sample/question.wav',
+        @context      TEXT   DEFAULT "",
+        @persona      TEXT   DEFAULT 'a helpful assistant',
+        @llm_model    TEXT   DEFAULT 'lfm2.5',
+        @tts_voice    TEXT   DEFAULT 'alloy',
+        @tts_model    TEXT   DEFAULT 'tts-1',
+        @output_dir   TEXT   DEFAULT 'cookbook/60_voice_dialogue/outputs',
+        @log_dir      TEXT   DEFAULT 'cookbook/60_voice_dialogue/logs-spl'
+    OUTPUT: @response TEXT
+DO
+    LOGGING '[voice_dialogue] step 1: transcribing audio ...' LEVEL INFO
+
+    -- Step 1: AUDIO → TEXT (transcription)
+    GENERATE transcribe_audio(@audio_in)
+        WITH OUTPUT BUDGET 1024 TOKENS
+        USING MODEL 'liquid/lfm-2.5-1.2b-instruct:free'
+        INTO @transcript
+
+    LOGGING f'[voice_dialogue] transcript: "{@transcript}"' LEVEL INFO
+
+    -- Step 2: TEXT → TEXT (LLM response)
+    GENERATE respond(@transcript, @context, @persona)
+        WITH OUTPUT BUDGET 1024 TOKENS
+        USING MODEL @llm_model
+        INTO @response
+
+    LOGGING f'[voice_dialogue] response ready ({len(@response)} chars)' LEVEL INFO
+
+    -- Step 3: TEXT → AUDIO (TTS) is handled by run.py
+    -- Output: @response (TEXT) + saved audio file path (side effect)
+    RETURN @response
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[voice_dialogue] model unavailable' LEVEL ERROR
+        RETURN '[ERROR] Model unavailable.' WITH status = 'failed'
+END

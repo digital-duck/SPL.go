@@ -1,0 +1,53 @@
+-- Recipe Name: Few-Shot Prompting
+-- Embed gold-standard examples directly in the SELECT context to guide output format and style.
+-- Demonstrates in-context learning — no fine-tuning required.
+--
+-- Usage:
+--   spl3 run cookbook/24_few_shot/few_shot.spl --adapter ollama --model gemma3 \
+--       text="The quarterly results exceeded all analyst forecasts by a significant margin"
+--
+--   spl3 run cookbook/24_few_shot/few_shot.spl --adapter ollama \
+--       text="System outage detected in EU-WEST-2 affecting 15% of users" \
+--       domain="ops"
+
+-- Gold-standard examples for tone/format calibration
+CREATE FUNCTION few_shot_examples(domain TEXT DEFAULT 'general')
+RETURN TEXT
+AS $$
+SELECT CASE domain
+  WHEN 'finance' THEN
+    """### Examples
+
+Input: "Revenue grew 12% YoY despite headwinds in APAC."
+Output: {"sentiment": "positive", "magnitude": 0.7, "topics": ["revenue", "growth", "APAC"], "summary": "Revenue up 12% YoY."}
+
+Input: "Write-downs of $2.3B drove a net loss for Q3."
+Output: {"sentiment": "negative", "magnitude": 0.9, "topics": ["write-downs", "net loss", "Q3"], "summary": "Q3 net loss from $2.3B write-downs."}"""
+
+  WHEN 'ops' THEN
+    """### Examples
+
+Input: "Deployment succeeded. All health checks passing. P99 latency 45ms."
+Output: {"status": "healthy", "severity": "none", "action_required": false, "summary": "Deploy OK, latency nominal."}
+
+Input: "Pod crash-loop in prod-east. OOMKilled. Restarted 7 times in 10 min."
+Output: {"status": "incident", "severity": "high", "action_required": true, "summary": "OOM crash-loop in prod-east, immediate attention needed."}"""
+
+  ELSE
+    """### Examples
+
+Input: "The new feature launched today and users are loving it!"
+Output: {"sentiment": "positive", "magnitude": 0.8, "summary": "Successful feature launch with positive user reception."}
+
+Input: "We encountered several critical bugs that delayed the release by two weeks."
+Output: {"sentiment": "negative", "magnitude": 0.7, "summary": "Critical bugs caused two-week release delay."}"""
+END
+$$;
+
+PROMPT few_shot_classifier
+SELECT
+    system_role('You are a precise text classifier. Follow the examples exactly — same JSON structure, same field names. Return only the JSON object.'),
+    few_shot_examples(context.domain) AS examples,
+    context.text AS text,
+    context.domain AS domain
+GENERATE classify(text, examples)

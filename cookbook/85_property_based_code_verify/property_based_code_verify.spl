@@ -1,0 +1,376 @@
+-- ============================================================
+-- Recipe 85: Property-Based Code Verification — hypothesis proves
+-- what recipe 79's fixed pytest examples cannot
+--
+-- Recipe 79 upgraded recipe 50's LLM-as-tester into a REAL pytest run,
+-- but the LLM still writes a handful of fixed example tests — it can
+-- only catch bugs on inputs it happened to think of. This recipe goes
+-- one rung further: the LLM writes PROPERTIES (invariants that must
+-- hold for ALL inputs of a given shape), and Hypothesis auto-generates
+-- hundreds of edge-case inputs (empty lists, negative numbers, huge
+-- values, duplicates) trying to falsify them. A property survives
+-- Hypothesis's search far more convincingly than it survives 3
+-- hand-picked examples.
+--
+--   Recipe 79: tests = LLM-picked EXAMPLES        (assert f(2,3)==5)
+--   Recipe 85: tests = LLM-written PROPERTIES      (@given(...) forall x: ...)
+--
+--   Probabilistic (LLM)   — generate the implementation from the spec
+--   Probabilistic (LLM)   — generate the properties from the SAME spec,
+--                            independently of the code (no test-to-code
+--                            circularity)
+--   Deterministic (pytest — Hypothesis auto-generates inputs and runs
+--    + hypothesis)          them against the properties in a subprocess;
+--                            any falsifying example is a real bug
+--   Deterministic (ASSERT)— formal gate: only continue when every
+--                            property held for every generated input
+--   Probabilistic (LLM)   — narrate the result
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — the LLM
+-- reviews its own code by eye and self-reports pass/fail, exactly
+-- recipe 50's original (unreliable) approach.
+--
+-- Requires: pip install hypothesis pytest
+-- Run:
+--   spl3 run cookbook/85_property_based_code_verify/property_based_code_verify.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/85_property_based_code_verify/property_based_code_verify.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: Hypothesis property-based test runner ──
+
+CREATE TOOL_API run_hypothesis(code TEXT, properties TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_hypothesis(code: str, properties: str) -> str:
+    """Execute LLM-generated code against LLM-generated Hypothesis
+    properties in a subprocess. Returns JSON. Both are written to a temp
+    directory that is removed after the subprocess exits — no filesystem
+    side effects.
+
+    Returns {"status": "AllPassed"/"Failed"/"Error", "passed": N,
+             "failed": M, "returncode": R, "output": "..."}
+    """
+    import json
+    import re
+    import subprocess
+    import tempfile
+    import os
+
+    def _strip(src: str) -> str:
+        src = re.sub(r'^```(?:python)?\s*\n?', '', src.strip(), flags=re.IGNORECASE)
+        return re.sub(r'\n?```\s*$', '', src)
+
+    code = _strip(code)
+    properties = _strip(properties)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "solution.py"), "w") as f:
+            f.write(code)
+        with open(os.path.join(tmpdir, "test_properties.py"), "w") as f:
+            f.write("from solution import *\n" + properties)
+        try:
+            proc = subprocess.run(
+                ["python3", "-m", "pytest", "test_properties.py", "-q",
+                 "--tb=short", "-p", "no:cacheprovider"],
+                cwd=tmpdir, capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            return json.dumps({"status": "Error", "error": "Hypothesis run timed out"})
+        except Exception as e:
+            return json.dumps({"status": "Error", "error": str(e)})
+
+        m = re.search(r'(\d+) passed', proc.stdout)
+        passed = int(m.group(1)) if m else 0
+        m = re.search(r'(\d+) failed', proc.stdout)
+        failed = int(m.group(1)) if m else 0
+        m = re.search(r'(\d+) error', proc.stdout)
+        errored = int(m.group(1)) if m else 0
+
+        if errored > 0 or (failed == 0 and passed == 0):
+            status = "Error"
+        elif failed == 0:
+            status = "AllPassed"
+        else:
+            status = "Failed"
+
+        return json.dumps({
+            "status": status, "passed": passed, "failed": failed,
+            "returncode": proc.returncode,
+            "output": (proc.stdout + proc.stderr)[-3000:]
+        })
+$$;
+
+CREATE TOOL_API all_properties_passed(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def all_properties_passed(result_json: str) -> bool:
+    """ASSERT gate: True only when Hypothesis found no falsifying example
+    for any property across all its generated inputs."""
+    import json
+    try:
+        return json.loads(result_json).get("status") == "AllPassed"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own narration correctly state
+    that all Hypothesis properties passed / the code is verified, and
+    does the reported pass count agree with what the JSON says? Catches
+    the LLM claiming success when the run actually failed (or vice versa).
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    try:
+        truth = json.loads(result_json)
+    except Exception:
+        return "unverifiable"
+    truth_status = truth.get("status")
+    if truth_status is None:
+        return "unverifiable"
+
+    text = narrative.lower()
+    claims_pass = bool(re.search(r'\b(all\s+properties?\s+pass|verified|no\s+bugs?\s+found|passed)\b', text))
+    claims_fail = bool(re.search(r'\b(fail|bug\s+found|falsif|does\s+not\s+hold)\b', text))
+
+    if truth_status == "AllPassed":
+        if claims_pass and not claims_fail:
+            return "match"
+        if claims_fail:
+            return "mismatch"
+        return "unverifiable"
+    else:
+        if claims_fail:
+            return "match"
+        if claims_pass:
+            return "mismatch"
+        return "unverifiable"
+$$;
+
+CREATE TOOL_API format_report(spec TEXT, code TEXT, properties TEXT,
+                              result_json TEXT, narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(spec: str, code: str, properties: str, result_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        res = json.loads(result_json)
+    except Exception:
+        res = {}
+    lines = [
+        "# Property-Based Code Verification Report",
+        "",
+        f"**Spec:** {spec.strip()}",
+        "",
+        f"**Hypothesis status:** `{res.get('status', 'Unknown')}`",
+        f"**Properties passed / failed:** `{res.get('passed', '?')} / {res.get('failed', '?')}`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Generated Implementation", "",
+        "```python", code.strip(), "```",
+        "", "## Generated Hypothesis Properties", "",
+        "```python", properties.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION generate_implementation(spec TEXT)
+RETURNS TEXT AS $$
+Write a Python implementation for this spec:
+
+{spec}
+
+Rules:
+- Output ONLY the function definition(s) — no markdown fences, no example
+  usage, no if __name__ == "__main__" block
+- Give the function(s) clear, spec-matching names and full type hints
+$$;
+
+CREATE FUNCTION generate_properties(spec TEXT)
+RETURNS TEXT AS $$
+Write Hypothesis property-based tests for this spec — NOT for any
+particular implementation, so write them from the spec alone:
+
+{spec}
+
+Rules:
+- Output ONLY the test code — no markdown fences, no commentary
+- `from hypothesis import given, strategies as st` — assume this import,
+  do NOT repeat it in your output
+- The function(s) under test are already importable by name (matching the
+  spec) — do NOT redefine or reimplement them, do NOT import them either
+- Write at least 2 distinct @given-decorated property test functions,
+  each capturing an invariant that must hold for ALL valid inputs (e.g.
+  idempotence, output length, ordering, round-trip of an inverse
+  operation, invariance under a transformation) — NOT fixed-example
+  assertions like `assert f(2,3) == 5`
+- Use st.integers(), st.lists(...), st.text(), etc. to generate inputs
+  matching the spec''s parameter types
+
+Example shape (for a different spec, illustrating format only):
+```
+@given(st.lists(st.integers()))
+def test_sort_is_idempotent(xs):
+    once = my_sort(xs)
+    twice = my_sort(once)
+    assert once == twice
+```
+$$;
+
+CREATE FUNCTION repair_properties(spec TEXT, properties TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This Hypothesis test code produced an ERROR (not a test failure — an
+actual exception in the test file itself, e.g. a bad import or syntax
+error).
+
+Spec: {spec}
+
+Previous test code:
+{properties}
+
+Error:
+{error_info}
+
+Fix the test code so it runs (do not change what it is designed to check).
+Output ONLY the corrected test code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_hypothesis_result(spec TEXT, result_json TEXT)
+RETURNS TEXT AS $$
+You are a software testing expert. Interpret this VERIFIED Hypothesis
+property-based test run for a developer.
+
+Spec: {spec}
+
+Verified result (JSON — pytest + Hypothesis actually executed the
+properties against hundreds of generated inputs; trust it completely):
+{result_json}
+
+Provide a concise interpretation (under 100 words):
+1. State whether all properties passed or a falsifying example was found
+2. If failed, mention the falsifying input from the output if visible
+3. One sentence on what this means for the implementation''s correctness
+$$;
+
+CREATE FUNCTION solve_directly(spec TEXT)
+RETURNS TEXT AS $$
+Write a Python implementation for this spec, then review it yourself by
+eye — there is no test runner backing you up this time.
+
+Spec: {spec}
+
+Write the implementation, then in a few sentences self-assess whether you
+believe it is correct and why. State clearly whether you believe it
+passes or fails.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW property_based_code_verify
+  -- Default spec: merging two sorted lists — small enough to eyeball,
+  -- but easy to subtly break (e.g. forgetting to sort inputs first,
+  -- off-by-one merge logic) in ways 2-3 hand-picked examples miss but
+  -- Hypothesis's generated inputs (empty lists, duplicates, negatives)
+  -- reliably catch.
+  INPUT @spec TEXT := "Write a function merge_sorted(a: list[int], b: list[int]) -> list[int] that takes two ALREADY-SORTED lists of integers and returns a single sorted list containing all elements of both (duplicates included)."
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/85_property_based_code_verify/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[property_based_code_verify] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — self-reviewed, no test runner ──
+        LOGGING "[arm=llm_only] generating + self-reviewing, NO Hypothesis run" LEVEL INFO
+        GENERATE solve_directly(@spec) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM writes code + properties independently; Hypothesis proves it ──
+        LOGGING "[arm=solver] Stage 1 — generating implementation + properties" LEVEL INFO
+        GENERATE generate_implementation(@spec) INTO @code;
+        GENERATE generate_properties(@spec) INTO @properties;
+
+        @tries  := 0;
+        @status := "init";
+        @result := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "AllPassed" THEN
+              @tries := @max_tries
+            WHEN = "Failed" THEN
+              -- A genuine falsifying example is the deterministic verdict
+              -- on THIS implementation — do not let the LLM "fix" a
+              -- correct property to make a buggy implementation pass;
+              -- fail fast, same policy as 78/79's ASSERT gate.
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                CALL run_hypothesis(@code, @properties) INTO @result;
+                CALL result_status(@result) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                -- status == "Error": the TEST CODE itself is broken
+                -- (bad import, syntax error) — repair the test harness,
+                -- never the implementation under test.
+                CALL result_error(@result) INTO @error_info;
+                GENERATE repair_properties(@spec, @properties, @error_info) INTO @properties;
+                CALL run_hypothesis(@code, @properties) INTO @result;
+                CALL result_status(@result) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[property_based_code_verify] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT all_properties_passed(@result);
+        LOGGING "[property_based_code_verify] ASSERT passed — Hypothesis found no falsifying example" LEVEL INFO
+
+        GENERATE interpret_hypothesis_result(@spec, @result) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @result) INTO @roundtrip;
+        LOGGING f"[property_based_code_verify] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@spec, @code, @properties, @result, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/property_verify_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[property_based_code_verify] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Hypothesis found a falsifying example (or the harness errored) after " + @tries + " attempts. Last status: " + @status + "\n\n" + @result;
+    CALL write_file(f"{@out_dir}/property_verify_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[property_based_code_verify] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "falsified", arm = "solver", roundtrip = "unverifiable"
+END;

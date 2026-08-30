@@ -1,0 +1,131 @@
+-- Recipe 41: Human Steering (Human-in-the-Loop)
+-- Demonstrates the "Pause for Approval" pattern.
+-- A workflow pauses for human feedback via a deterministic CALL, then conditionally
+-- refines its output based on what the human said.
+--
+-- Usage:
+--   spl3 run cookbook/41_human_steering/human_steering.spl \
+--       --adapter ollama \
+--       topic="The future of agentic AI"
+
+CREATE TOOL_API wait_for_human_feedback(prompt_msg TEXT)
+RETURNS TEXT AS PYTHON $$
+def wait_for_human_feedback(prompt_msg: str) -> str:
+    """
+    Pause the workflow and prompt the human for feedback via stdin.
+
+    Displays the prompt message, then reads a multi-line response until the user
+    enters a blank line or presses Ctrl-D.  Returns the trimmed response text,
+    or "" if no feedback is given (workflow continues with the original draft).
+
+    Bounded by an overall wall-clock timeout — default 15 minutes (900s),
+    override via the HUMAN_FEEDBACK_TIMEOUT_SEC env var. Without this, an
+    unattended run (e.g. cookbook/run_all.py batch jobs, where no human is at
+    the keyboard) would block on input() forever. A timeout is treated exactly
+    like "no feedback": the workflow continues with the draft as-is.
+    """
+    import os
+    import select
+    import sys
+    import time
+
+    timeout_sec = float(os.environ.get("HUMAN_FEEDBACK_TIMEOUT_SEC", "900"))
+    deadline = time.monotonic() + timeout_sec
+
+    print("\n" + "=" * 60)
+    print("HUMAN FEEDBACK REQUIRED")
+    print("=" * 60)
+    print(prompt_msg)
+    print("-" * 60)
+    print(f"Enter feedback (blank line or Ctrl-D to skip; "
+          f"times out after {timeout_sec:.0f}s with no input):")
+
+    lines = []
+    timed_out = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([sys.stdin], [], [], remaining)
+            if not ready:
+                timed_out = True
+                break
+            line = sys.stdin.readline()
+            if line == "":            # EOF — Ctrl-D, or stdin closed/redirected (batch run)
+                break
+            line = line.rstrip("\n")
+            if line == "":
+                break
+            lines.append(line)
+    except Exception:
+        pass
+
+    feedback = "\n".join(lines).strip()
+    if feedback:
+        print(f"[Feedback recorded: {len(feedback)} chars]")
+    elif timed_out:
+        print(f"[No input within {timeout_sec:.0f}s — continuing unattended with draft as-is]")
+    else:
+        print("[No feedback — using draft as-is]")
+    print("=" * 60 + "\n")
+    return feedback
+$$;
+
+CREATE FUNCTION draft(topic TEXT)
+RETURN TEXT
+AS $$
+You are a professional tech writer. Draft a concise 3-sentence article about the provided topic.
+Focus on a clear opening claim, a supporting example, and a forward-looking conclusion.
+
+Topic: {topic}
+$$;
+
+CREATE FUNCTION refine(draft TEXT, feedback TEXT)
+RETURN TEXT
+AS $$
+You are a senior editor. Revise the draft below to address the reviewer feedback.
+Preserve the structure (opening claim, example, conclusion) unless the feedback explicitly changes it.
+
+Draft:
+{draft}
+
+Reviewer feedback:
+{feedback}
+$$;
+
+WORKFLOW human_steering
+    INPUT: 
+        @topic TEXT DEFAULT 'The future of decentralized AI inference',
+        @log_dir TEXT DEFAULT 'cookbook/41_human_steering/logs-spl'
+    OUTPUT: @final_article TEXT
+DO
+    LOGGING f'Drafting article on topic:\n {@topic}' LEVEL INFO
+
+    -- Step 1: Generate initial draft (LLM)
+    GENERATE draft(@topic) INTO @draft
+    LOGGING 'Draft generated — requesting human feedback' LEVEL INFO
+    CALL write_file(f'{@log_dir}/draft.md', @draft) INTO NONE
+
+    -- Step 2: Pause for human steering (deterministic CALL — no LLM cost)
+    CALL wait_for_human_feedback(f'Review this draft:\n\n{@draft}') INTO @feedback
+    CALL write_file(f'{@log_dir}/feedback.md', @feedback) INTO NONE
+
+    -- Step 3: Branch on whether feedback was provided
+    EVALUATE @feedback
+        WHEN != "" THEN
+            LOGGING 'Human feedback received — refining draft' LEVEL INFO
+            GENERATE refine(@draft, @feedback) INTO @final_article
+        ELSE
+            LOGGING 'No feedback received — using initial draft as-is' LEVEL DEBUG
+            @final_article := @draft
+    END
+
+    CALL write_file(f'{@log_dir}/final_article.md', @final_article) INTO NONE
+    RETURN @final_article WITH status = 'complete'
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN @draft WITH status = 'draft_only', reason = 'generation_error'
+END

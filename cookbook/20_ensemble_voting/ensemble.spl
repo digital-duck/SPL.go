@@ -1,0 +1,68 @@
+-- Recipe Name: Ensemble Voting
+-- Generates multiple independent answers, then uses majority voting to pick the best.
+-- Demonstrates ensemble methods, comparative scoring, and consensus-driven output.
+--
+-- Usage:
+--   spl3 run cookbook/20_ensemble_voting/ensemble.spl --adapter ollama --model gemma3 question="What causes inflation?"
+--   spl3 run cookbook/20_ensemble_voting/ensemble.spl --adapter ollama question="Is Rust faster than C++?"
+--   spl3 run cookbook/20_ensemble_voting/ensemble.spl --adapter ollama question="What is the best database for time-series data?"
+
+WORKFLOW ensemble_voting
+    INPUT: @question TEXT
+    OUTPUT: @final_answer TEXT
+DO
+    LOGGING f'Ensemble voting | question: {@question}' LEVEL INFO
+
+    -- Step 1: Generate 5 independent candidate answers with varying temperatures
+    LOGGING 'Generating 5 candidate answers ...' LEVEL DEBUG
+    GENERATE answer_candidate(@question) INTO @candidate_1
+    GENERATE answer_candidate(@question) INTO @candidate_2
+    GENERATE answer_candidate(@question) INTO @candidate_3
+    GENERATE answer_candidate(@question) INTO @candidate_4
+    GENERATE answer_candidate(@question) INTO @candidate_5
+    LOGGING '5 candidates ready — scoring ...' LEVEL INFO
+
+    -- Step 2: Score each candidate on accuracy, completeness, and clarity
+    GENERATE score_candidate(@candidate_1, @question) INTO @score_1
+    GENERATE score_candidate(@candidate_2, @question) INTO @score_2
+    GENERATE score_candidate(@candidate_3, @question) INTO @score_3
+    GENERATE score_candidate(@candidate_4, @question) INTO @score_4
+    GENERATE score_candidate(@candidate_5, @question) INTO @score_5
+    LOGGING f'Scores: 1={@score_1} 2={@score_2} 3={@score_3} 4={@score_4} 5={@score_5}' LEVEL DEBUG
+
+    -- Step 3: Find consensus — identify common themes across candidates
+    LOGGING 'Finding consensus ...' LEVEL DEBUG
+    GENERATE find_consensus(
+        @candidate_1, @candidate_2, @candidate_3,
+        @candidate_4, @candidate_5
+    ) INTO @consensus
+
+    -- Step 4: Select the best candidate based on scores and consensus alignment
+    LOGGING 'Selecting winner ...' LEVEL DEBUG
+    GENERATE select_winner(
+        @candidate_1, @score_1,
+        @candidate_2, @score_2,
+        @candidate_3, @score_3,
+        @candidate_4, @score_4,
+        @candidate_5, @score_5,
+        @consensus
+    ) INTO @best_candidate
+
+    -- Step 5: Polish the winning answer, incorporating consensus insights
+    GENERATE polish(@best_candidate, @consensus, @question) INTO @final_answer
+
+    LOGGING 'Final answer ready' LEVEL INFO
+    RETURN @final_answer WITH status = 'complete', candidates = 5
+
+EXCEPTION
+    WHEN BudgetExceeded THEN
+        -- If budget runs out, use whatever candidates we have
+        GENERATE select_winner(
+            @candidate_1, @score_1,
+            @candidate_2, @score_2,
+            @candidate_3, @score_3
+        ) INTO @final_answer
+        RETURN @final_answer WITH status = 'partial', candidates = 3
+    WHEN HallucinationDetected THEN
+        RETRY WITH temperature = 0.1 LIMIT 3
+END

@@ -1,0 +1,108 @@
+
+-- Recipe Name: Prompt A/B Test
+-- Compare two prompt variants using EVALUATE scoring. Pick the winner automatically.
+-- Demonstrates data-driven prompt engineering built into the workflow itself.
+-- Supports pre-built experiments from experiments.json or ad-hoc task + prompt_a + prompt_b.
+--
+-- Usage (from catalog):
+--   spl3 run cookbook/26_ab_test/ab_test.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/26_ab_test/tools.py \
+--       experiment_id=neural_networks
+--
+--   spl3 run cookbook/26_ab_test/ab_test.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/26_ab_test/tools.py \
+--       experiment_id=standing_desk winner_threshold=2.0
+--
+-- Usage (ad-hoc — no catalog):
+--   spl3 run cookbook/26_ab_test/ab_test.spl --adapter ollama --model gemma3 \
+--       --tools cookbook/26_ab_test/tools.py \
+--       task="Explain neural networks" \
+--       prompt_a="Explain like I'm 5" \
+--       prompt_b="Give a technical explanation with analogies"
+--
+-- Discover available experiments:
+--   spl3 run ... experiment_id=list
+
+IMPORT 'tools'
+
+-- Scoring rubric as a reusable function
+CREATE FUNCTION scoring_rubric()
+RETURN TEXT
+AS $$
+Rate the response on a scale of 0–10 for each criterion:
+1. Clarity (0-10): Is it easy to understand?
+2. Completeness (0-10): Does it fully address the task?
+3. Relevance (0-10): Is every sentence on-topic?
+4. Engagement (0-10): Is it interesting to read?
+
+Return valid JSON only — no prose outside the JSON:
+{"clarity": N, "completeness": N, "relevance": N, "engagement": N, "total": N, "rationale": "one concise sentence"}
+$$;
+
+WORKFLOW ab_test
+    INPUT:  @experiment_id    TEXT DEFAULT "",
+            @task             TEXT DEFAULT "",
+            @prompt_a         TEXT DEFAULT "",
+            @prompt_b         TEXT DEFAULT "",
+            @winner_threshold FLOAT DEFAULT 1.5
+    OUTPUT: @winner_output TEXT
+DO
+    -- Step 1: Load experiment from catalog (deterministic — no LLM)
+    -- Sets @experiment_context with task, prompt_a, prompt_b, and notes.
+    -- If experiment_id is blank, the context will be empty and @task/@prompt_a/@prompt_b are used directly.
+    CALL load_experiment(@experiment_id) INTO @experiment_context
+
+    -- Step 2: Generate Variant A response
+    GENERATE run_variant_a(
+        @task,
+        @prompt_a,
+        @experiment_context
+    ) INTO @response_a
+
+    -- Step 3: Generate Variant B response
+    GENERATE run_variant_b(
+        @task,
+        @prompt_b,
+        @experiment_context
+    ) INTO @response_b
+
+    -- Step 4: Score both variants against the rubric (LLM)
+    GENERATE evaluate_response(@response_a, @task, scoring_rubric()) 
+        INTO @score_a_json
+    GENERATE evaluate_response(@response_b, @task, scoring_rubric()) 
+        INTO @score_b_json
+
+    -- Step 5: Extract numeric totals (deterministic — no LLM)
+    CALL extract_score_total(@score_a_json) INTO @score_a
+    CALL extract_score_total(@score_b_json) INTO @score_b
+
+    -- Step 6: Pick winner or declare tie
+    EVALUATE (@score_a - @score_b)
+        WHEN > @winner_threshold THEN
+            SET @winner_output = @response_a
+            RETURN @winner_output WITH
+                winner    = 'A',
+                score_a   = @score_a,
+                score_b   = @score_b,
+                margin    = (@score_a - @score_b)
+        WHEN < (0 - @winner_threshold) THEN
+            SET @winner_output = @response_b
+            RETURN @winner_output WITH
+                winner    = 'B',
+                score_a   = @score_a,
+                score_b   = @score_b,
+                margin    = (@score_b - @score_a)
+        ELSE
+            -- Scores too close — format both with explanation (deterministic — no LLM)
+            CALL format_tie_result(@response_a, @response_b, @score_a_json, @score_b_json) 
+                INTO @winner_output
+            RETURN @winner_output WITH
+                winner  = 'tie',
+                score_a = @score_a,
+                score_b = @score_b
+    END
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'A/B test failed during generation.' WITH status = 'error'
+END

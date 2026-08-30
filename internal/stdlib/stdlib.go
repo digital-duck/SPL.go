@@ -6,7 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -94,9 +98,40 @@ var Registry = map[string]Func{
 	"list_length":   listLength,
 	"list_join":     listJoin,
 	"list_contains": listContains,
+	"list_append":   listAppend,
+	"list_count":    listCount,
 	"trim_turns":    trimTurns,
 	"count":         listLength, // COUNT(@list) — alias for list_length; case-folded by stdlib.Call
-	"len_val":       lenVal,     // polymorphic length: string chars, JSON array elements, JSON object keys
+	"len_val":       lenVal,     // backward-compat alias; length() is now polymorphic
+
+	// Logging
+	"log_init": logInit,
+	"log":      logMessage,
+
+	// Timing
+	"time_now":       timeNow,
+	"time_elapsed":   timeElapsed,
+	"time_monotonic": timeMonotonic,
+
+	// SOLVER result helpers
+	"result_status": resultStatus,
+	"result_error":  resultError,
+	"result_ok":     resultOk,
+
+	// Finance / compliance
+	"fin_risk_rating": finRiskRating,
+	"alert":           alertFn,
+
+	// File I/O
+	"write_file":  writeFile,
+	"read_file":   readFile,
+	"file_exists": fileExists,
+	"make_dir":    makeDir,
+	"path_join":   pathJoin,
+
+	// Network
+	"http_get":   httpGet,
+	"web_search": webSearch,
 }
 
 // Call invokes a stdlib function by name. Returns (result, ok).
@@ -209,7 +244,7 @@ func length(args []string) string {
 	if len(args) == 0 {
 		return "0"
 	}
-	return strconv.Itoa(len(args[0]))
+	return lenVal(args)
 }
 
 func substr(args []string) string {
@@ -575,8 +610,12 @@ func jsonGet(args []string) string {
 	if len(args) < 2 {
 		return ""
 	}
+	// Strip markdown code fences so raw LLM output works directly.
+	clean := strings.ReplaceAll(args[0], "```json", "")
+	clean = strings.ReplaceAll(clean, "```", "")
+	clean = strings.TrimSpace(clean)
 	var obj interface{}
-	if err := json.Unmarshal([]byte(args[0]), &obj); err != nil {
+	if err := json.Unmarshal([]byte(clean), &obj); err != nil {
 		return ""
 	}
 	parts := strings.Split(args[1], ".")
@@ -780,24 +819,38 @@ func listGet(args []string) string {
 	if len(args) < 2 {
 		return ""
 	}
-	var arr []interface{}
-	if err := json.Unmarshal([]byte(args[0]), &arr); err != nil {
-		return ""
-	}
-	idx, err := strconv.Atoi(args[1])
+	s := strings.TrimSpace(args[0])
+	idx, err := strconv.Atoi(strings.TrimSpace(args[1]))
 	if err != nil {
 		return ""
 	}
-	if idx < 0 || idx >= len(arr) {
+	idx-- // convert 1-based to 0-based
+	// Try JSON array first.
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		var arr []interface{}
+		if json.Unmarshal([]byte(s), &arr) == nil {
+			if idx < 0 || idx >= len(arr) {
+				return ""
+			}
+			switch v := arr[idx].(type) {
+			case string:
+				return v
+			default:
+				b, _ := json.Marshal(v)
+				return string(b)
+			}
+		}
+	}
+	// Fallback: delimiter-based list (default delimiter ",").
+	delim := ","
+	if len(args) >= 3 {
+		delim = args[2]
+	}
+	parts := strings.Split(s, delim)
+	if idx < 0 || idx >= len(parts) {
 		return ""
 	}
-	switch v := arr[idx].(type) {
-	case string:
-		return v
-	default:
-		b, _ := json.Marshal(v)
-		return string(b)
-	}
+	return strings.TrimSpace(parts[idx])
 }
 
 func listLength(args []string) string {
@@ -889,6 +942,294 @@ func trimTurns(args []string) string {
 		return conversationJSON
 	}
 	return string(result)
+}
+
+func listAppend(args []string) string {
+	if len(args) < 2 {
+		return safeArg(args, 0)
+	}
+	value := strings.TrimSpace(args[0])
+	item := strings.TrimSpace(args[1])
+	delim := ","
+	if len(args) >= 3 {
+		delim = args[2]
+	}
+	if value == "" {
+		return item
+	}
+	return value + delim + item
+}
+
+func listCount(args []string) string {
+	if len(args) < 2 {
+		return "0"
+	}
+	delim := ","
+	if len(args) >= 3 {
+		delim = args[2]
+	}
+	target := strings.TrimSpace(args[1])
+	count := 0
+	for _, p := range strings.Split(args[0], delim) {
+		if strings.TrimSpace(p) == target {
+			count++
+		}
+	}
+	return strconv.Itoa(count)
+}
+
+// =============================================================================
+// Logging
+// =============================================================================
+
+func logInit(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	name := args[0]
+	logDir := filepath.Join(os.Getenv("HOME"), ".spl", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Sprintf("log_init error: %v", err)
+	}
+	ts := time.Now().Format("20060102-150405")
+	path := filepath.Join(logDir, name+"-"+ts+".log")
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Sprintf("log_init error: %v", err)
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "# SPL Log: %s\n# Started: %s\n\n", name, time.Now().Format(time.RFC3339))
+	return path
+}
+
+func logMessage(args []string) string {
+	if len(args) < 3 {
+		return safeArg(args, 2)
+	}
+	message := args[0]
+	severity := strings.ToUpper(args[1])
+	logFile := args[2]
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	line := fmt.Sprintf("[%s] %s", severity, message)
+	if severity == "WARN" || severity == "ERROR" {
+		fmt.Fprintln(os.Stderr, line)
+	} else {
+		fmt.Println(line)
+	}
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		fmt.Fprintf(f, "[%s] [%s] %s\n", ts, severity, message)
+	}
+	return logFile
+}
+
+// =============================================================================
+// Timing
+// =============================================================================
+
+func timeNow(args []string) string {
+	return time.Now().Format("2006-01-02_15-04-05")
+}
+
+func timeMonotonic(args []string) string {
+	return strconv.FormatFloat(float64(time.Now().UnixNano())/1e9, 'f', 6, 64)
+}
+
+func timeElapsed(args []string) string {
+	if len(args) == 0 {
+		return "?"
+	}
+	start, err := strconv.ParseFloat(strings.TrimSpace(args[0]), 64)
+	if err != nil {
+		return "?"
+	}
+	now := float64(time.Now().UnixNano()) / 1e9
+	return fmt.Sprintf("%.1f", now-start)
+}
+
+// =============================================================================
+// SOLVER result helpers
+// =============================================================================
+
+func resultStatus(args []string) string {
+	if len(args) == 0 {
+		return "Error"
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(args[0]), &m); err != nil {
+		return "Error"
+	}
+	if v, ok := m["status"]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	return "Error"
+}
+
+func resultError(args []string) string {
+	if len(args) == 0 {
+		return "unknown error"
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(args[0]), &m); err != nil {
+		return args[0]
+	}
+	if v, ok := m["error"]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	if v, ok := m["status"]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	return "unknown error"
+}
+
+func resultOk(args []string) string {
+	if len(args) == 0 {
+		return "false"
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(args[0]), &m); err != nil {
+		return "false"
+	}
+	if v, ok := m["status"]; ok && fmt.Sprintf("%v", v) == "OK" {
+		return "true"
+	}
+	return "false"
+}
+
+// =============================================================================
+// Finance / compliance
+// =============================================================================
+
+func finRiskRating(args []string) string {
+	if len(args) == 0 {
+		return "low"
+	}
+	t := strings.ToLower(args[0])
+	if strings.Contains(t, "high risk") || strings.Contains(t, "critical") || strings.Contains(t, "red flag") {
+		return "high"
+	}
+	if strings.Contains(t, "medium risk") || strings.Contains(t, "moderate") || strings.Contains(t, "review needed") {
+		return "medium"
+	}
+	return "low"
+}
+
+func alertFn(args []string) string {
+	payload := safeArg(args, 0)
+	if len(payload) > 200 {
+		payload = payload[:200]
+	}
+	fmt.Printf("ALERT:\n%s\n", payload)
+	return "alert_sent"
+}
+
+// =============================================================================
+// File I/O
+// =============================================================================
+
+func writeFile(args []string) string {
+	if len(args) < 2 {
+		return ""
+	}
+	path := strings.TrimSpace(args[0])
+	content := args[1]
+	mode := "w"
+	if len(args) >= 3 {
+		mode = strings.TrimSpace(args[2])
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Sprintf("write_file error: %v", err)
+	}
+	flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if mode == "a" {
+		flag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	}
+	f, err := os.OpenFile(path, flag, 0644)
+	if err != nil {
+		return fmt.Sprintf("write_file error: %v", err)
+	}
+	defer f.Close()
+	f.WriteString(content)
+	abs, _ := filepath.Abs(path)
+	return abs
+}
+
+func readFile(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	data, err := os.ReadFile(strings.TrimSpace(args[0]))
+	if err != nil {
+		return fmt.Sprintf("read_file error: %v", err)
+	}
+	return string(data)
+}
+
+func fileExists(args []string) string {
+	if len(args) == 0 {
+		return "false"
+	}
+	_, err := os.Stat(strings.TrimSpace(args[0]))
+	if err == nil {
+		return "true"
+	}
+	return "false"
+}
+
+func makeDir(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	path := strings.TrimSpace(args[0])
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return fmt.Sprintf("make_dir error: %v", err)
+	}
+	abs, _ := filepath.Abs(path)
+	return abs
+}
+
+func pathJoin(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = strings.TrimSpace(a)
+	}
+	return filepath.Join(parts...)
+}
+
+// =============================================================================
+// Network
+// =============================================================================
+
+func httpGet(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	url := strings.TrimSpace(args[0])
+	timeout := 10 * time.Second
+	if len(args) >= 2 {
+		if secs, err := strconv.Atoi(strings.TrimSpace(args[1])); err == nil {
+			timeout = time.Duration(secs) * time.Second
+		}
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Sprintf("http_get error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Sprintf("http_get read error: %v", err)
+	}
+	return string(body)
+}
+
+func webSearch(args []string) string {
+	return "web_search unavailable: install ddgs (pip install ddgs) or use the Python runtime"
 }
 
 // lenVal is a polymorphic length function.

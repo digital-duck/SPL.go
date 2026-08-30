@@ -1,0 +1,222 @@
+-- Recipe Name: LLM-powered SPL Compiler (vibe-splc)
+-- Compiles a .spl workflow to a target framework implementation using LLM.
+-- Complements the deterministic SPLc compiler — use both and cross-compare
+-- to surface gaps between the generated output and the author's intent.
+--
+-- Supported targets: langgraph, autogen, crewai
+-- Recommended adapter: claude_cli (top-tier reasoning, best for code generation)
+--
+-- Usage:
+--   spl3 run cookbook/65_llm_splc/llm_splc.spl \
+--       --adapter claude_cli \
+--       --param spl_file="cookbook/05_self_refine/self_refine.spl" \
+--       --param target="langgraph"
+--
+--   spl3 run cookbook/65_llm_splc/llm_splc.spl \
+--       --adapter claude_cli \
+--       --param spl_file="cookbook/11_debate_arena/debate_arena.spl" \
+--       --param target="crewai"
+--
+--   spl3 run cookbook/65_llm_splc/llm_splc.spl \
+--       --adapter claude_cli \
+--       --param spl_file="cookbook/63_parallel_code_review/parallel_code_review.spl" \
+--       --param target="autogen"
+
+-- load_file: reads a file from disk (stdlib passthrough)
+CREATE TOOL_API load_file(path TEXT)
+RETURNS TEXT AS PYTHON $$
+import os
+
+def load_file(path: str) -> str:
+    """Load a file and return its contents."""
+    path = path.strip()
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+$$;
+
+-- write_file: strips markdown code fences before writing code files (*.py, *.go, *.ts, *.js)
+CREATE TOOL_API write_file(path TEXT, content TEXT)
+RETURNS TEXT AS PYTHON $$
+import os
+import re
+
+def write_file(path: str, content: str) -> str:
+    """Write content to a file, stripping markdown code fences for code files."""
+    code_exts = {".py", ".go", ".ts", ".js"}
+    if os.path.splitext(path)[1] in code_exts:
+        content = re.sub(r"^```[a-zA-Z0-9_]*\n?", "", content.strip())
+        content = re.sub(r"\n?```$", "", content).strip()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content + "\n")
+    return f"written: {path}"
+$$;
+
+CREATE FUNCTION framework_guide(target TEXT)
+RETURN TEXT
+AS $$
+SELECT CASE target
+  WHEN 'langgraph' THEN
+    'LangGraph (Python). Use StateGraph with TypedDict state. One node per GENERATE statement.
+     CALL PARALLEL → parallel node branches joined by a merge node.
+     EVALUATE → ConditionalEdge with a router function.
+     WHILE → cycle back to an earlier node with a conditional exit edge.
+     EXCEPTION WHEN → wrap nodes in try/except, route to fallback nodes.
+     Use @chain.invoke() at the end. Include all imports.'
+  WHEN 'autogen' THEN
+    'AutoGen (Python). Use AssistantAgent and UserProxyAgent or GroupChat.
+     Each GENERATE maps to an agent message exchange.
+     CALL PARALLEL → asyncio.gather over multiple agent.initiate_chat calls.
+     EVALUATE → inspect last message content and branch in Python.
+     WHILE → loop until termination condition on reply content.
+     EXCEPTION WHEN → try/except around initiate_chat.
+     Include all imports. Use gemma3 as the default model (Ollama-compatible) — NOT gpt-4o or any OpenAI model.'
+  WHEN 'crewai' THEN
+    'CrewAI (Python). Use Agent + Task + Crew.
+     Each GENERATE maps to a Task assigned to an Agent.
+     CALL PARALLEL → tasks with async_execution=True in the same Crew.
+     EVALUATE → conditional Task or Python if/else on task output.
+     WHILE → loop Crew.kickoff() until quality condition met.
+     EXCEPTION WHEN → try/except around crew.kickoff().
+     Include all imports. Use process=Process.sequential or hierarchical.'
+  ELSE
+    'Generate idiomatic Python that faithfully implements the workflow logic.
+     Preserve all branching, looping, parallel execution, and exception handling.'
+END
+$$;
+
+CREATE FUNCTION compile_prompt(spl_source TEXT, target TEXT)
+RETURN TEXT
+AS $$
+You are an expert AI engineer fluent in SPL (Structured Prompt Language) and LLM application frameworks.
+
+Your task: translate the SPL workflow below into an idiomatic {target} implementation.
+
+--- SPL SOURCE ---
+{spl_source}
+--- END SPL SOURCE ---
+
+Framework conventions:
+{framework_guide(target)}
+
+Requirements:
+1. Preserve the exact workflow logic — every GENERATE, CALL, EVALUATE, WHILE, EXCEPTION WHEN must have a counterpart.
+2. All LLM prompts from CREATE FUNCTION blocks must appear verbatim in the output.
+3. Parameterise the model name so it can be swapped without code changes.
+   Use 'gemma3' as the default model (Ollama-compatible) — NOT gpt-4 or any OpenAI model.
+4. Output only the complete, runnable code — no explanation, no markdown fences.
+5. Include a __main__ block with a usage example matching the SPL INPUT defaults.
+$$;
+
+CREATE FUNCTION review_prompt(spl_source TEXT, implementation TEXT, target TEXT)
+RETURN TEXT
+AS $$
+You are a senior code reviewer. Compare the SPL specification against the {target} implementation.
+
+--- SPL SOURCE ---
+{spl_source}
+--- END ---
+
+--- IMPLEMENTATION ---
+{implementation}
+--- END ---
+
+Check:
+1. Every GENERATE has a corresponding LLM call.
+2. Every CALL PARALLEL maps to concurrent execution.
+3. Every EVALUATE branch is represented.
+4. Every EXCEPTION WHEN has a handler.
+5. Prompts match the CREATE FUNCTION definitions.
+
+If the implementation is complete and correct, reply exactly: [APPROVED]
+Otherwise list specific gaps, one per line. Be concise.
+$$;
+
+CREATE FUNCTION fix_prompt(spl_source TEXT, implementation TEXT, review TEXT, target TEXT)
+RETURN TEXT
+AS $$
+Fix the {target} implementation based on the review feedback.
+
+--- SPL SOURCE ---
+{spl_source}
+--- END ---
+
+--- CURRENT IMPLEMENTATION ---
+{implementation}
+--- END ---
+
+--- REVIEW FEEDBACK ---
+{review}
+--- END ---
+
+Output only the corrected, complete, runnable code. No explanation.
+$$;
+
+WORKFLOW llm_splc
+    INPUT:
+        @spl_file       TEXT,
+        @target         TEXT DEFAULT 'langgraph',
+        @model          TEXT DEFAULT 'claude-cli',
+        @output_file    TEXT DEFAULT "",
+        @log_dir        TEXT DEFAULT 'cookbook/65_llm_splc/logs'
+    OUTPUT: @implementation TEXT
+DO
+    LOGGING f'llm_splc start | file={@spl_file} target={@target} model={@model}' LEVEL INFO
+
+    -- Load .spl source
+    CALL load_file(@spl_file) INTO @spl_source
+    LOGGING f'SPL source loaded ({@spl_file})' LEVEL DEBUG
+
+    -- Step 1: Generate target framework implementation
+    LOGGING f'Generating {target} implementation ...' LEVEL INFO
+    GENERATE compile_prompt(@spl_source, @target)
+        USING MODEL @model
+        INTO @implementation
+    LOGGING 'Implementation generated' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/draft_{@target}.py', @implementation) INTO NONE
+
+    -- Step 2: Self-review against the original SPL spec
+    LOGGING 'Reviewing against SPL spec ...' LEVEL INFO
+    GENERATE review_prompt(@spl_source, @implementation, @target)
+        USING MODEL @model
+        INTO @review
+    LOGGING f'Review: {@review}' LEVEL DEBUG
+
+    -- Step 3: Fix if gaps found
+    EVALUATE @review
+        WHEN contains('[APPROVED]') THEN
+            LOGGING 'Implementation approved on first pass' LEVEL INFO
+        ELSE
+            LOGGING 'Gaps found — applying fixes ...' LEVEL WARN
+            GENERATE fix_prompt(@spl_source, @implementation, @review, @target)
+                USING MODEL @model
+                INTO @implementation
+            LOGGING 'Fixed implementation generated' LEVEL INFO
+            CALL write_file(f'{@log_dir}/fixed_{@target}.py', @implementation) INTO NONE
+    END
+
+    -- Step 4: Write output file if requested
+    EVALUATE @output_file
+        WHEN != "" THEN
+            CALL write_file(@output_file, @implementation) INTO NONE
+            LOGGING f'Output written to {@output_file}' LEVEL INFO
+        ELSE
+            LOGGING 'No output_file specified — result in RETURN only' LEVEL DEBUG
+    END
+
+    LOGGING f'llm_splc complete | target={@target}' LEVEL INFO
+    RETURN @implementation WITH
+        status   = 'complete',
+        target   = @target,
+        spl_file = @spl_file
+
+EXCEPTION
+    WHEN GenerationError THEN
+        LOGGING 'GenerationError — returning partial draft' LEVEL WARN
+        RETURN @implementation WITH status = 'partial', reason = 'generation_error'
+    WHEN FileNotFound THEN
+        LOGGING f'FileNotFound: {@spl_file}' LEVEL ERROR
+        RETURN "" WITH status = 'error', reason = 'spl_file_not_found'
+END

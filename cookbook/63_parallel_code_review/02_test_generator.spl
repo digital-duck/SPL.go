@@ -1,0 +1,37 @@
+-- 02_test_generator.spl
+-- Sub-workflow: generate unit test cases for the given code.
+-- Imported by parallel_code_review.spl
+
+CREATE FUNCTION test_generator_prompt(code TEXT, lang TEXT) RETURN TEXT
+AS $$
+You are a test engineer writing unit tests for {lang} code.
+
+Generate unit test cases for the following {lang} code:
+
+{code}
+
+Requirements:
+- Cover the happy path (expected inputs and outputs)
+- Cover at least two edge cases (empty input, boundary values, None/null, etc.)
+- Cover at least one error/exception path if applicable
+- Use the standard testing framework for {lang}
+  (pytest for Python, testing package for Go, jest for TypeScript/JavaScript)
+
+Output only the test code, no explanation. Include import statements.
+$$;
+
+WORKFLOW test_generator
+    INPUT:
+        @code    TEXT,
+        @lang    TEXT DEFAULT 'python',
+        @review_model   TEXT DEFAULT 'gemma4',
+        @log_dir TEXT DEFAULT ""
+    OUTPUT: @tests TEXT
+DO
+    LOGGING f'[test_generator] lang={@lang}' LEVEL DEBUG
+    GENERATE test_generator_prompt(@code, @lang)
+        WITH OUTPUT BUDGET 512 TOKENS
+        USING MODEL @review_model
+        INTO @tests
+    RETURN @tests
+END

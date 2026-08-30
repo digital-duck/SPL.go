@@ -2831,6 +2831,17 @@ func (p *Parser) check(t lexer.TokenType) bool {
 	return p.current().Type == t
 }
 
+// ParseExpression is the exported form of parseExpression, for use by the
+// executor when evaluating sub-expressions inside f-string template holes.
+func (p *Parser) ParseExpression() (ast.Expr, error) {
+	return p.parseExpression()
+}
+
+// AtEOF reports whether the parser has consumed all input tokens.
+func (p *Parser) AtEOF() bool {
+	return p.check(lexer.EOF)
+}
+
 func (p *Parser) checkAny(types ...lexer.TokenType) bool {
 	ct := p.current().Type
 	for _, t := range types {

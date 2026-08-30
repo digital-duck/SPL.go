@@ -1,0 +1,177 @@
+-- answer_on_demand.spl — personalised concept-book micro-lesson.
+--
+-- Updated to be consistent with concept-book/spl/build_concept_book.spl:
+--   @style → @lvl (learner-progression levels)
+--   @domain_yaml added (now domain-agnostic)
+--   @language, @primitive_budget added
+--   @learner_state changed from LIST to TEXT (JSON array string)
+--   SOLVE → CALL for all tool invocations
+--   COMMIT → RETURN
+--   verify_math → verify_section(@section, @domain_yaml)
+--   write_section signature extended: (concept, label, context, style_guide, language)
+--   primitive budget check now matches build_concept_book.spl
+--   resolve_target prompt generalised (no "linear algebra" hardcoding)
+--
+-- Workflow:
+--   1. Resolve NL question to a target concept node (LLM).
+--   2. Assert target exists in the domain graph (deterministic).
+--   3. Compute the personalised learning gap via setup_answer_path.
+--   4. Generate and verify one section per gap concept in dependency order.
+--   5. Generate the target concept as the capstone.
+--
+-- Tools required in tools.py (in addition to build_concept_book.spl tools):
+--   concept_names_list(@domain_yaml) → newline-separated list of all concept IDs
+--   in_graph(@domain_yaml, @target)  → "yes" or "" (falsy when not found)
+--   setup_answer_path(@domain_yaml, @target, @learner_state) → gap length as int string
+--   answer_path_item(@domain_yaml, @index) → concept ID at that index
+
+-- ── Prompt templates ────────────────────────────────────────────────────────
+
+CREATE FUNCTION resolve_target(question TEXT, concept_list TEXT)
+RETURN TEXT
+AS $$
+You are a domain curriculum expert.
+
+A student asked: {question}
+
+Available concept nodes in the knowledge graph:
+{concept_list}
+
+Return the single concept name from the list above that best answers the
+student's question. Output only the concept name as a bare identifier (e.g.
+"eigenpair", "spectral_theorem"). No explanation. No punctuation.
+$$;
+
+CREATE FUNCTION write_section(concept TEXT, label TEXT, context TEXT, style_guide TEXT, language TEXT)
+RETURN TEXT
+AS $$
+You are an expert author writing a concept-book section.
+
+{style_guide}
+
+Write a self-contained section for the concept: {concept}
+Surrounding context: {context}
+
+Begin the section with a level-2 Markdown heading: ## {label}
+
+Follow the structure and length specified in the STYLE GUIDE above exactly.
+Use LaTeX for all mathematics and notation.
+Write the narrative in language: {language}  (ISO 639-1 code, e.g. "en", "zh", "fr", "es").
+Mathematical notation and LaTeX remain in their standard form regardless of language.
+Output only the section text. No preamble, no metadata.
+$$;
+
+CREATE FUNCTION refine_section(section TEXT, feedback TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert author. Revise the section below based on the feedback
+provided. Keep all correct content; fix only what is flagged. Maintain the
+style described below throughout the revision.
+
+{style_guide}
+
+SECTION:
+{section}
+
+FEEDBACK:
+{feedback}
+
+Output the revised section only. No preamble. No commentary.
+$$;
+
+-- ── Main workflow ────────────────────────────────────────────────────────────
+
+WORKFLOW answer_on_demand
+    INPUT:
+        @question         TEXT  DEFAULT 'Why does diagonalization work?',
+        @domain_yaml      TEXT  DEFAULT 'linalg_graph.yaml',
+        @lvl              TEXT  DEFAULT 'college',
+        @language         TEXT  DEFAULT 'en',
+        @primitive_budget INT   DEFAULT 2,
+        @learner_state    TEXT  DEFAULT '[]'
+    OUTPUT:
+        @lesson TEXT
+DO
+    -- 0. Timing setup
+    CALL now_float() INTO @t_workflow_start
+
+    -- 1. Load domain (validates acyclicity + reducibility) and resolve level guide.
+    --    concept_names_list auto-loads the domain if not already cached, so no
+    --    separate setup_domain call is needed here.
+    CALL get_level_guide(@lvl) INTO @style_guide
+    CALL concept_names_list(@domain_yaml) INTO @concept_list
+
+    LOGGING f"Level: {@lvl}  Language: {@language}" LEVEL INFO
+
+    -- 2. Resolve NL question to a concept node (LLM)
+    GENERATE resolve_target(@question, @concept_list) INTO @target
+
+    -- 3. Assert the resolved target exists in the domain graph
+    ASSERT in_graph(@domain_yaml, @target)
+        OTHERWISE GENERATE resolve_target(@question, @concept_list) INTO @target
+
+    LOGGING f"Target concept: {@target}" LEVEL INFO
+
+    -- 4. Compute the personalised learning gap (prerequisite concepts the learner
+    --    still needs before reaching @target, in dependency order)
+    CALL setup_answer_path(@domain_yaml, @target, @learner_state) INTO @order_len
+
+    LOGGING f"Learning path: {@order_len} new concepts" LEVEL INFO
+
+    -- 5. Generate and verify each gap concept in dependency order
+    @lesson := ""
+    @_i := 0
+
+    WHILE @_i < @order_len DO
+        CALL answer_path_item(@domain_yaml, @_i) INTO @concept
+        CALL now_float() INTO @t_section_start
+        CALL concept_label(@concept) INTO @_label
+
+        LOGGING f"Generating: {@concept}" LEVEL INFO
+
+        GENERATE write_section(@concept, @_label, @concept, @style_guide, @language) INTO @section
+
+        -- Primitive budget check
+        CALL count_new_primitives(@section, @domain_yaml) INTO @_prim_count
+        CALL needs_primitive_refinement(@_prim_count, @primitive_budget) INTO @_refine
+        EVALUATE @_refine
+            WHEN = "yes" THEN
+                GENERATE refine_section(@section, f"introduce at most {@primitive_budget} new primitives per section", @style_guide) INTO @section
+            ELSE
+                LOGGING "Primitive budget OK" LEVEL INFO
+        END
+
+        -- Domain-specific content verification
+        CALL verify_section(@section, @domain_yaml) INTO @check
+        EVALUATE @check
+            WHEN contains("fail") THEN
+                GENERATE refine_section(@section, @check, @style_guide) INTO @section
+            ELSE
+                LOGGING f"Section {@concept} verified" LEVEL INFO
+        END
+
+        CALL time_elapsed(@t_section_start) INTO @section_elapsed
+        LOGGING f"[timing] {@concept}: {@section_elapsed}s" LEVEL INFO
+
+        @lesson := @lesson + "\n\n---\n\n" + @section
+        @_i := @_i + 1
+    END
+
+    -- 6. Target concept capstone (the concept the learner asked about)
+    CALL now_float() INTO @t_capstone_start
+    CALL concept_label(@target) INTO @_target_label
+
+    GENERATE write_section(@target, @_target_label, @target, @style_guide, @language) INTO @capstone
+
+    CALL time_elapsed(@t_capstone_start) INTO @capstone_elapsed
+    LOGGING f"[timing] capstone ({@target}): {@capstone_elapsed}s" LEVEL INFO
+
+    @lesson := @lesson + "\n\n---\n\n" + @capstone
+
+    CALL time_elapsed(@t_workflow_start) INTO @total_elapsed
+    LOGGING f"[timing] workflow total: {@total_elapsed}s for {@order_len} concepts + capstone" LEVEL INFO
+
+    LOGGING f"Lesson complete — level: {@lvl}  target: {@target}" LEVEL INFO
+
+    RETURN @lesson
+END

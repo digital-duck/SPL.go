@@ -1,0 +1,113 @@
+-- Recipe Name: Multi-Model Pipeline
+-- Showcases GENERATE ... USING MODEL per-step model selection
+-- and semantic WHILE loop with variable context.
+--
+-- Each step can target a different model — the right model for each task.
+-- Usage:
+--   spl3 run cookbook/21_multi_model_pipeline/multi_model.spl --adapter ollama topic="climate change"
+
+CREATE FUNCTION research(topic TEXT) 
+RETURN TEXT 
+AS $$
+
+You are a research specialist.
+Provide key facts, statistics, and recent developments about: {topic}
+Focus on factual accuracy. Be thorough but concise.
+$$;
+
+CREATE FUNCTION analyze(facts TEXT) 
+RETURN TEXT 
+AS $$
+
+You are a data analyst.
+Analyze the following research and identify the 3 most significant insights:
+
+{facts}
+
+For each insight, explain why it matters and rate its significance (1-10).
+$$;
+
+CREATE FUNCTION write_summary(analysis TEXT) 
+RETURN TEXT 
+AS $$
+
+You are a professional writer.
+Write a clear, engaging 2-paragraph summary based on this analysis:
+
+{analysis}
+
+The first paragraph should present the key findings.
+The second paragraph should discuss implications and outlook.
+$$;
+
+CREATE FUNCTION quality_check(text TEXT) 
+RETURN TEXT 
+AS $$
+
+You are a quality reviewer.
+Rate the following text on a scale of 0.0 to 1.0 for:
+- Clarity
+- Accuracy
+- Completeness
+
+Return ONLY a single number (the average score).
+
+Text: {text}
+$$;
+
+WORKFLOW multi_model_pipeline
+  INPUT:
+    @topic TEXT,
+    @max_iterations INT DEFAULT 3,
+    @log_dir TEXT DEFAULT 'cookbook/21_multi_model_pipeline/logs-spl'
+  OUTPUT: @final TEXT
+DO
+  LOGGING f'Multi-model pipeline | topic={@topic}' LEVEL INFO
+
+  -- Step 1: Research with a fast model (good for factual retrieval)
+  GENERATE research(@topic) USING MODEL 'gemma3' INTO @facts
+  LOGGING 'Research complete' LEVEL DEBUG
+  CALL write_file(f'{@log_dir}/research.md', @facts) INTO NONE
+
+  -- Step 2: Analysis with a reasoning model
+  GENERATE analyze(@facts) USING MODEL 'gemma3' INTO @analysis
+  LOGGING 'Analysis complete' LEVEL DEBUG
+  CALL write_file(f'{@log_dir}/analysis.md', @analysis) INTO NONE
+
+  -- Step 3: Writing with a creative model
+  GENERATE write_summary(@analysis) USING MODEL 'gemma3' INTO @draft
+  LOGGING 'Initial draft ready' LEVEL INFO
+  CALL write_file(f'{@log_dir}/draft_0.md', @draft) INTO NONE
+
+  -- Step 4: Quality loop — refine until score > 0.7 (max 3 iterations)
+  @iteration := 0
+  @quality := 0
+
+  WHILE @iteration < @max_iterations DO
+    LOGGING f'Quality check | iteration={@iteration}' LEVEL DEBUG
+    GENERATE quality_check(@draft) INTO @quality
+    LOGGING f'Quality score: {@quality}' LEVEL DEBUG
+
+    EVALUATE @quality
+      WHEN > 0.7 THEN
+        LOGGING f'Quality threshold met | score={@quality}' LEVEL INFO
+        CALL write_file(f'{@log_dir}/final.md', @draft) INTO NONE
+        RETURN @draft WITH status = 'high_quality', score = @quality
+      ELSE
+        GENERATE write_summary(@analysis) INTO @draft
+        @iteration := @iteration + 1
+        CALL write_file(f'{@log_dir}/draft_{@iteration}.md', @draft) INTO NONE
+    END
+  END
+
+  -- Fallback: commit whatever we have
+  LOGGING f'Max iterations reached | final score={@quality}' LEVEL WARN
+  CALL write_file(f'{@log_dir}/final.md', @draft) INTO NONE
+  RETURN @draft WITH status = 'max_iterations', score = @quality
+
+EXCEPTION
+  WHEN MaxIterationsReached THEN
+    RETURN @draft WITH status = 'partial'
+  WHEN ModelOverloaded THEN
+    RETURN @draft WITH status = 'model_overloaded'
+END

@@ -1,0 +1,78 @@
+-- Recipe Name: Data Extraction with MAP Configuration
+-- Demonstrates the MAP type for runtime configuration lookup and result annotation.
+--
+-- Key idea: instead of IF/ELSE chains per format, a single MAP routes each
+-- format to its extraction fields.  map_has() validates input, @map[key]
+-- reads the config, and map_merge() annotates the output with run metadata.
+--
+-- Usage:
+--   spl3 run cookbook/27_data_extraction/data_extraction_map.spl --adapter ollama --model gemma3
+--
+--   spl3 run cookbook/27_data_extraction/data_extraction_map.spl --adapter ollama \
+--       format="invoice" \
+--       text="Invoice #INV-042 from Acme Corp, USD 3,750.00 due 2024-04-15, PO: PO-9901."
+--
+--   spl3 run cookbook/27_data_extraction/data_extraction_map.spl --adapter claude_cli \
+--       format="contract" \
+--       text="$(cat contract.txt)" \
+--       model="claude-sonnet-4-6" \
+--       log_dir="cookbook/27_data_extraction/logs-map"
+
+CREATE FUNCTION extract_fields(text TEXT, fields TEXT) RETURN TEXT
+AS $$
+You are a data extraction specialist.
+
+Extract the following fields from the text below:
+{fields}
+
+Return a JSON object with those field names as keys.
+Omit any field not present in the text — do not guess or infer.
+Return only the JSON object, no prose, no markdown fences.
+
+Text:
+{text}
+$$;
+
+WORKFLOW data_extraction_map
+  INPUT:
+    @text    TEXT    DEFAULT 'Invoice #INV-2024-0042 from Acme Corp for USD 3,750.00, due 2024-04-15. PO reference: PO-9901.',
+    @format  TEXT    DEFAULT 'invoice',
+    @model   TEXT    DEFAULT 'gemma3',
+    @log_dir TEXT    DEFAULT 'cookbook/27_data_extraction/logs-map'
+  OUTPUT: @result TEXT
+DO
+  -- Configuration MAP: format → comma-separated fields to extract.
+  -- Adding a new format is one line here, not a new IF/ELSE branch.
+  @field_map := {
+    'general':  'names, organizations, dates, amounts, references, locations',
+    'invoice':  'invoice_number, vendor, amount, currency, issue_date, due_date, po_reference',
+    'contract': 'parties, effective_date, expiry_date, value, currency, jurisdiction, key_obligations'
+  }
+
+  -- Validate: fall back to 'general' for unknown formats
+  @valid := map_has(@field_map, @format)
+  EVALUATE @valid
+    WHEN contains('false') THEN
+      LOGGING f'Unknown format "{@format}" — falling back to general' LEVEL WARN
+      @format := 'general'
+  END
+
+  -- Config lookup: one subscript read replaces a 3-way IF/ELSE
+  @fields := @field_map[@format]
+
+  LOGGING f'Extracting format={@format} | fields={@fields} | model={@model}' LEVEL INFO
+
+  -- Run extraction
+  GENERATE extract_fields(@text, @fields) USING MODEL @model INTO @extracted
+
+  -- Build result MAP: merge run metadata with extracted data
+  @meta   := {'format': @format, 'model': @model, 'fields': @fields}
+  @output := map_merge(@meta, {'data': @extracted})
+
+  -- Persist extracted data
+  CALL write_file(f'{@log_dir}/result_{@format}.md', @extracted) INTO NONE
+
+  LOGGING f'Done — result written to {@log_dir}/result_{@format}.md' LEVEL INFO
+
+  RETURN @output WITH status = 'complete', format = @format
+END

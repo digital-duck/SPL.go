@@ -1,0 +1,209 @@
+-- Recipe Name: Headline News Aggregator
+-- Generate, expand, and evaluate a daily news digest for a given topic area.
+-- Uses claude_cli adapter with Opus model for broad knowledge synthesis.
+--
+-- Pattern:
+--   generate_headlines(topic) → N headlines
+--     → expand each headline into a brief summary
+--     → evaluate coverage and balance
+--     → refine if coverage gaps detected
+--     → commit structured daily digest
+--
+-- Usage:
+--   spl3 run cookbook/37_headline_news/headline_news.spl --adapter claude_cli --model claude-opus-4-6 \
+--       topic="artificial intelligence"
+--
+--   spl3 run cookbook/37_headline_news/headline_news.spl --adapter claude_cli --model claude-opus-4-6 \
+--       topic="renewable energy" style="executive brief" max_headlines=5
+--
+--   spl3 run cookbook/37_headline_news/headline_news.spl --adapter claude_cli --model claude-opus-4-6 \
+--       topic="quantum computing" style="bullet points" perspective="global"
+
+CREATE FUNCTION news_format_guide(style TEXT DEFAULT 'structured')
+RETURN TEXT
+AS $$
+SELECT CASE style
+  WHEN 'executive brief'  THEN 'Concise executive summary. Lead with the most significant development. 2-3 sentences per item. Close with a one-line strategic implication.'
+  WHEN 'bullet points'    THEN 'Bulleted list. One headline per bullet. Sub-bullets for key facts. No more than 3 sub-bullets per headline.'
+  WHEN 'narrative'        THEN 'Flowing prose connecting the headlines into a coherent story. Identify themes and through-lines. 3-4 paragraphs.'
+  ELSE                         'Structured digest. Each headline followed by a 2-3 sentence summary. Group related items. End with a brief synthesis.'
+END
+$$;
+
+CREATE FUNCTION perspective_guide(perspective TEXT DEFAULT 'balanced')
+RETURN TEXT
+AS $$
+SELECT CASE perspective
+  WHEN 'technical'   THEN 'Focus on technical developments, research breakthroughs, and engineering milestones. Prioritize substance over narrative.'
+  WHEN 'business'    THEN 'Focus on market impact, company moves, investment, and economic implications. Prioritize commercial significance.'
+  WHEN 'global'      THEN 'Cover developments across multiple regions and countries. Note geographic variation in trends. Avoid US-centric framing.'
+  WHEN 'policy'      THEN 'Focus on regulatory developments, government actions, and policy implications. Note geopolitical dimensions.'
+  ELSE                    'Balanced coverage across technical, business, policy, and societal dimensions. Represent multiple viewpoints.'
+END
+$$;
+
+CREATE FUNCTION generate_headlines(topic TEXT, max_headlines TEXT, date TEXT, perspective TEXT) 
+RETURN TEXT
+AS $$
+You are a news editor with broad knowledge. Generate the top {max_headlines} headlines about "{topic}" as of {date}.
+
+Coverage perspective: {perspective}
+
+Output a numbered list of headlines only — no summaries yet, just plain text headlines.
+1. First headline here
+2. Second headline here
+$$;
+
+CREATE FUNCTION expand_headlines(headlines TEXT, topic TEXT, perspective TEXT) 
+RETURN TEXT
+AS $$
+You are a news analyst. Expand each headline in this list with a 2-3 sentence factual summary.
+
+Topic area: {topic}
+Perspective lens: {perspective}
+
+Headlines to expand:
+{headlines}
+
+For each headline, write:
+[N]. [Original headline]
+Summary: [2-3 sentences of key facts, context, and significance]
+$$;
+
+CREATE FUNCTION evaluate_coverage(expanded TEXT, topic TEXT, perspective TEXT) 
+RETURN TEXT
+AS $$
+You are a news editor evaluating coverage quality. Assess how well these summaries cover the major angles for "{topic}".
+
+Perspective: {perspective}
+
+Summaries:
+{expanded}
+
+Reply with ONLY a decimal score between 0.0 and 1.0 representing coverage completeness.
+- 1.0 = all major angles covered
+- 0.75 = most angles covered, minor gaps
+- 0.5 = significant gaps
+- 0.25 = very incomplete
+
+Score only, no explanation.
+$$;
+
+CREATE FUNCTION fill_coverage_gaps(expanded TEXT, topic TEXT, coverage_score TEXT, perspective TEXT) 
+RETURN TEXT
+AS $$
+You are a news editor filling coverage gaps. The current digest scored {coverage_score} on coverage.
+
+Topic: {topic}
+Perspective: {perspective}
+
+Current summaries:
+{expanded}
+
+Add 2-3 additional headlines with summaries covering angles that are missing or underrepresented.
+Return the FULL list (original + additions) in the same style.
+$$;
+
+CREATE FUNCTION format_digest(expanded TEXT, topic TEXT, date TEXT, format_guide TEXT) RETURN TEXT
+AS $$
+You are a news editor formatting a daily digest.
+
+Topic: {topic}
+Date: {date}
+Format instructions: {format_guide}
+
+Content to style:
+{expanded}
+
+Format the content according to the style instructions. Include a header with topic and date.
+$$;
+
+WORKFLOW headline_news
+    INPUT:
+        @topic         TEXT,
+        @date          TEXT    DEFAULT 'today',
+        @max_headlines INTEGER DEFAULT 7,
+        @style        TEXT    DEFAULT 'structured',
+        @perspective   TEXT    DEFAULT 'balanced',
+        @log_dir       TEXT    DEFAULT 'cookbook/37_headline_news/logs'
+    OUTPUT: @digest TEXT
+DO
+    LOGGING f'Headline news | topic={@topic} max={@max_headlines} perspective={@perspective}' LEVEL INFO
+
+    -- Step 1: Generate top headlines for the topic
+    GENERATE generate_headlines(
+        @topic,
+        @max_headlines,
+        @date,
+        perspective_guide(@perspective)
+    ) INTO @headlines
+    LOGGING f'Headlines generated: {@max_headlines} items on topic:\n {@topic}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/01_headlines.md', @headlines) INTO NONE
+
+    -- Step 2: Expand each headline into a brief summary with key facts
+    GENERATE expand_headlines(
+        @headlines,
+        @topic,
+        perspective_guide(@perspective)
+    ) INTO @expanded
+    LOGGING 'Headlines expanded' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/02_expanded.md', @expanded) INTO NONE
+
+    -- Step 3: Evaluate coverage — are major angles represented?
+    GENERATE evaluate_coverage(
+        @expanded,
+        @topic,
+        perspective_guide(@perspective)
+    ) INTO @coverage_score
+    LOGGING f'Coverage score: {@coverage_score}' LEVEL INFO
+    CALL write_file(f'{@log_dir}/03_coverage_score.txt', @coverage_score) INTO NONE
+
+    -- Step 4: Refine if coverage gaps detected
+    EVALUATE @coverage_score
+        WHEN > 0.75 THEN
+            -- Coverage is solid — style and commit
+            GENERATE format_digest(
+                @expanded,
+                @topic,
+                @date,
+                news_format_guide(@style)
+            ) INTO @digest
+            CALL write_file(f'{@log_dir}/final_digest.md', @digest) INTO NONE
+            RETURN @digest WITH status = 'complete', coverage = @coverage_score
+
+        ELSE
+            -- Coverage gaps — add missing angles and reformat
+            LOGGING f'Coverage gaps detected ({@coverage_score}) — filling ...' LEVEL WARN
+            GENERATE fill_coverage_gaps(
+                @expanded,
+                @topic,
+                @coverage_score,
+                perspective_guide(@perspective)
+            ) INTO @expanded
+            CALL write_file(f'{@log_dir}/04_expanded_refined.md', @expanded) INTO NONE
+
+            GENERATE format_digest(
+                @expanded,
+                @topic,
+                @date,
+                news_format_guide(@style)
+            ) INTO @digest
+            CALL write_file(f'{@log_dir}/final_digest.md', @digest) INTO NONE
+            RETURN @digest WITH status = 'refined', coverage = @coverage_score
+    END
+
+EXCEPTION
+    WHEN ContextLengthExceeded THEN
+        -- Too many headlines — trim and commit best effort
+        GENERATE format_digest(
+            @headlines,
+            @topic,
+            @date,
+            news_format_guide(@style)
+        ) INTO @digest
+        CALL write_file(f'{@log_dir}/final_digest_partial.md', @digest) INTO NONE
+        RETURN @digest WITH status = 'partial'
+
+    WHEN BudgetExceeded THEN
+        RETURN @expanded WITH status = 'budget_limit'
+END

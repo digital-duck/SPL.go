@@ -1,0 +1,71 @@
+WORKFLOW self_refine_product_description
+  INPUT @product_info TEXT
+  OUTPUT @final_description TEXT
+DO
+  @current_description := "";
+  @feedback := "";
+  @quality := 0.0;
+  @iteration := 0;
+  @max_iterations := 5;
+
+  GENERATE rewrite(@product_info, 'compelling product description') INTO @current_description;
+
+  WHILE @quality < 0.85 AND @iteration < @max_iterations DO
+    DO
+      GENERATE critique(@current_description) INTO @feedback;
+
+      EVALUATE @feedback
+        WHEN contains('the description is high quality and no significant improvements are needed') THEN
+          @final_description := @current_description;
+          RETURN @final_description;
+        ELSE
+          GENERATE rewrite(@current_description, @feedback, 'improved product description') INTO @current_description;
+      END;
+
+      GENERATE score_quality(@current_description) INTO @quality;
+
+      @iteration := @iteration + 1;
+    EXCEPTION
+      WHEN HallucinationDetected THEN
+        GENERATE rewrite(@product_info, 'factual product description') INTO @current_description;
+        RETRY;
+      WHEN ModelOverloaded THEN
+        RETRY;
+      WHEN MaxIterationsReached THEN
+        RETURN @current_description;
+    END;
+  END;
+
+  @final_description := @current_description;
+  RETURN @final_description;
+END;
+
+CREATE FUNCTION rewrite(description TEXT, feedback TEXT, style TEXT) RETURNS TEXT AS $$
+  You are an expert copywriter. Rewrite the following product description based on the
+  feedback provided, in the style of: {style}.
+
+  Original description: {description}
+
+  Feedback: {feedback}
+
+  Write the improved product description now.
+$$;
+
+CREATE FUNCTION critique(description TEXT) RETURNS TEXT AS $$
+  Evaluate the following product description for clarity, persuasiveness, accuracy,
+  and emotional appeal. Identify specific weaknesses and provide actionable suggestions
+  for improvement. Be concise and direct in your feedback.
+
+  Description: {description}
+$$;
+
+CREATE FUNCTION score_quality(description TEXT) RETURNS NUMBER AS $$
+  Score the following product description on a scale from 0.0 to 1.0 based on:
+  - Clarity and readability (0.0-0.25)
+  - Persuasiveness and appeal (0.0-0.25)
+  - Completeness and accuracy (0.0-0.25)
+  - Tone and style appropriateness (0.0-0.25)
+  Return only a single numeric score.
+
+  Description: {description}
+$$;

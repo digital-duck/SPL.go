@@ -1,0 +1,143 @@
+-- Recipe Name: Meeting Notes → Action Items
+-- Transcript in, structured TODO list + owners out.
+-- Demonstrates multi-step extraction + structured output from long-form text,
+-- with deterministic tool calls for file loading, speaker extraction,
+-- date normalisation, and ownership validation.
+--
+-- Usage (load from file):
+--   spl3 run cookbook/29_meeting_actions/meeting_actions.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/29_meeting_actions/tools.py \
+--       filename=sprint_planning.txt \
+--       output_format=markdown
+--
+-- Usage (inline transcript):
+--   spl3 run cookbook/29_meeting_actions/meeting_actions.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/29_meeting_actions/tools.py \
+--       transcript="Alice: fix the login bug by Friday. Bob: I will handle it." \
+--       output_format=json
+--
+-- Sample transcripts in transcripts/:
+--   sprint_planning.txt   Full sprint planning with assignments and decisions
+--   design_review.txt     API architecture review with open questions
+--   standup.txt           Short daily standup with blockers
+
+-- ── Schema (zero LLM cost — injected as grounding context) ─────────────────
+
+IMPORT 'tools'
+
+CREATE FUNCTION action_item_schema()
+RETURN JSON
+AS $$
+{
+  "type": "object",
+  "properties": {
+    "meeting_title":   {"type": "string"},
+    "meeting_date":    {"type": "string"},
+    "attendees":       {"type": "array", "items": {"type": "string"}},
+    "meeting_summary": {"type": "string"},
+    "decisions": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "action_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "task":     {"type": "string"},
+          "owner":    {"type": "string", "description": "Person responsible. Use exact speaker name or empty string if unassigned."},
+          "due_date": {"type": "string", "description": "Due date or relative phrase e.g. Friday, next Wednesday, end of sprint"},
+          "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+          "context":  {"type": "string", "description": "Why this task matters or what triggered it"}
+        },
+        "required": ["task", "priority"]
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "next_meeting": {"type": "string"}
+  },
+  "required": ["meeting_summary", "action_items"]
+}
+$$;
+
+-- ── Main workflow ───────────────────────────────────────────────────────────
+
+WORKFLOW meeting_to_actions
+    INPUT:  
+        @filename      TEXT DEFAULT "",
+        @transcript    TEXT DEFAULT "",
+        @output_format TEXT DEFAULT 'json',
+        @log_dir TEXT DEFAULT 'cookbook/04_model_showdown/logs-spl'
+    OUTPUT: @output TEXT
+DO
+    LOGGING f'Meeting to actions | format={@output_format} filename={@filename}' LEVEL INFO
+
+    -- Step 1: Load transcript from file if filename provided (deterministic — no LLM)
+    CALL load_transcript(@filename) INTO @file_content
+
+    -- Step 2: Extract speaker names for grounding the LLM (deterministic — no LLM)
+    CALL extract_speakers(@file_content) INTO @speakers_from_file
+    CALL extract_speakers(@transcript)   INTO @speakers_from_inline
+    LOGGING f'Speakers from file: {@speakers_from_file}' LEVEL DEBUG
+
+    -- Step 3: Normalise transcript — merge sources, clean formatting, identify speakers
+    GENERATE normalize_transcript(
+        @file_content,
+        @transcript,
+        @speakers_from_file,
+        @speakers_from_inline
+    ) INTO @clean_transcript
+    LOGGING 'Transcript normalised' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/clean_transcript.md', @clean_transcript) INTO NONE
+
+    -- Step 4: Extract structured action items grounded by schema and known speakers
+    GENERATE extract_actions(
+        @clean_transcript,
+        action_item_schema(),
+        @speakers_from_file,
+        @speakers_from_inline
+    ) INTO @structured_json
+    LOGGING 'Action items extracted' LEVEL INFO
+    CALL write_file(f'{@log_dir}/structured_json.md', @structured_json) INTO NONE
+
+    -- Step 5: Normalise relative due dates to ISO-8601 (deterministic — no LLM)
+    CALL normalize_dates(@structured_json) INTO @structured_json
+
+    -- Step 6: Validate ownership — flag unowned high-priority items (deterministic — no LLM)
+    CALL validate_ownership(@structured_json) INTO @validation_notes
+
+    -- Step 7: Format and commit output
+    EVALUATE @output_format
+        WHEN = 'markdown' THEN
+            GENERATE format_as_markdown(@structured_json, @validation_notes) 
+              INTO @output
+            CALL write_file(f'{@log_dir}/output.md', @output) INTO NONE
+
+            RETURN @output WITH status = 'complete', format = 'markdown'
+        WHEN = 'email' THEN
+            GENERATE format_as_email(@structured_json, @validation_notes) 
+              INTO @output
+            CALL write_file(f'{@log_dir}/output-email.md', @output) INTO NONE
+            RETURN @output WITH status = 'complete', format = 'email'
+        ELSE
+            SET @output = @structured_json
+            RETURN @output WITH status = 'complete', format = 'json'
+    END
+
+EXCEPTION
+    WHEN ContextLengthExceeded THEN
+        -- Long transcript: summarise first, then extract from the summary
+        GENERATE summarize_transcript(@clean_transcript) 
+          INTO @summary
+        GENERATE extract_actions(@summary, action_item_schema(), @speakers_from_file, @speakers_from_inline) 
+          INTO @structured_json
+        CALL normalize_dates(@structured_json) INTO @structured_json
+        CALL validate_ownership(@structured_json) INTO @validation_notes
+        SET @output = @structured_json
+        RETURN @output WITH status = 'complete_chunked'
+END

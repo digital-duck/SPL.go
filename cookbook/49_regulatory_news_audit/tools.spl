@@ -1,0 +1,32 @@
+-- tools.spl — TOOL_API definitions for Recipe 49: Regulatory News Monitor
+-- Imported by audit_news.spl via IMPORT 'tools'
+--
+-- Stdlib tools used by this recipe (no TOOL_API needed):
+--   length, spl_list_get_item, write_file, alert, json_get
+--
+-- Only read_news_feed is non-stdlib and defined here.
+
+CREATE TOOL_API read_news_feed(path TEXT)
+RETURNS TEXT AS PYTHON $$
+def read_news_feed(path: str) -> str:
+    import json
+    import os
+    import re
+
+    if not path or not os.path.exists(path):
+        return "[]"
+
+    with open(path, encoding="utf-8") as fh:
+        raw_lines = fh.readlines()
+
+    items = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Strip optional "BATCH N: " prefix
+        cleaned = re.sub(r"^BATCH\s+\d+\s*:\s*", "", line, flags=re.IGNORECASE)
+        items.append(cleaned)
+
+    return json.dumps(items)
+$$;

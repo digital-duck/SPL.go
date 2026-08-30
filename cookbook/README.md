@@ -11,12 +11,12 @@ You do not need to copy or modify any recipe — just point `spl-go` at the reci
 
 ## The key difference: no virtual environment
 
-| | Python `spl3` | Go `spl-go` |
+| | Python `spl-go` | Go `spl-go` |
 |---|---|---|
 | Install | `conda create -n spl3` + `pip install spl-llm` | `go build` → one binary |
 | Activate | `conda activate spl3` every session | none |
-| Run | `spl3 run recipe.spl` | `spl-go run recipe.spl` |
-| Uninstall | `conda remove -n spl3 --all` | `rm ~/.local/bin/spl-go` |
+| Run | `spl-go run recipe.spl` | `spl-go run recipe.spl` |
+| Uninstall | `conda remove -n spl-go --all` | `rm ~/.local/bin/spl-go` |
 
 ---
 
@@ -158,7 +158,7 @@ spl-go run recipe.spl --adapter momagrid
 ## Why no venv?
 
 The Go runtime compiles to a single static binary with no runtime dependencies.
-The Python `spl3` runtime remains the primary development environment where new
+The Python `spl-go` runtime remains the primary development environment where new
 features are prototyped first. Once stable, they are ported to `spl-go`.
 
 See [docs/ROADMAP.md](../docs/ROADMAP.md) for current feature parity across

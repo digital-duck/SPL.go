@@ -1,0 +1,57 @@
+-- Recipe 80a: OpenCV 5 Scene Triage
+-- Category: vision / hybrid deterministic-tool + LLM reasoning
+--
+-- Pattern: OpenCV does the seeing (deterministic, zero LLM cost), the LLM
+-- does the reasoning — over the structured JSON report, never over raw
+-- pixels. Same "keep each engine in its lane" principle as 36_tool_use
+-- ("LLMs are great at language, terrible at arithmetic"), applied to vision:
+-- LLMs are great at language, unreliable at pixel-level measurement.
+--
+-- Usage:
+--   spl3 run cookbook/80_opencv_5/opencv5_scene_triage.spl \
+--       --adapter ollama --model gemma4 \
+--       --tools cookbook/80_opencv_5/tools.py \
+--       background="cookbook/80_opencv_5/sample/background.jpg" \
+--       current="cookbook/80_opencv_5/sample/current.jpg"
+
+IMPORT 'tools'
+
+CREATE FUNCTION scene_assessment_prompt(change_report TEXT)
+RETURN TEXT
+AS $$
+You are reviewing an automated scene-change report from a fixed camera. The
+report was produced by deterministic pixel differencing (OpenCV), not a
+language model — treat the numbers as ground truth.
+
+Change report (JSON): {change_report}
+
+Write a 2-3 sentence plain-language assessment for a human monitor: what
+most likely happened, and whether it looks routine or worth a closer look.
+Do not invent details the report does not support.
+$$;
+
+WORKFLOW opencv5_scene_triage
+    INPUT:  @background TEXT DEFAULT 'cookbook/80_opencv_5/sample/background.jpg',
+            @current    TEXT DEFAULT 'cookbook/80_opencv_5/sample/current.jpg',
+            @log_dir    TEXT DEFAULT 'cookbook/80_opencv_5/logs-spl'
+    OUTPUT: @assessment TEXT
+DO
+    LOGGING f'[opencv5_scene_triage] background={@background} current={@current}' LEVEL INFO
+
+    -- Step 1: deterministic OpenCV 5 change detection (zero LLM cost).
+    -- Uses CV_16F (fp16) Mats — new first-class depth in OpenCV 5.
+    CALL detect_change(@background, @current) INTO @change_report
+    LOGGING f'[opencv5_scene_triage] change_report={@change_report}' LEVEL DEBUG
+
+    -- Step 2: one LLM call reasons over the structured report, not the pixels.
+    GENERATE scene_assessment_prompt(@change_report) INTO @assessment
+
+    CALL write_file(f'{@log_dir}/triage.md', f'{@change_report}\n\n{@assessment}') INTO NONE
+    LOGGING f'[opencv5_scene_triage] done' LEVEL INFO
+    RETURN @assessment WITH status = 'complete', change_report = @change_report
+
+EXCEPTION
+    WHEN GenerationError THEN
+        LOGGING '[opencv5_scene_triage] LLM unavailable — returning raw CV report' LEVEL ERROR
+        RETURN @change_report WITH status = 'report_only'
+END

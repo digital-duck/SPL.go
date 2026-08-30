@@ -1,0 +1,170 @@
+-- Recipe Name: Interview Simulator
+-- Two-persona structured Q&A with evaluation.
+-- Interviewer persona asks questions, candidate persona answers, evaluator scores.
+-- Uses deterministic tools for role/candidate loading, question extraction,
+-- score aggregation, and transcript formatting.
+--
+-- Usage (from catalog):
+--   spl3 run cookbook/33_interview_sim/interview_sim.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/33_interview_sim/tools.py \
+--       role_key=senior_swe focus=system_design candidate_id=alice_senior_swe difficulty=hard
+--
+--   spl3 run cookbook/33_interview_sim/interview_sim.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/33_interview_sim/tools.py \
+--       role_key=data_scientist focus=statistics candidate_id=carol_data_scientist
+--
+--   spl3 run cookbook/33_interview_sim/interview_sim.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/33_interview_sim/tools.py \
+--       role_key=devops_engineer focus=kubernetes candidate_id=dave_devops difficulty=hard
+--
+-- Usage (freeform, no catalog):
+--   spl3 run cookbook/33_interview_sim/interview_sim.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/33_interview_sim/tools.py \
+--       role="ML Engineer" focus="deep learning" difficulty=medium experience="3 years"
+--
+-- Discover what is available:
+--   spl3 run ... role_key=list     (lists all roles)
+--   spl3 run ... candidate_id=list (lists all candidates)
+
+-- ── Persona functions (zero LLM cost — injected as system context) ──────────
+
+IMPORT 'tools'
+
+CREATE FUNCTION interviewer_persona(role TEXT, focus TEXT, difficulty TEXT DEFAULT 'medium')
+RETURN TEXT
+AS $$
+You are an experienced technical interviewer at a top tech company.
+Role being interviewed for: {role}
+Focus area for this session: {focus}
+Difficulty level: {difficulty}
+
+Rules:
+- Ask targeted, probing questions. Follow up on shallow or vague answers.
+- Be professional and neutral — neither warm nor hostile.
+- Ask exactly one question at a time.
+- Do not reveal what a good answer looks like before hearing the response.
+- If the answer by candidate is incomplete, push deeper with a follow-up.
+$$;
+
+CREATE FUNCTION candidate_persona(role TEXT, experience TEXT DEFAULT '5 years')
+RETURN TEXT
+AS $$
+You are a job candidate interviewing for: {role}
+You have {experience} of relevant experience.
+
+Rules:
+- Answer honestly based on the candidate profile you have been given.
+- Think out loud and be specific — reference real or plausible past experiences.
+- Show genuine strengths confidently. Show gaps honestly without guessing wildly.
+- If unsure, say so and explain your reasoning process rather than bluffing.
+$$;
+
+CREATE FUNCTION evaluation_rubric()
+RETURN TEXT
+AS $$
+Evaluate the candidate answer on four dimensions (each 0-10):
+1. accuracy     — Is the answer technically correct and free of errors?
+2. depth        — Does the candidate go beyond the surface level?
+3. communication — Is the answer clear, structured, and easy to follow?
+4. experience   — Does the candidate reference concrete real-world scenarios?
+
+Also derive: total = accuracy + depth + communication + experience  (max 40)
+
+Return valid JSON only — no prose outside the JSON:
+{"accuracy": N, "depth": N, "communication": N, "experience": N, "total": N, "feedback": "one concise sentence"}
+$$;
+
+-- ── Main workflow ───────────────────────────────────────────────────────────
+
+WORKFLOW interview_sim
+    INPUT:  @role_key      TEXT DEFAULT "",
+            @candidate_id  TEXT DEFAULT "",
+            @role          TEXT DEFAULT "",
+            @focus         TEXT DEFAULT "",
+            @difficulty    TEXT DEFAULT 'medium',
+            @num_questions INT  DEFAULT 3,
+            @experience    TEXT DEFAULT '5 years'
+    OUTPUT: @evaluation_report TEXT
+DO
+    LOGGING f'Interview sim | role={@role} focus={@focus} difficulty={@difficulty}' LEVEL INFO
+
+    -- Step 1: Load role and focus area context (deterministic — no LLM)
+    CALL load_role(@role_key, @focus) INTO @role_context
+
+    -- Step 2: Load candidate profile (deterministic — no LLM)
+    CALL load_candidate(@candidate_id) INTO @candidate_profile
+    LOGGING f'Role and candidate loaded | candidate_id={@candidate_id}' LEVEL DEBUG
+
+    -- Step 3: Generate the full question set upfront (LLM, grounded by role context)
+    GENERATE generate_question_set(
+        @role,
+        @role_context,
+        @focus,
+        @difficulty,
+        @num_questions,
+        interviewer_persona(@role, @focus, @difficulty)
+    ) INTO @questions_json
+
+    -- Step 4: Extract individual questions (deterministic — replaces GENERATE ask_question)
+    CALL extract_question(@questions_json, '1') INTO @q1
+    CALL extract_question(@questions_json, '2') INTO @q2
+    CALL extract_question(@questions_json, '3') INTO @q3
+
+    -- Step 5: Candidate answers each question (LLM, grounded by candidate profile)
+    GENERATE answer_question(
+        @q1, @role, @role_context, @candidate_profile,
+        candidate_persona(@role, @experience)
+    ) INTO @a1
+
+    GENERATE answer_question(
+        @q2, @role, @role_context, @candidate_profile,
+        candidate_persona(@role, @experience)
+    ) INTO @a2
+
+    GENERATE answer_question(
+        @q3, @role, @role_context, @candidate_profile,
+        candidate_persona(@role, @experience)
+    ) INTO @a3
+
+    -- Step 6: Score each answer against the rubric (LLM)
+    LOGGING 'Scoring answers ...' LEVEL DEBUG
+    GENERATE score_answer(@q1, @a1, @role_context, evaluation_rubric()) INTO @score1
+    GENERATE score_answer(@q2, @a2, @role_context, evaluation_rubric()) INTO @score2
+    GENERATE score_answer(@q3, @a3, @role_context, evaluation_rubric()) INTO @score3
+
+    -- Step 7: Aggregate scores across all questions (deterministic — no LLM)
+    CALL aggregate_scores(@score1, @score2, @score3) INTO @agg_scores
+    LOGGING f'Aggregate scores: {@agg_scores}' LEVEL INFO
+
+    -- Step 8: Compile the interview transcript (deterministic — no LLM)
+    CALL compile_transcript(
+        @q1, @a1, @score1,
+        @q2, @a2, @score2,
+        @q3, @a3, @score3,
+        @role, @focus
+    ) INTO @transcript
+
+    -- Step 9: Write the overall evaluation narrative (LLM, receives deterministic agg_scores)
+    GENERATE overall_evaluation(
+        @transcript,
+        @agg_scores,
+        @role,
+        @focus,
+        @candidate_profile
+    ) INTO @evaluation_report
+
+    LOGGING f'Evaluation complete | role={@role} focus={@focus}' LEVEL INFO
+    RETURN @evaluation_report WITH
+        status     = 'complete',
+        role       = @role,
+        focus      = @focus,
+        difficulty = @difficulty
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN @transcript WITH status = 'partial', reason = 'evaluation_failed'
+END

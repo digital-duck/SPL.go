@@ -1,0 +1,158 @@
+-- ============================================================
+-- Recipe 69: Jupyter Notebook Generator
+--
+-- Demonstrates the IPython kernel as a persistent, stateful
+-- execution substrate woven through an SPL workflow.
+--
+-- Key features shown:
+--   1. Kernel state persists across CALL steps — 'import sympy'
+--      in step 1 is still live in step 3 (no re-importing).
+--   2. LLM + kernel interplay — kernel owns the math (exact),
+--      LLM owns the narrative (language). Neither trespasses.
+--   3. Real .ipynb output — a Jupyter notebook you can open
+--      and run immediately after spl3 run.
+--
+-- Architecture:
+--   run_python (kernel)  — deterministic: eigendecomposition,
+--                          verification A*v = lambda*v
+--   GENERATE   (LLM)     — probabilistic: intro prose, explanation
+--   assemble_notebook    — tools.spl (CREATE TOOL_API): builds the .ipynb safely
+--
+-- Run:
+--   spl3 run cookbook/69_notebook_gen/notebook_gen.spl \
+--       --kernel --adapter ollama
+--
+-- With custom topic:
+--   spl3 run cookbook/69_notebook_gen/notebook_gen.spl \
+--       --kernel --adapter ollama \
+--       -p topic="dot products and orthogonality" \
+--       -p matrix_a="[[1, 0], [0, -1]]"
+-- ============================================================
+
+IMPORT 'tools'
+
+-- ── Prompt templates ─────────────────────────────────────────
+
+CREATE FUNCTION write_intro(topic TEXT, matrix_a TEXT)
+RETURN TEXT
+AS $$
+Write a 3-sentence introduction for a Jupyter notebook section on: {topic}
+
+Assume the reader knows basic matrix notation but is new to this topic.
+End with the sentence: "The worked example below uses the matrix A = {matrix_a}."
+
+Return plain markdown text — no code fences, no headers, no bullet points.
+$$;
+
+CREATE FUNCTION explain_eigenvalues(matrix_a TEXT, eigen_summary TEXT)
+RETURN TEXT
+AS $$
+The eigendecomposition of the matrix A = {matrix_a} produced these eigenpairs:
+
+{eigen_summary}
+
+Write 2-3 sentences explaining what these values mean geometrically:
+what the eigenvectors represent as directions, and what the eigenvalues
+represent as scale factors under the linear transformation.
+
+Return plain markdown text only.
+$$;
+
+
+-- ── Workflow ──────────────────────────────────────────────────
+
+WORKFLOW notebook_gen
+    INPUT:
+        @topic       TEXT DEFAULT 'eigenvalues and eigenvectors',
+        @matrix_a    TEXT DEFAULT '[[4, 1], [2, 3]]',
+        @output_path TEXT DEFAULT 'cookbook/69_notebook_gen/output/eigenvalues.ipynb',
+        @log_dir     TEXT DEFAULT 'cookbook/69_notebook_gen/logs-spl'
+    OUTPUT: @notebook_path TEXT
+DO
+    CALL now_iso() INTO @run_ts;
+    CALL replace(@run_ts, ':', '') INTO @run_ts;
+    @log_file := f'{@log_dir}/chain_trace-{@run_ts}.md';
+
+    CALL write_file(@log_file,
+        f"# Notebook Generator — chain trace\n\n**Topic:** {@topic}\n**Matrix:** {@matrix_a}\n**Output:** {@output_path}\n**Started:** {@run_ts}\n\n") INTO NONE;
+
+    -- ── Step 1: kernel setup ─────────────────────────────────
+    -- Import once; all subsequent run_python steps share this
+    -- kernel session — imports and variables persist.
+    CALL run_python(f'
+import sympy as sp
+A = sp.Matrix({@matrix_a})
+print(f"A = {A}")
+') INTO @matrix_repr
+
+    LOGGING f'Matrix: {@matrix_repr}' LEVEL INFO
+
+    CALL write_file(@log_file,
+        f"## Step 1 — Kernel setup\n**Matrix repr:** {@matrix_repr}\n\n", 'a') INTO NONE;
+
+    -- ── Step 2: deterministic eigendecomposition ─────────────
+    -- Uses A from step 1. No re-import needed — state persists.
+    CALL now_iso() INTO @t2;
+    CALL run_python('
+eigendata = A.eigenvects()
+parts = []
+for lam, mult, vecs in eigendata:
+    for v in vecs:
+        parts.append(f"lambda={lam}, v={list(v)}")
+_eigen_summary = " | ".join(parts)
+print(_eigen_summary)
+') INTO @eigen_summary
+
+    LOGGING f'Eigendata: {@eigen_summary}' LEVEL INFO
+
+    CALL write_file(@log_file,
+        f"## Step 2 — Eigendecomposition (at {@t2})\n**Eigenpairs:** {@eigen_summary}\n\n", 'a') INTO NONE;
+
+    -- ── Step 3: deterministic verification ───────────────────
+    -- A*v == lambda*v exactly (SymPy symbolic equality, not float).
+    CALL now_iso() INTO @t3;
+    CALL run_python('
+checks = []
+for lam, mult, vecs in eigendata:
+    for v in vecs:
+        ok = bool(A * v == lam * v)
+        checks.append(f"lambda={lam}: {ok}")
+print(", ".join(checks))
+') INTO @verification
+
+    LOGGING f'Verification: {@verification}' LEVEL INFO
+
+    CALL write_file(@log_file,
+        f"## Step 3 — Verification (at {@t3})\n**Checks:** {@verification}\n\n", 'a') INTO NONE;
+
+    -- ── Step 4: LLM writes the introduction ──────────────────
+    CALL now_iso() INTO @t4;
+    GENERATE write_intro(@topic, @matrix_a) INTO @intro_text
+
+    CALL write_file(@log_file,
+        f"## Step 4 — LLM intro (at {@t4})\n{@intro_text}\n\n", 'a') INTO NONE;
+
+    -- ── Step 5: LLM explains the eigenvalues ─────────────────
+    CALL now_iso() INTO @t5;
+    GENERATE explain_eigenvalues(@matrix_a, @eigen_summary) INTO @explanation_text
+
+    CALL write_file(@log_file,
+        f"## Step 5 — LLM explanation (at {@t5})\n{@explanation_text}\n\n", 'a') INTO NONE;
+
+    -- ── Step 6: assemble and write the .ipynb ─────────────────
+    -- tools.spl (CREATE TOOL_API) handles text assembly safely — no string escaping
+    -- of LLM output needed inside SPL f-strings.
+    CALL assemble_notebook(
+        @topic, @matrix_a, @intro_text, @explanation_text,
+        @eigen_summary, @verification, @output_path
+    ) INTO @notebook_path
+
+    LOGGING f'Notebook written: {@notebook_path}' LEVEL INFO
+
+    CALL now_iso() INTO @t_done;
+    CALL write_file(@log_file,
+        f"## Step 6 — Notebook assembled (at {@t_done})\n**Path:** {@notebook_path}\n\n---\n*status: complete*\n", 'a') INTO NONE;
+
+    COMMIT @notebook_path
+
+END

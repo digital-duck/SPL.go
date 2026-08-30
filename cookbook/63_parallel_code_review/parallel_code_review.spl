@@ -1,0 +1,96 @@
+-- Recipe 63: Parallel Code Review
+-- Category: agentic / SPL 3.0
+-- Run three independent quality checks on a code snippet concurrently:
+--   style review, security audit, and test case generation.
+-- Merge all three into a single prioritised action plan.
+--
+-- SPL INPUT types:  TEXT (code + lang + model)
+-- SPL OUTPUT type:  TEXT (consolidated review report)
+--
+-- Pipeline:
+--   @code ──┬── style_review    ──► @style_fb  ──┐
+--           ├── security_audit  ──► @sec_fb    ──┼── merge ──► @report
+--           └── test_generator  ──► @test_fb   ──┘
+--
+-- Demonstrates:
+--   IMPORT — load three sub-workflow definitions from separate files
+--   CALL PARALLEL — three independent LLM calls run concurrently
+--   Fan-out + merge pattern with heterogeneous sub-workflows
+--   Named-argument CALL dispatch to WORKFLOW definitions
+--
+-- Run locally (Ollama):
+--   spl3 run parallel_code_review.spl code="def add(a, b): return a - b"
+--   spl3 run parallel_code_review.spl \
+--       code="$(cat my_module.py)" lang=python review_model=gemma4
+--
+-- Run with spl-go:
+--   spl-go run parallel_code_review.spl \
+--       code="def add(a, b): return a - b" --adapter ollama --param review_model=gemma3
+
+IMPORT '00_style_review'
+IMPORT '01_security_audit'
+IMPORT '02_test_generator'
+
+-- ── Merge function ─────────────────────────────────────────────────────────────
+
+CREATE FUNCTION merge_reviews(style TEXT, sec_audit TEXT, tests TEXT) RETURN TEXT
+AS $$
+You are a senior engineering lead consolidating three independent code-review reports
+into a single, actionable plan.
+
+Style & Correctness Review:
+{style}
+
+Security Audit:
+{sec_audit}
+
+Generated Test Cases:
+{tests}
+
+Produce a consolidated report with three sections:
+1. **Action Items** — numbered list of changes to make, CRITICAL first, then MODERATE, then LOW
+2. **Test Coverage** — paste the generated tests verbatim under a code block
+3. **Summary** — one paragraph overall assessment (is this code production-ready?)
+
+Keep the Action Items section under 150 words.
+$$;
+
+-- ── Main orchestrator ──────────────────────────────────────────────────────────
+
+WORKFLOW parallel_code_review
+    INPUT:
+        @code    TEXT,
+        @lang    TEXT    DEFAULT 'python',
+        @review_model   TEXT    DEFAULT 'gemma4',
+        @log_dir TEXT    DEFAULT 'cookbook/63_parallel_code_review/logs-spl'
+    OUTPUT: @report TEXT
+DO
+    LOGGING f'[parallel_code_review] starting 3-way parallel review | lang={@lang} review_model={@review_model}' LEVEL INFO
+
+    -- Three independent quality checks run concurrently.
+    -- style_review, security_audit, and test_generator all read @code
+    -- but write only to their own INTO @var — no interference.
+    CALL PARALLEL
+        style_review   (@code, lang=@lang, review_model=@review_model, log_dir=@log_dir) INTO @style_fb,
+        security_audit (@code, lang=@lang, review_model=@review_model, log_dir=@log_dir) INTO @sec_fb,
+        test_generator (@code, lang=@lang, review_model=@review_model, log_dir=@log_dir) INTO @test_fb
+    END
+
+    LOGGING '[parallel_code_review] parallel checks complete — merging into report' LEVEL INFO
+
+    GENERATE merge_reviews(@style_fb, @sec_fb, @test_fb)
+        WITH OUTPUT BUDGET 1024 TOKENS
+        USING MODEL @review_model
+        INTO @report
+
+    LOGGING f'[parallel_code_review] done | report_len={len(@report)}' LEVEL INFO
+    RETURN @report
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING f'[parallel_code_review] model unavailable: {@review_model}' LEVEL ERROR
+        RETURN '[ERROR] Model unavailable.' WITH status = 'failed'
+    WHEN BudgetExceeded THEN
+        LOGGING '[parallel_code_review] token budget exceeded during merge' LEVEL WARN
+        RETURN @report WITH status = 'truncated'
+END

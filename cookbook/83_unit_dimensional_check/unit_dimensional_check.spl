@@ -1,0 +1,315 @@
+-- ============================================================
+-- Recipe 83: Unit / Dimensional Check — LLM formulates, pint proves
+--
+-- Extends the verifier ladder into physics / engineering word
+-- problems where the LLM's most common failure mode isn't the
+-- arithmetic — it's silently dropping or mismatching UNITS
+-- (mixing m/s with km/h, forgetting to square time in s = 1/2 a t^2,
+-- etc). `pint` tracks units through every operation and raises a
+-- DimensionalityError the moment two incompatible quantities are
+-- combined, making it a categorical (not numeric-fuzzy) verifier.
+--
+--   Probabilistic (LLM)   — read the natural-language physics problem
+--                            and write runnable pint code
+--   Deterministic (pint)  — pint's UnitRegistry executes the
+--                            calculation with units attached; wrong
+--                            unit algebra raises DimensionalityError
+--   Deterministic (ASSERT)— formal gate: only continue when the
+--                            calculation ran with consistent units
+--   Probabilistic (LLM)   — narrate the result, restating the
+--                            final answer explicitly
+--   Deterministic (round- — regex-and-compare classifier confirms the
+--    trip classifier)       LLM's stated final answer matches pint's
+--                            computed ground truth (WITH roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — physics
+-- word problems are exactly where models silently drop a unit
+-- conversion and never notice.
+--
+-- Requires: pip install pint
+-- Run:
+--   spl3 run cookbook/83_unit_dimensional_check/unit_dimensional_check.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/83_unit_dimensional_check/unit_dimensional_check.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: pint unit-aware solver tool ────────
+
+CREATE TOOL_API run_pint(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_pint(code: str) -> str:
+    """Execute LLM-generated pint code and return a JSON result dict.
+
+    The LLM writes the code; this function is the deterministic oracle.
+    `ureg` (a pint.UnitRegistry) and `Q_` (ureg.Quantity) are already in
+    scope. The code must set:
+        _result = {"status": "OK", "answer": <rounded scalar magnitude
+                   in the units the question asked for>, "unit": "<unit>",
+                   ...extra fields...}
+    A DimensionalityError (mixing incompatible units) or any other
+    exception returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json
+    import re
+    import pint
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    ureg = pint.UnitRegistry()
+    namespace = {"ureg": ureg, "Q_": ureg.Quantity}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except pint.DimensionalityError as e:
+        return json.dumps({"status": "Error", "error": f"DimensionalityError: {e}"})
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own 'Final answer: ...' line, in
+    its narration of the VERIFIED pint result, match the ground-truth
+    magnitude (within 0.5% relative tolerance to absorb rounding)?
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.').lower()
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+
+    def _num(s):
+        try:
+            return float(re.sub(r'[^0-9.\-]', '', str(s)))
+        except Exception:
+            return None
+
+    ln, tn = _num(llm_val), _num(truth)
+    if ln is None or tn is None:
+        return "unverifiable"
+    if tn == 0:
+        return "match" if abs(ln) < 1e-6 else "mismatch"
+    rel_err = abs(ln - tn) / abs(tn)
+    return "match" if rel_err < 0.005 else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, code TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, code: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Unit / Dimensional Check Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**pint status:** `{sol.get('status', 'Unknown')}`",
+        f"**Ground-truth answer:** `{sol.get('answer', '?')} {sol.get('unit', '')}`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Solver Code (LLM-generated, pint)", "",
+        "```python", code.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_pint_code(problem TEXT)
+RETURNS TEXT AS $$
+You are a physics/engineering expert. Convert this word problem into
+runnable Python code using the `pint` unit-aware library.
+
+Rules:
+- `ureg` (a pint.UnitRegistry) and `Q_` (ureg.Quantity) are already in
+  scope — do NOT add import statements
+- Attach units to EVERY quantity as you create it, e.g. Q_(2.5, 'm/s^2'),
+  Q_(12, 's') — never use bare floats for physical quantities
+- Do all arithmetic on the Quantity objects directly so pint enforces
+  dimensional consistency; convert to the unit the question asks for
+  with `.to('<unit>')` at the end
+- Store the result EXACTLY as:
+    _result = {
+        "status": "OK",
+        "answer": <the final numeric magnitude, rounded to 3 significant
+                   figures, in the unit the question asked for>,
+        "unit": "<that unit as a string>",
+        ...any other useful intermediate values...
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_pint_code(problem TEXT, code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This pint code produced an error.
+
+Problem: {problem}
+
+Previous code:
+{code}
+
+Error:
+{error_info}
+
+Fix the code. Common causes:
+- A DimensionalityError means two incompatible units were combined
+  (e.g. adding a length to a time) — check every operation's units
+- A bare float used where a Quantity (Q_(value, 'unit')) was needed
+- Wrong unit string (pint uses 'm', 's', 'kg', 'mile', 'hour', 'N', ...)
+- Missing or duplicate _result assignment
+- Forgot to call .to('<unit>') to convert to the unit the question asked for
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_pint_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a physics/engineering expert. Interpret this VERIFIED, unit-checked
+result for a general audience.
+
+Problem: {problem}
+
+Verified result (JSON, computed exactly by pint with units enforced
+throughout — trust it completely, do not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate what the problem asks
+2. State the answer with its unit, referencing the exact value from the JSON
+3. One sentence on which physical relationship (formula) was used
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A student asked this physics/engineering question: "{problem}"
+
+There is no unit-checking library backing you up this time — work it out
+yourself, from scratch, tracking units carefully in your head.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the problem
+2. Shows your calculation step by step, stating units at each step
+3. Gives the final answer plainly, with its unit
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW unit_dimensional_check
+  -- Default: a kinematics problem with a known closed-form answer
+  -- (v = a*t = 30 m/s = 108 km/h) that is easy to get wrong by
+  -- forgetting the unit conversion from m/s to km/h.
+  INPUT @problem TEXT := "A car accelerates from rest at 2.5 m/s^2 for 12 seconds. What is its final speed, in km/h?"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/83_unit_dimensional_check/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[unit_dimensional_check] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no unit-checking library ──
+        LOGGING "[arm=llm_only] solving with NO unit checker" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM formulates pint code; unit-checked solve ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + pint solve" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @code     := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_pint_code(@problem) INTO @code;
+                CALL run_pint(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_pint_code(@problem, @code, @error_info) INTO @code;
+                CALL run_pint(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[unit_dimensional_check] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[unit_dimensional_check] ASSERT passed — pint confirmed dimensionally consistent" LEVEL INFO
+
+        GENERATE interpret_pint_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[unit_dimensional_check] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @code, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/unit_check_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[unit_dimensional_check] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "pint could not compute a dimensionally-consistent answer after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/unit_check_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[unit_dimensional_check] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

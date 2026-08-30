@@ -1,0 +1,160 @@
+-- tools.spl — TOOL_API definitions for Recipe 26: Prompt A/B Test
+-- Imported by ab_test.spl via IMPORT 'tools'
+
+CREATE TOOL_API load_experiment(experiment_id TEXT)
+RETURNS TEXT AS PYTHON $$
+def load_experiment(experiment_id: str) -> str:
+    import json
+    import os
+    import textwrap
+
+    def _wrap(text, width=76, indent="  "):
+        lines = []
+        for paragraph in text.split("\n"):
+            if not paragraph.strip():
+                lines.append("")
+                continue
+            wrapped = textwrap.fill(paragraph, width=width, subsequent_indent=indent)
+            lines.append(wrapped)
+        return "\n".join(lines)
+
+    data_dir = "cookbook/26_ab_test"
+    path = os.path.join(data_dir, "experiments.json")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    experiments = {e["id"]: e for e in data["experiments"]}
+    experiment_id = experiment_id.strip().lower()
+
+    if not experiment_id or experiment_id == "list":
+        lines = ["Available experiments:", ""]
+        for e in data["experiments"]:
+            lines.append(f"  {e['id']:20s} — {e['notes'][:60]}...")
+        return "\n".join(lines)
+
+    exp = experiments.get(experiment_id)
+    if exp is None:
+        available = ", ".join(experiments.keys())
+        return f"Experiment '{experiment_id}' not found. Available: {available}"
+
+    lines = [
+        f"EXPERIMENT: {exp['id']}",
+        "",
+        f"TASK:",
+        f"  {_wrap(exp['task'], indent='  ')}",
+        "",
+        f"PROMPT A:",
+        f"  {_wrap(exp['prompt_a'], indent='  ')}",
+        "",
+        f"PROMPT B:",
+        f"  {_wrap(exp['prompt_b'], indent='  ')}",
+        "",
+        f"EXPECTED WINNER: {exp['expected_winner']}",
+        "",
+        f"NOTES:",
+        f"  {_wrap(exp['notes'], indent='  ')}",
+    ]
+    return "\n".join(lines)
+$$;
+
+CREATE TOOL_API list_experiments()
+RETURNS TEXT AS PYTHON $$
+def list_experiments() -> str:
+    import json
+    import os
+
+    data_dir = "cookbook/26_ab_test"
+    path = os.path.join(data_dir, "experiments.json")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    lines = ["Available A/B experiments:", ""]
+    for e in data["experiments"]:
+        lines.append(f"ID     : {e['id']}")
+        lines.append(f"Task   : {e['task'][:80]}")
+        lines.append(f"Notes  : {e['notes'][:80]}")
+        lines.append("")
+    return "\n".join(lines)
+$$;
+
+CREATE TOOL_API extract_score_total(score_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def extract_score_total(score_json: str) -> str:
+    import json
+
+    score_json = score_json.strip()
+    try:
+        obj = json.loads(score_json)
+        total = obj.get("total")
+        if total is not None:
+            return str(float(total))
+        # Fallback: sum the four dimensions
+        dims = ["clarity", "completeness", "relevance", "engagement"]
+        total = sum(float(obj.get(d, 0)) for d in dims)
+        return str(total)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return "0"
+$$;
+
+CREATE TOOL_API format_tie_result(response_a TEXT, response_b TEXT, score_a_json TEXT, score_b_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_tie_result(response_a: str, response_b: str, score_a_json: str, score_b_json: str) -> str:
+    import json
+    import textwrap
+
+    def _wrap(text, width=76, indent="  "):
+        lines = []
+        for paragraph in text.split("\n"):
+            if not paragraph.strip():
+                lines.append("")
+                continue
+            wrapped = textwrap.fill(paragraph, width=width, subsequent_indent=indent)
+            lines.append(wrapped)
+        return "\n".join(lines)
+
+    def _parse(raw):
+        try:
+            return json.loads(raw.strip())
+        except (json.JSONDecodeError, AttributeError):
+            return {}
+
+    def _dim_row(label, sa, sb):
+        a_val = sa.get(label, "?")
+        b_val = sb.get(label, "?")
+        return f"  {label:<14} A: {a_val}/10   B: {b_val}/10"
+
+    divider = "─" * 68
+    sa = _parse(score_a_json)
+    sb = _parse(score_b_json)
+
+    lines = [
+        "TIE — Both variants scored within the threshold.",
+        divider,
+        "",
+        "SCORES",
+        _dim_row("clarity",      sa, sb),
+        _dim_row("completeness", sa, sb),
+        _dim_row("relevance",    sa, sb),
+        _dim_row("engagement",   sa, sb),
+        f"  {'total':<14} A: {sa.get('total', '?')}/40   B: {sb.get('total', '?')}/40",
+        "",
+        "RATIONALE A:",
+        f"  {_wrap(sa.get('rationale', '(none)'), indent='  ')}",
+        "",
+        "RATIONALE B:",
+        f"  {_wrap(sb.get('rationale', '(none)'), indent='  ')}",
+        "",
+        divider,
+        "",
+        "VARIANT A RESPONSE:",
+        _wrap(response_a.strip(), indent="  "),
+        "",
+        divider,
+        "",
+        "VARIANT B RESPONSE:",
+        _wrap(response_b.strip(), indent="  "),
+        "",
+        divider,
+    ]
+    return "\n".join(lines)
+$$;

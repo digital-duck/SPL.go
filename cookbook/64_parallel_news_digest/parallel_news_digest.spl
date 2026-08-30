@@ -1,0 +1,120 @@
+-- Recipe 64: Parallel News Digest
+-- Category: agentic / SPL 3.0
+-- Summarise three independent news topics concurrently, then synthesise
+-- them into a single morning briefing.
+--
+-- SPL INPUT types:  TEXT (three topic strings + model)
+-- SPL OUTPUT type:  TEXT (consolidated morning briefing)
+--
+-- Pipeline:
+--   @topic_tech  ──┐
+--   @topic_sci   ──┼── CALL PARALLEL ──► 3 summaries ──► merge ──► @digest
+--   @topic_biz   ──┘
+--
+-- Demonstrates:
+--   CALL PARALLEL — three independent LLM calls run concurrently
+--   CALL dispatching a WORKFLOW definition (summarise_single)
+--   Fan-out + merge pattern (pure text, no external services)
+--
+-- Run locally (Ollama):
+--   spl3 run parallel_news_digest.spl
+--   spl3 run parallel_news_digest.spl topic_tech="quantum computing breakthroughs"
+--   spl3 run parallel_news_digest.spl digest_model=gemma3
+--
+-- Run with spl-go:
+--   spl-go run parallel_news_digest.spl --adapter ollama --param digest_model=gemma3
+--   spl-go run parallel_news_digest.spl --adapter echo   -- dry-run
+
+-- ── Prompt functions ───────────────────��──────────────────────────────────────
+
+CREATE FUNCTION summarise_topic(topic TEXT, context TEXT) RETURN TEXT
+AS $$
+You are a concise news analyst writing for a busy professional.
+
+Write a 3-sentence summary of recent and notable developments in: {topic}
+Additional context or constraints: {context}
+
+Rules:
+- Be factual and neutral in tone
+- Focus on the most impactful or surprising developments
+- End with one sentence on the likely near-term outlook
+$$;
+
+CREATE FUNCTION morning_briefing(tech TEXT, science TEXT, business TEXT) RETURN TEXT
+AS $$
+You are an executive assistant writing a morning briefing for a senior leader.
+
+Combine the three topic summaries below into a single, coherent 200-word digest.
+Start with one orienting sentence, then present each topic under a bold header.
+Close with a one-sentence "watch today" callout highlighting the most time-sensitive item.
+
+Technology:
+{tech}
+
+Science:
+{science}
+
+Business:
+{business}
+$$;
+
+-- ── Sub-workflow (called in parallel) ───────────────���────────────────────────
+
+WORKFLOW summarise_single
+    INPUT:
+        @topic   TEXT,
+        @context TEXT    DEFAULT "",
+        @digest_model   TEXT    DEFAULT 'gemma3',
+        @log_dir TEXT    DEFAULT ""
+    OUTPUT: @summary TEXT
+DO
+    LOGGING f'[summarise_single] topic="{@topic}"' LEVEL DEBUG
+    GENERATE summarise_topic(@topic, @context)
+        WITH OUTPUT BUDGET 256 TOKENS
+        USING MODEL @digest_model
+        INTO @summary
+    RETURN @summary
+END
+
+-- ── Main orchestrator ──────────────────────────���──────────────────────────────
+
+WORKFLOW parallel_news_digest
+    INPUT:
+        @topic_tech     TEXT    DEFAULT 'AI and large language models',
+        @topic_science  TEXT    DEFAULT 'space exploration and astronomy',
+        @topic_business TEXT    DEFAULT 'global markets and energy transition',
+        @digest_model   TEXT    DEFAULT 'gemma3',
+        @output_budget  INTEGER DEFAULT 512,
+        @log_dir        TEXT    DEFAULT 'cookbook/64_parallel_news_digest/logs-spl'
+    OUTPUT: @digest TEXT
+DO
+    LOGGING f'[parallel_news_digest] digest_model={@digest_model}' LEVEL INFO
+    LOGGING f'[parallel_news_digest] topics: "{@topic_tech}" | "{@topic_science}" | "{@topic_business}"' LEVEL INFO
+
+    -- Three independent summaries run concurrently.
+    -- Each branch receives a snapshot of the parent scope; results flow back
+    -- only via INTO @var — no shared mutable state between branches.
+    CALL PARALLEL
+        summarise_single(@topic_tech,     digest_model=@digest_model, log_dir=@log_dir) INTO @tech_summary,
+        summarise_single(@topic_science,  digest_model=@digest_model, log_dir=@log_dir) INTO @sci_summary,
+        summarise_single(@topic_business, digest_model=@digest_model, log_dir=@log_dir) INTO @biz_summary
+    END
+
+    LOGGING '[parallel_news_digest] parallel summaries complete — merging into digest' LEVEL INFO
+
+    GENERATE morning_briefing(@tech_summary, @sci_summary, @biz_summary)
+        WITH OUTPUT BUDGET @output_budget TOKENS
+        USING MODEL @digest_model
+        INTO @digest
+
+    LOGGING f'[parallel_news_digest] done | digest_len={len(@digest)}' LEVEL INFO
+    RETURN @digest
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING f'[parallel_news_digest] model unavailable: {@digest_model}' LEVEL ERROR
+        RETURN '[ERROR] Model unavailable.' WITH status = 'failed'
+    WHEN BudgetExceeded THEN
+        LOGGING '[parallel_news_digest] token budget exceeded' LEVEL WARN
+        RETURN @digest WITH status = 'truncated'
+END

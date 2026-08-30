@@ -1,0 +1,330 @@
+-- ============================================================
+-- Recipe 87: Route Optimization — LLM formulates, OR-Tools proves
+--
+-- A second, harder optimization class beyond recipe 78's linear
+-- program: vehicle-routing / TSP-style logistics is NP-hard
+-- combinatorial optimization, yet still exactly checkable — OR-Tools'
+-- routing solver either returns a route with a verifiable total
+-- distance or reports no solution. Same deterministic-probabilistic
+-- boundary as 78, a fundamentally harder search space.
+--
+--   Probabilistic (LLM)   — read the natural-language routing problem
+--                            and write runnable OR-Tools routing code
+--   Deterministic (OR-    — OR-Tools' constraint-programming routing
+--    Tools)                 solver searches the combinatorial space and
+--                            returns a route + its total distance
+--   Deterministic (ASSERT)— formal gate: only continue when the
+--                            solver reports a found solution
+--   Probabilistic (LLM)   — narrate the route, restating the total
+--                            distance explicitly
+--   Deterministic (round- — regex-and-compare classifier confirms the
+--    trip classifier)       LLM's stated final distance matches the
+--                            solver's computed ground truth (WITH
+--                            roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — routing
+-- problems are exactly where LLMs confidently propose a plausible-
+-- looking but non-optimal (or even infeasible, revisiting a stop)
+-- route.
+--
+-- Requires: pip install ortools
+-- Run:
+--   spl3 run cookbook/87_route_optimization/route_optimization.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/87_route_optimization/route_optimization.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: OR-Tools routing solver tool ───────
+
+CREATE TOOL_API run_ortools(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_ortools(code: str) -> str:
+    """Execute LLM-generated OR-Tools routing code and return a JSON
+    result dict. The LLM writes the code; this function is the
+    deterministic oracle. `pywrapcp` and `routing_enums_pb2` are already
+    in scope. The code must set:
+        _result = {"status": "Optimal", "route": [0, 4, 3, ...],
+                   "answer": <total_distance>, ...extra fields...}
+        _result = {"status": "NoSolution"}
+    On any error returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json
+    import re
+    from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"pywrapcp": pywrapcp, "routing_enums_pb2": routing_enums_pb2}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API is_optimal(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def is_optimal(result_json: str) -> bool:
+    """ASSERT gate: True only when OR-Tools found a feasible route."""
+    import json
+    try:
+        return json.loads(result_json).get("status") == "Optimal"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own 'Final answer: ...' line, in
+    its narration of the VERIFIED route, match the solver's computed
+    total distance? Catches the LLM restating a different (usually
+    worse) total than the one it was just given.
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.').lower()
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+
+    def _num(s):
+        try:
+            return float(re.sub(r'[^0-9.\-]', '', str(s)))
+        except Exception:
+            return None
+
+    ln, tn = _num(llm_val), _num(truth)
+    if ln is not None and tn is not None:
+        return "match" if abs(ln - tn) < 1e-6 else "mismatch"
+    truth_str = str(truth).strip().lower()
+    if truth_str in llm_val or llm_val in truth_str:
+        return "match"
+    return "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, code TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, code: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Route Optimization Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**OR-Tools status:** `{sol.get('status', 'Unknown')}`",
+        f"**Route (node indices):** `{sol.get('route', '?')}`",
+        f"**Total distance (ground truth):** `{sol.get('answer', '?')}`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Solver Code (LLM-generated, OR-Tools)", "",
+        "```python", code.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_routing_code(problem TEXT)
+RETURNS TEXT AS $$
+You are an operations-research expert. Convert this vehicle-routing
+problem into runnable Python code using Google OR-Tools' routing solver.
+
+Rules:
+- `pywrapcp` and `routing_enums_pb2` are already imported and in scope —
+  do NOT add import statements
+- Build the distance matrix from the problem exactly as given, node 0 is
+  always the depot (start/end point) unless stated otherwise
+- Use pywrapcp.RoutingIndexManager(n, num_vehicles, depot), then
+  pywrapcp.RoutingModel(manager), register a transit callback returning
+  distance_matrix[from_node][to_node], call
+  routing.SetArcCostEvaluatorOfAllVehicles(...), set search parameters
+  with PATH_CHEAPEST_ARC first-solution strategy and GUIDED_LOCAL_SEARCH
+  metaheuristic with a short time limit (e.g. 2 seconds), then
+  routing.SolveWithParameters(search_parameters)
+- If a solution is found, walk it with routing.Start/IsEnd/NextVar to
+  build the route (list of node indices, ending back at the depot) and
+  sum routing.GetArcCostForVehicle(...) for the total distance
+- Store the result EXACTLY as:
+    _result = {"status": "Optimal", "route": [0, ...node indices..., 0],
+               "answer": <total_distance_as_number>}
+    (or {"status": "NoSolution"} if solution is None)
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_routing_code(problem TEXT, code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This OR-Tools routing code produced an error.
+
+Problem: {problem}
+
+Previous code:
+{code}
+
+Error:
+{error_info}
+
+Fix the code. Common causes:
+- Distance matrix dimensions don't match the number of locations
+- Transit callback signature wrong (must take from_index, to_index and
+  convert with manager.IndexToNode before indexing the matrix)
+- Forgot to register the callback with RegisterTransitCallback before
+  SetArcCostEvaluatorOfAllVehicles
+- Missing or duplicate _result assignment
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_routing_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a logistics expert. Interpret this VERIFIED routing result for a
+dispatcher.
+
+Problem: {problem}
+
+Verified result (JSON, computed exactly by the OR-Tools routing solver —
+trust it completely, do not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate the routing question
+2. State the route order and total distance, referencing the exact
+   values from the JSON
+3. One sentence on why a solver (not hand-planning) is needed at this scale
+
+End your response with a line in EXACTLY this format (no extra words,
+number only):
+Final answer: <total distance>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A dispatcher asked this routing question: "{problem}"
+
+There is no routing solver backing you up this time — plan the route
+yourself, from scratch, in plain English.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the problem
+2. Proposes a route, showing your reasoning (which stop to visit next
+   and why)
+3. Gives the total distance of your proposed route plainly
+
+End your response with a line in EXACTLY this format (no extra words,
+number only):
+Final answer: <total distance>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW route_optimization
+  -- Default: a 6-location (1 depot + 5 customers) TSP with a known
+  -- optimal round-trip distance of 101 (route 0-4-3-5-2-1-0), small
+  -- enough to sanity-check by hand-summing the matrix entries but
+  -- large enough (5! = 120 orderings) that guessing rarely finds it.
+  INPUT @problem TEXT := "A delivery driver starts and ends at the depot (location 0) and must visit 5 customer locations (1-5). The distance matrix in miles is: [[0,29,20,21,16,31],[29,0,15,29,28,40],[20,15,0,15,14,25],[21,29,15,0,4,12],[16,28,14,4,0,16],[31,40,25,12,16,0]] (row/col order = depot,1,2,3,4,5). Find the shortest round-trip route visiting every location exactly once."
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/87_route_optimization/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[route_optimization] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no routing solver at all ──
+        LOGGING "[arm=llm_only] solving with NO routing solver" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM formulates OR-Tools code; solver proves it ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + OR-Tools solve" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @code     := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "Optimal" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_routing_code(@problem) INTO @code;
+                CALL run_ortools(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_routing_code(@problem, @code, @error_info) INTO @code;
+                CALL run_ortools(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[route_optimization] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT is_optimal(@solution);
+        LOGGING "[route_optimization] ASSERT passed — OR-Tools found a feasible route" LEVEL INFO
+
+        GENERATE interpret_routing_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[route_optimization] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @code, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/route_optimization_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[route_optimization] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "OR-Tools did not find a feasible route after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/route_optimization_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[route_optimization] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

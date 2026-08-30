@@ -1,0 +1,65 @@
+-- Tools for Recipe 28: Customer Support Triage
+
+CREATE TOOL_API extract_order_numbers(text TEXT) RETURNS TEXT AS PYTHON $$
+import re
+
+def extract_order_numbers(text):
+    patterns = [
+        r'\bORD-(\d{5,})\b',
+        r'\bORDER-(\d{5,})\b',
+        r'#(\d{5,})\b',
+        r'\border\s+(?:number\s+)?#?(\d{5,})\b',
+    ]
+    found = []
+    seen = set()
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            oid = f"ORD-{m.group(1)}"
+            if oid not in seen:
+                seen.add(oid)
+                found.append(oid)
+    return ", ".join(found)
+$$;
+
+CREATE TOOL_API lookup_order(order_numbers TEXT) RETURNS TEXT AS PYTHON $$
+import json
+import os
+
+_ORDERS_FILE = "cookbook/28_support_triage/orders.json"
+
+def _load_orders():
+    with open(_ORDERS_FILE, encoding="utf-8") as fh:
+        return json.load(fh)
+
+def lookup_order(order_numbers):
+    order_numbers = order_numbers.strip()
+    if not order_numbers:
+        return "No order number found in this ticket."
+
+    orders = _load_orders()
+    index = {o["order_id"].upper(): o for o in orders}
+
+    found = []
+    missing = []
+
+    for raw in order_numbers.split(","):
+        oid = raw.strip().upper()
+        if oid in index:
+            found.append(index[oid])
+        else:
+            missing.append(oid)
+
+    if not found:
+        ids = ", ".join(missing)
+        return (
+            f"Order(s) not found in system: {ids}. "
+            "The customer may have misquoted the order number. "
+            "Ask the customer to confirm the order ID."
+        )
+
+    payload = {"orders_found": found}
+    if missing:
+        payload["orders_not_found"] = missing
+
+    return json.dumps(payload, indent=2, default=str)
+$$;

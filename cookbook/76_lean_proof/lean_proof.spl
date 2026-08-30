@@ -1,0 +1,287 @@
+-- ============================================================
+-- Recipe 76: Lean Proof — the top rung of the verifier ladder
+--
+-- Implements the B-2/B-3 pattern of docs/DEV/sage_lean_integration_plan.md:
+-- the generate-then-verify spine at PROOF grade, with Lean error
+-- messages fed back into capped repair loops.
+--
+--   Probabilistic  (LLM)   — formalize a prose claim as a Lean prop
+--   Deterministic  (Lean)  — does the formalization typecheck?
+--                             (autoImplicit off — hallucinated names fail)
+--   Probabilistic  (LLM)   — judge: is the formalization FAITHFUL
+--                             to the prose? (the one link nothing
+--                             machine-checks — §B.4)
+--   Probabilistic  (LLM)   — write the tactic proof (ONLY the tactics:
+--                             the verified statement never round-trips
+--                             through the LLM — recipe 67's lesson)
+--   Deterministic  (Lean)  — kernel-check the proof; repair loop on
+--                             errors, capped; failure never blocks
+--                             delivery, it only withholds the badge
+--   Deterministic  (Lean)  — exact? probe: is this already a known
+--                             lemma? (mathlib citation mode, B-5 seed)
+--
+-- Requires: bash cookbook/tools/lean/setup_lean.sh   (one-time)
+-- Run:      spl3 run cookbook/76_lean_proof/lean_proof.spl --kernel
+--           (any Python kernel; Lean runs behind it via spl3.lean_bridge)
+-- ============================================================
+
+-- ── Deterministic helpers (in-process, zero tokens) ──────────
+
+CREATE TOOL_API strip_fences(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def strip_fences(text: str) -> str:
+    """Remove markdown code fences and surrounding noise from LLM output."""
+    s = text.strip()
+    if s.startswith("```"):
+        lines = [ln for ln in s.splitlines() if not ln.strip().startswith("```")]
+        s = "\n".join(lines).strip()
+    # one-line statements sometimes arrive with a trailing period
+    return s.rstrip(".").strip().replace("'''", "")
+$$;
+
+CREATE TOOL_API make_theorem(stmt TEXT, tactics TEXT)
+RETURNS TEXT AS PYTHON $$
+def make_theorem(stmt: str, tactics: str) -> str:
+    """Assemble the final theorem deterministically: the verified statement
+    is spliced in verbatim — the LLM only ever contributes the tactic block,
+    so it can never prove a subtly different statement."""
+    body = tactics.strip()
+    if body.startswith(":="):
+        body = body[2:].strip()
+    if body == "by" or body.startswith(("by\n", "by ")):
+        body = body[2:].strip()
+    return f"theorem spl_claim : {stmt} := by\n  {body}"
+$$;
+
+CREATE TOOL_API make_report(claim TEXT, stmt TEXT, faithful TEXT,
+                            proof TEXT, badge TEXT, citation TEXT)
+RETURNS TEXT AS PYTHON $$
+def make_report(claim: str, stmt: str, faithful: str,
+                proof: str, badge: str, citation: str) -> str:
+    lines = [
+        f"# Lean verification report",
+        f"",
+        f"**Claim (prose):** {claim}",
+        f"",
+        f"**Formalization:** `{stmt}`",
+        f"",
+        f"**Faithfulness (LLM judge):** {faithful.strip()}",
+        f"",
+        f"**Badge:** `{badge}`",
+    ]
+    if proof.strip():
+        lines += ["", "**Kernel-checked proof:**", "```lean", proof, "```"]
+    if citation.strip() and citation.strip() != "None":
+        lines += ["", f"**Library search (exact?):** `{citation.strip()}`"]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formalize_claim(claim TEXT)
+RETURNS TEXT AS $$
+Translate this mathematical claim into a single Lean 4 proposition.
+
+Rules:
+- Output ONLY the proposition — what goes after `example :`. No proof,
+  no `example`, no markdown fences, no commentary.
+- Use core Lean 4 types (Nat, Int, List) and notation. Bind every
+  variable explicitly with ∀.
+- Example output:  ∀ n : Nat, n + 0 = n
+
+Claim: {claim}
+$$;
+
+CREATE FUNCTION fix_formalization(claim TEXT, lean_stmt TEXT, feedback TEXT)
+RETURNS TEXT AS $$
+This Lean 4 proposition failed to typecheck.
+
+Claim (prose): {claim}
+Attempted proposition: {lean_stmt}
+Lean's diagnostics:
+{feedback}
+
+Output ONLY the corrected proposition (what goes after `example :`).
+No proof, no fences, no commentary. Bind every variable with ∀.
+$$;
+
+CREATE FUNCTION judge_faithfulness(claim TEXT, lean_stmt TEXT)
+RETURNS TEXT AS $$
+A prose mathematical claim was formalized in Lean 4.
+
+Prose claim: {claim}
+Lean proposition: {lean_stmt}
+
+Does the Lean proposition say exactly what the prose claims — same
+quantifiers, no vacuous hypotheses, no degenerate specialization?
+Reply with exactly one line: FAITHFUL or UNFAITHFUL, then a dash and
+one short reason.
+$$;
+
+CREATE FUNCTION write_tactics(lean_stmt TEXT)
+RETURNS TEXT AS $$
+Write a Lean 4 tactic proof for this proposition:
+
+  {lean_stmt}
+
+Rules:
+- Output ONLY the tactic script — what goes after `:= by`. No fences,
+  no commentary, no restatement of the proposition.
+- CORE Lean 4 only — mathlib is NOT imported: ring, linarith, nlinarith,
+  norm_num, positivity, aesop will all fail with "unknown tactic".
+- Stick to: intro, rfl, simp, omega, decide, induction, cases, calc,
+  exact, and core Nat/Int/List lemmas (e.g. Nat.add_comm, Nat.le_self_pow).
+- Example output for `∀ n : Nat, n + 0 = n`:  intro n; rfl
+$$;
+
+CREATE FUNCTION repair_tactics(lean_stmt TEXT, tactics TEXT, feedback TEXT)
+RETURNS TEXT AS $$
+This Lean 4 tactic proof failed.
+
+Proposition: {lean_stmt}
+Failed tactic script: {tactics}
+Lean's diagnostics:
+{feedback}
+
+Output ONLY a corrected tactic script (what goes after `:= by`) — no
+fences, no explanation, nothing after the final tactic.
+CORE Lean 4 only — mathlib is NOT imported: ring, linarith, nlinarith,
+norm_num, positivity, aesop will all fail with "unknown tactic".
+Stick to: intro, rfl, simp, omega, decide, induction, cases, calc,
+exact, and core Nat/Int/List lemmas (e.g. Nat.add_comm, Nat.le_self_pow).
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW lean_proof
+  INPUT @claim TEXT := 'addition of natural numbers is commutative'
+  INPUT @max_tries INT := 3
+  OUTPUT @report TEXT
+DO
+  -- Step 0 (deterministic): start the persistent Lean REPL inside the
+  -- kernel. Stdlib-only by default (fast warm-up); for mathlib pass
+  -- project_dir/imports — see the readme.
+  CALL run_python('from spl3.lean_bridge import LeanREPL; _spl_lean = LeanREPL().start(); print("ready")') INTO @lean_status;
+  LOGGING f"Lean REPL: {@lean_status}" LEVEL INFO
+
+  -- ── Stage 1: formalize, with capped typecheck-repair loop ──
+  -- 'init' → first formalization; 'false' → repair with Lean feedback;
+  -- 'true' → verified, loop spins out without further LLM calls.
+  @stmt_ok_lc := 'init';
+  @tries := 0;
+  WHILE @tries < @max_tries DO
+    EVALUATE @stmt_ok_lc
+      WHEN = 'true' THEN
+        @tries := @tries + 1
+      WHEN = 'init' THEN
+        GENERATE formalize_claim(@claim) INTO @stmt_raw;
+        CALL strip_fences(@stmt_raw) INTO @lean_stmt;
+        @check_code := f"print(_spl_lean.statement_ok(r'''{@lean_stmt}'''))";
+        CALL run_python(@check_code) INTO @stmt_ok;
+        CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+        CALL lower(@stmt_ok) INTO @stmt_ok_lc;
+        @tries := @tries + 1;
+        LOGGING f"formalize attempt {@tries}: '{@lean_stmt}' → {@stmt_ok}" LEVEL INFO
+      ELSE
+        GENERATE fix_formalization(@claim, @lean_stmt, @lean_feedback) INTO @stmt_raw;
+        CALL strip_fences(@stmt_raw) INTO @lean_stmt;
+        @check_code := f"print(_spl_lean.statement_ok(r'''{@lean_stmt}'''))";
+        CALL run_python(@check_code) INTO @stmt_ok;
+        CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+        CALL lower(@stmt_ok) INTO @stmt_ok_lc;
+        @tries := @tries + 1;
+        LOGGING f"repair attempt {@tries}: '{@lean_stmt}' → {@stmt_ok}" LEVEL INFO
+    END
+  END
+
+  -- ── Stage 2: faithfulness judge (§B.4 — the unmachine-checkable link)
+  @faithful := 'not judged (formalization failed)';
+  @badge := 'unverified';
+  @proof := "";
+  @citation := "";
+  EVALUATE @stmt_ok_lc
+    WHEN = 'true' THEN
+      GENERATE judge_faithfulness(@claim, @lean_stmt) INTO @faithful;
+      @badge := 'statement_checked';
+
+      -- ── Stage 3a (citation first, §B.4): is this already a known
+      -- lemma? On an exact? hit the suggestion IS the proof — zero LLM
+      -- tokens, and a library citation is stronger correspondence
+      -- evidence than a bespoke proof of a bespoke statement.
+      @proof_ok_lc := 'init';
+      @find_code := f"print(_spl_lean.find(r'''{@lean_stmt}'''))";
+      CALL run_python(@find_code) INTO @citation;
+      CALL lower(@citation) INTO @citation_lc;
+      EVALUATE @citation_lc
+        WHEN = 'none' THEN
+          @citation := ""
+        ELSE
+          CALL make_theorem(@lean_stmt, @citation) INTO @proof;
+          @check_code := f"print(_spl_lean.check(r'''{@proof}''')['ok'])";
+          CALL run_python(@check_code) INTO @proof_ok;
+          CALL lower(@proof_ok) INTO @proof_ok_lc;
+          LOGGING f"citation path: by {@citation} → {@proof_ok}" LEVEL INFO
+      END
+
+      -- ── Stage 3b: LLM proof, capped kernel-check repair loop —
+      -- runs only when the library search missed. The LLM writes ONLY
+      -- the tactic block; make_theorem splices the already-verified
+      -- statement in verbatim.
+      @tries := 0;
+      WHILE @tries < @max_tries DO
+        EVALUATE @proof_ok_lc
+          WHEN = 'true' THEN
+            @tries := @tries + 1
+          WHEN = 'init' THEN
+            GENERATE write_tactics(@lean_stmt) INTO @tactics_raw;
+            CALL strip_fences(@tactics_raw) INTO @tactics;
+            CALL make_theorem(@lean_stmt, @tactics) INTO @proof;
+            @check_code := f"print(_spl_lean.check(r'''{@proof}''')['ok'])";
+            CALL run_python(@check_code) INTO @proof_ok;
+            CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+            CALL lower(@proof_ok) INTO @proof_ok_lc;
+            @tries := @tries + 1;
+            LOGGING f"proof attempt {@tries}: by {@tactics} → {@proof_ok}" LEVEL INFO
+          ELSE
+            GENERATE repair_tactics(@lean_stmt, @tactics, @lean_feedback) INTO @tactics_raw;
+            CALL strip_fences(@tactics_raw) INTO @tactics;
+            CALL make_theorem(@lean_stmt, @tactics) INTO @proof;
+            @check_code := f"print(_spl_lean.check(r'''{@proof}''')['ok'])";
+            CALL run_python(@check_code) INTO @proof_ok;
+            CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+            CALL lower(@proof_ok) INTO @proof_ok_lc;
+            @tries := @tries + 1;
+            LOGGING f"proof repair {@tries}: by {@tactics} → {@proof_ok}" LEVEL INFO
+        END
+      END
+
+      EVALUATE @proof_ok_lc
+        WHEN = 'true' THEN
+          @badge := 'machine_proved'
+        ELSE
+          -- Lean failure never blocks delivery (§B.2): the claim keeps
+          -- its statement-checked grade, the higher badge is withheld.
+          @proof := ""
+      END
+  END
+
+  LOGGING f"badge: {@badge}" LEVEL INFO
+
+  CALL make_report(@claim, @lean_stmt, @faithful, @proof, @badge, @citation) INTO @report;
+
+  -- ── B-4: a kernel-checked outcome enters cache provenance as the
+  -- machine_proved claim badge — verifier='lean' is the engine-of-record,
+  -- and the verified statement is stored alongside the prose so the
+  -- prose↔formal correspondence stays auditable (spl3 cache show <key>).
+  @cache_key := "";
+  EVALUATE @badge
+    WHEN = 'machine_proved' THEN
+      CALL cache_put(@claim, @report, badges='machine_proved', verifier='lean', statement=@lean_stmt) INTO @cache_key;
+      LOGGING f"cache: machine_proved entry {@cache_key}" LEVEL INFO
+  END
+
+  RETURN @report WITH status = 'complete', badge = @badge;
+EXCEPTION
+  WHEN BudgetExceeded THEN
+    RETURN @report WITH status = 'budget_limit';
+END;

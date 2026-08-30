@@ -1,0 +1,144 @@
+-- Recipe Name: arXiv Morning Brief (SPL 3.0)
+-- Downloads arXiv PDFs, chunks and summarizes each paper, assembles a Markdown brief.
+--
+-- SPL 3.0 port of the SPL 3.0 recipe (cookbook-v3.0/47_arxiv_morning_brief).
+-- Two SPL 3.0 features are not available in SPL 3.0:
+--   • IMPORT 'file.spl'                  → CREATE FUNCTIONs inlined here
+--   • CALL sub_workflow(@arg) INTO @var   → summarize_paper logic inlined as nested WHILE
+-- Everything else (WHILE, :=, [], list tools, WITH OUTPUT BUDGET @var) is SPL 3.0 native.
+--
+-- Usage:
+--   spl3 run cookbook/47_arxiv_morning_brief/arxiv_morning_brief.spl \
+--       --tools cookbook/47_arxiv_morning_brief/tools.py \
+--       --adapter anthropic \
+--       urls="cookbook/47_arxiv_morning_brief/arxiv-papers.txt"
+--
+--   spl3 run cookbook/47_arxiv_morning_brief/arxiv_morning_brief.spl \
+--       --tools cookbook/47_arxiv_morning_brief/tools.py \
+--       --adapter ollama --model gemma3 \
+--       urls="https://arxiv.org/pdf/2501.12948"
+--
+--   spl3 run cookbook/47_arxiv_morning_brief/arxiv_morning_brief.spl \
+--       --tools cookbook/47_arxiv_morning_brief/tools.py \
+--       urls='["https://arxiv.org/pdf/2501.12948","https://arxiv.org/pdf/2501.09732"]' \
+--       date="2026-04-02"
+
+IMPORT 'tools'
+
+-- ── LLM function definitions ──────────────────────────────────────────────────
+-- (inlined from functions.spl; identical to the SPL 3.0 version)
+
+CREATE FUNCTION chunk_summarizer(chunk TEXT, max_tokens INT)
+RETURN TEXT
+AS $$
+You are a technical summarizer. Produce a concise summary of the following research paper section in plain English. Focus on methods and findings. Aim for {max_tokens} words or fewer.
+
+Section:
+{chunk}
+$$;
+
+CREATE FUNCTION paper_reducer(summaries TEXT)
+RETURN TEXT
+AS $$
+You are a research editor. Given the following list of section summaries from a single paper, write a concise abstract of about 150 words that captures the core contribution, method, and key results.
+
+Section summaries:
+{summaries}
+$$;
+
+CREATE FUNCTION brief_writer(header TEXT, summaries TEXT, word_count INT)
+RETURN TEXT
+AS $$
+You are a technical newsletter editor. Format the following paper abstracts into a clean Markdown morning brief. Each paper gets a ### heading and a 2-3 sentence summary. End with a "## Key Themes" section listing 2-4 recurring themes across the papers.
+
+{header}
+
+Paper abstracts:
+{summaries}
+
+Target length: approximately {word_count} words.
+$$;
+
+-- ── Main workflow ─────────────────────────────────────────────────────────────
+
+WORKFLOW arxiv_morning_brief
+    INPUT:
+        @urls         TEXT,
+        @date         TEXT DEFAULT "",
+        @brief_tokens INT  DEFAULT 1024,
+        @chunk_tokens INT  DEFAULT 512
+    OUTPUT: @brief TEXT
+DO
+    LOGGING 'arXiv Morning Brief — starting' LEVEL INFO
+
+    -- Normalise URL list: accepts JSON array / space-delimited / comma-delimited / file path
+    CALL parse_urls(@urls) INTO @urls
+    CALL build_brief_date_header(@date) INTO @header
+
+    @paper_summaries := []
+    @i := 0
+    CALL list_count(@urls) INTO @n
+    LOGGING f'Papers to process: {@n}' LEVEL INFO
+
+    -- ── Per-paper loop ───────────────────────────────────────────────────────
+    WHILE @i < @n DO
+        CALL list_get(@urls, @i + 1) INTO @url
+        LOGGING f'Paper {@i}/{@n}: {@url}' LEVEL INFO
+
+        DO
+            -- Step A: download PDF (cached, rate-limited)
+            CALL download_arxiv_pdf(@url) INTO @pdf_path
+            LOGGING f'Downloaded: {@pdf_path}' LEVEL DEBUG
+
+            -- Step B: structural chunking (header/paragraph-based, no embeddings)
+            CALL semantic_chunk_plan(@pdf_path) INTO @chunks
+            CALL list_count(@chunks) INTO @m
+            LOGGING f'Chunks: {@m}' LEVEL DEBUG
+
+            -- Step C: summarize each chunk  (inlined from summarize_paper sub-workflow)
+            @summaries := []
+            @j := 0
+            WHILE @j < @m DO
+                CALL list_get(@chunks, @j + 1) INTO @chunk
+                GENERATE chunk_summarizer(@chunk, @chunk_tokens)
+                    WITH OUTPUT BUDGET @chunk_tokens TOKENS
+                    INTO @chunk_summary
+                CALL list_append(@summaries, @chunk_summary) INTO @summaries
+                @j := @j + 1
+            END
+
+            -- Step D: reduce chunk summaries → single paper abstract
+            GENERATE paper_reducer(@summaries)
+                WITH OUTPUT BUDGET 200 TOKENS
+                INTO @paper_summary
+            LOGGING f'Abstract ({@url}): {@paper_summary}' LEVEL DEBUG
+
+            CALL list_append(@paper_summaries, @paper_summary) INTO @paper_summaries
+
+        EXCEPTION
+            WHEN ToolError THEN
+                LOGGING f'Skipping {@url}: tool/download error' LEVEL WARN
+            WHEN OTHERS THEN
+                LOGGING f'Skipping {@url}: unexpected error' LEVEL WARN
+        END
+
+        @i := @i + 1
+    END
+
+    -- ── Final brief ──────────────────────────────────────────────────────────
+    LOGGING f'All {@n} papers processed — writing brief ...' LEVEL INFO
+
+    GENERATE brief_writer(@header, @paper_summaries, @brief_tokens)
+        WITH OUTPUT BUDGET @brief_tokens TOKENS
+        INTO @brief
+
+    LOGGING 'Brief complete' LEVEL INFO
+    RETURN @brief WITH
+        status = 'complete',
+        papers = @n
+
+EXCEPTION
+    WHEN OTHERS THEN
+        LOGGING 'Brief generation failed' LEVEL WARN
+        RETURN 'Brief generation failed.' WITH status = 'error'
+END

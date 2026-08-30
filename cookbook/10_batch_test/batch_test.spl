@@ -1,0 +1,134 @@
+-- Recipe Name: Batch Test
+-- Automated testing of key cookbook recipes across multiple models.
+-- Uses parallel CTEs to fan out all recipe × model combinations at once,
+-- then generates a structured PASS/FAIL report.
+--
+-- The bash script (batch_test.sh) is kept for CI/CD and shell-based pipelines.
+--
+-- Usage:
+--   spl3 run cookbook/10_batch_test/batch_test.spl --adapter ollama
+--   spl3 run cookbook/10_batch_test/batch_test.spl --adapter ollama \
+--       model_1=gemma3 model_2=mistral
+
+CREATE FUNCTION summarize_results(
+    model_1 TEXT,
+    model_2 TEXT,
+    r1_name TEXT, r1_m1 TEXT, r1_m2 TEXT,
+    r2_name TEXT, r2_m1 TEXT, r2_m2 TEXT,
+    r3_name TEXT, r3_m1 TEXT, r3_m2 TEXT
+) RETURN TEXT
+AS $$
+
+You are a test reporter. Review the outputs below and produce a concise pass/fail report.
+
+A result is PASS if the output is a non-empty, coherent response.
+A result is FAIL if the output is empty, contains an error, or is clearly nonsensical.
+
+Models under test: {model_1}, {model_2}
+
+Recipe: {r1_name}
+  {model_1}: {r1_m1}
+  {model_2}: {r1_m2}
+
+Recipe: {r2_name}
+  {model_1}: {r2_m1}
+  {model_2}: {r2_m2}
+
+Recipe: {r3_name}
+  {model_1}: {r3_m1}
+  {model_2}: {r3_m2}
+
+Format each line as:
+  PASS  recipe_name  ({model})
+  FAIL  recipe_name  ({model})
+
+End with a summary line: "Results: X/Y passed, Z failed"
+$$;
+
+WORKFLOW batch_test
+    INPUT:
+        @model_1 TEXT DEFAULT 'gemma3',
+        @model_2 TEXT DEFAULT 'llama3.2'
+    OUTPUT: @report TEXT
+DO
+    -- Fan out all recipe × model combinations in parallel CTEs
+    WITH
+        -- Recipe 01: Hello World
+        hello_m1 AS (
+            PROMPT hello_world
+            SELECT
+                system_role('You are a helpful assistant. Say hello briefly.')
+            GENERATE greeting()
+            USING MODEL @model_1
+        ),
+        hello_m2 AS (
+            PROMPT hello_world
+            SELECT
+                system_role('You are a helpful assistant. Say hello briefly.')
+            GENERATE greeting()
+            USING MODEL @model_2
+        ),
+
+        -- Recipe 02: Ollama Proxy
+        proxy_m1 AS (
+            PROMPT ollama_proxy
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                'hello' AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_1
+        ),
+        proxy_m2 AS (
+            PROMPT ollama_proxy
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                'hello' AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_2
+        ),
+
+        -- Recipe 03: Multilingual
+        multi_m1 AS (
+            PROMPT multilingual
+            SELECT
+                system_role('You are a multilingual assistant.'),
+                'hello' AS user_input,
+                'English' AS lang
+            GENERATE response(user_input, lang)
+            USING MODEL @model_1
+        ),
+        multi_m2 AS (
+            PROMPT multilingual
+            SELECT
+                system_role('You are a multilingual assistant.'),
+                'hello' AS user_input,
+                'English' AS lang
+            GENERATE response(user_input, lang)
+            USING MODEL @model_2
+        )
+
+    SELECT
+        hello_m1.greeting  AS hello_m1,  hello_m2.greeting  AS hello_m2,
+        proxy_m1.answer    AS proxy_m1,  proxy_m2.answer    AS proxy_m2,
+        multi_m1.response  AS multi_m1,  multi_m2.response  AS multi_m2
+    INTO @hello_m1, @hello_m2,
+         @proxy_m1, @proxy_m2,
+         @multi_m1, @multi_m2
+
+    -- Generate the structured pass/fail report
+    GENERATE summarize_results(
+        @model_1, @model_2,
+        '01_hello_world/hello.spl',        @hello_m1, @hello_m2,
+        '02_ollama_proxy/proxy.spl',        @proxy_m1, @proxy_m2,
+        '03_multilingual/multilingual.spl', @multi_m1, @multi_m2
+    ) INTO @report
+
+    RETURN @report WITH
+        status  = 'complete',
+        model_1 = @model_1,
+        model_2 = @model_2
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'Batch test failed during generation.' WITH status = 'error'
+END

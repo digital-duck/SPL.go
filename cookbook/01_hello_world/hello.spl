@@ -1,0 +1,22 @@
+-- Recipe Name: Hello World
+-- Minimal SPL program — updated to support parameters and smaller models.
+/*
+SPL stands for "Structured Prompt Language" and is a declarative language to orchestrate agentic workflows, providing a way to create complex interactions with language models. It's designed to be easy to read and write, making it accessible for everyone.
+*/
+
+CREATE FUNCTION greeting(user_input TEXT := "Explain SQL", lang TEXT := "English")
+RETURNS TEXT AS $$
+
+You are an AI assistant.
+The user said: "{user_input}"
+
+Please respond in {lang}. 
+
+$$;
+
+PROMPT hello_world
+SELECT
+    system_role('You are a friendly assistant.'),
+    context.user_input AS user_input,
+    context.lang AS lang
+GENERATE greeting(user_input, lang)

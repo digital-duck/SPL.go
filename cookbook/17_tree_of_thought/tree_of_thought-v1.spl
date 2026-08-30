@@ -1,0 +1,74 @@
+-- Recipe 17: Tree of Thought
+-- Explores multiple reasoning paths in parallel, evaluates each, and selects the best.
+-- Each path is explored by a different model, maximising reasoning diversity.
+-- Demonstrates branching exploration, comparative evaluation, and path scoring.
+--
+-- Usage:
+--   spl3 run cookbook/17_tree_of_thought/tree_of_thought.spl --adapter ollama --model gemma3 problem="How should a startup prioritize between growth and profitability?"
+--   spl3 run cookbook/17_tree_of_thought/tree_of_thought.spl --adapter ollama problem="Design a caching strategy for a high-traffic API"
+--   spl3 run cookbook/17_tree_of_thought/tree_of_thought.spl --adapter ollama problem="Should we rewrite the legacy system or incrementally refactor?"
+--   spl3 run cookbook/17_tree_of_thought/tree_of_thought.spl --adapter ollama problem="..." model_a=gemma3 model_b=phi4 model_c=qwen2.5
+
+WORKFLOW tree_of_thought
+    INPUT:
+        @problem TEXT,
+        @model_a TEXT DEFAULT 'gemma3',
+        @model_b TEXT DEFAULT 'phi4',
+        @model_c TEXT DEFAULT 'qwen2.5'
+    OUTPUT: @best_solution TEXT
+DO
+    LOGGING f'Tree of thought | problem: {@problem} | models: {@model_a}, {@model_b}, {@model_c}' LEVEL INFO
+
+    -- Step 1: Generate multiple initial approaches — each model reasons independently
+    LOGGING f'Generating 3 initial approaches ({@model_a}, {@model_b}, {@model_c}) ...' LEVEL DEBUG
+    GENERATE approach_1(@problem) USING MODEL @model_a INTO @path_a
+    GENERATE approach_2(@problem) USING MODEL @model_b INTO @path_b
+    GENERATE approach_3(@problem) USING MODEL @model_c INTO @path_c
+
+    -- Step 2: Develop each approach one level deeper (same model per path)
+    LOGGING 'Developing all 3 paths ...' LEVEL DEBUG
+    GENERATE develop(@path_a, @problem) USING MODEL @model_a INTO @path_a_developed
+    GENERATE develop(@path_b, @problem) USING MODEL @model_b INTO @path_b_developed
+    GENERATE develop(@path_c, @problem) USING MODEL @model_c INTO @path_c_developed
+
+    -- Step 3: Score each path on multiple criteria
+    LOGGING 'Scoring paths ...' LEVEL DEBUG
+    GENERATE evaluate_path(@path_a_developed, @problem) INTO @score_a
+    GENERATE evaluate_path(@path_b_developed, @problem) INTO @score_b
+    GENERATE evaluate_path(@path_c_developed, @problem) INTO @score_c
+
+    -- Step 4: Select the best path
+    LOGGING f'Scores: A={@score_a} B={@score_b} C={@score_c} — selecting best ...' LEVEL INFO
+    GENERATE select_best(
+        @path_a_developed, @score_a,
+        @path_b_developed, @score_b,
+        @path_c_developed, @score_c
+    ) INTO @best_path
+
+    -- Step 5: Refine the winning path into a final solution
+    LOGGING 'Refining winning path ...' LEVEL DEBUG
+    GENERATE refine_solution(@best_path, @problem) INTO @best_solution
+
+    -- Step 6: Verify the solution holds up
+    GENERATE verify(@best_solution, @problem) INTO @verification
+    LOGGING f'Verification result: {@verification}' LEVEL INFO
+
+    EVALUATE @verification
+        WHEN 'sound' THEN
+            RETURN @best_solution WITH status = 'complete', paths_explored = 3
+        ELSE
+            -- If verification fails, combine insights from all paths
+            LOGGING 'Verification failed — synthesizing all paths' LEVEL WARN
+            GENERATE synthesize_all(
+                @path_a_developed, @path_b_developed, @path_c_developed, @problem
+            ) INTO @best_solution
+            RETURN @best_solution WITH status = 'synthesized', paths_explored = 3
+    END
+
+EXCEPTION
+    WHEN BudgetExceeded THEN
+        -- Return whatever path was scored highest so far
+        RETURN @best_path WITH status = 'budget_limit'
+    WHEN HallucinationDetected THEN
+        RETRY WITH temperature = 0.1 LIMIT 3
+END

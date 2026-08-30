@@ -1,0 +1,243 @@
+-- ============================================================
+-- Recipe 70b: Chapter 1 (complete) — Rn and Cn / Vector Space / Subspaces
+--
+-- The "whole-chapter" half of a content-cache experiment with
+-- chapter-1-vector-spaces-1A-real-complex.spl. This workflow
+-- regenerates ALL THREE sections of Axler's "Linear Algebra Done
+-- Right" (4e) Chapter 1 "Vector Spaces":
+--   1A  Rn and Cn
+--   1B  Definition of Vector Space
+--   1C  Subspaces
+--   https://linear.axler.net/
+--
+-- Run the 1A script FIRST, then run this one:
+--   1. 1A script runs alone  → cache MISS → generates, verifies,
+--      and stores section 1A under cache key content_key('1A_Rn_and_Cn', ...).
+--   2. THIS script loops over 1A, 1B, 1C. On 1A it computes the
+--      *same* cache key (identical @concept id, default params,
+--      default rubric_version) → cache HIT → reuses that section
+--      verbatim, with ZERO additional LLM calls. 1B and 1C are
+--      cache MISSes — generated, verified, and cached fresh.
+--
+-- Re-run THIS script alone afterwards and ALL THREE are cache hits.
+-- That's the point of a content-addressed (CAS) cache: verified
+-- prose is write-once and immutable, de-duplicated by (concept,
+-- params, rubric_version, dep_hashes) — not by which workflow,
+-- or in what order, asked for it.
+--
+-- Run:
+--   spl3 run cookbook/70_linalg_core_concepts/chapter-1-vector-spaces-1C-subspaces.spl \
+--       --adapter ollama --model gemma3
+-- ============================================================
+
+-- ── Deterministic regime: trimmed domain data (concept → context) ────────────
+-- Identical to the copy in chapter-1-vector-spaces-1A-real-complex.spl — see
+-- that file's header comment for why both scripts ship the same lookup table.
+
+CREATE TOOL_API section_context(concept TEXT)
+RETURNS TEXT AS PYTHON $$
+def section_context(concept: str) -> str:
+    """Deterministic lookup: concept id -> book context fed into write_section()."""
+    contexts = {
+        "1A_Rn_and_Cn": (
+            'Source: Axler, "Linear Algebra Done Right" (4e), Chapter 1 -- '
+            "Vector Spaces, Section 1A: Rn and Cn. Cover, in this order: "
+            "(1) complex numbers C as ordered pairs a + bi with addition and "
+            "multiplication defined by (a+bi)+(c+di) = (a+c)+(b+d)i and "
+            "(a+bi)(c+di) = (ac-bd)+(ad+bc)i, and the properties of complex "
+            "arithmetic (commutativity, associativity, identities, inverses, "
+            "distributive property); (2) the convention that F denotes R or C "
+            "so that results can be stated once for both; (3) lists -- an "
+            "ordered collection of n elements, length, and how lists differ "
+            "from sets; (4) Rn and Cn defined as the sets of all lists of "
+            "length n of real (resp. complex) numbers, with addition and "
+            "scalar multiplication defined componentwise."
+        ),
+        "1B_definition_of_vector_space": (
+            'Source: Axler, "Linear Algebra Done Right" (4e), Chapter 1 -- '
+            "Vector Spaces, Section 1B: Definition of Vector Space. Cover the "
+            "formal definition of a vector space V over a field F: a set V "
+            "with an addition and a scalar multiplication satisfying "
+            "commutativity, associativity, the existence of an additive "
+            "identity 0, the existence of additive inverses, a multiplicative "
+            "identity (1v = v), and the distributive properties. Note that Rn "
+            "and Cn are the motivating examples, state that the additive "
+            "identity and additive inverses are unique, and give the "
+            "scalar-zero identities 0v = 0, a0 = 0, and (-1)v = -v."
+        ),
+        "1C_subspaces": (
+            'Source: Axler, "Linear Algebra Done Right" (4e), Chapter 1 -- '
+            "Vector Spaces, Section 1C: Subspaces. Cover the definition of a "
+            "subspace U of V (a subset of V that is itself a vector space "
+            "under the addition and scalar multiplication inherited from V), "
+            "and the three-condition subspace test: U contains the additive "
+            "identity 0, U is closed under addition, and U is closed under "
+            "scalar multiplication. Note that {0} and V are always subspaces "
+            "of V, and that the intersection of any collection of subspaces "
+            "of V is itself a subspace of V."
+        ),
+    }
+    return contexts.get(concept.strip(), f"Unknown concept: {concept}")
+$$;
+
+CREATE TOOL_API section_terms(concept TEXT)
+RETURNS TEXT AS PYTHON $$
+def section_terms(concept: str) -> str:
+    """Deterministic lookup: concept id -> comma-separated terms that
+    check_terms() requires (case-insensitively) in the generated section."""
+    terms = {
+        "1A_Rn_and_Cn":
+            "complex number,Rn,Cn,list,length,addition,scalar multiplication",
+        "1B_definition_of_vector_space":
+            "vector space,additive identity,additive inverse,distributive,scalar",
+        "1C_subspaces":
+            "subspace,closed under addition,closed under scalar multiplication,additive identity",
+    }
+    return terms.get(concept.strip(), "")
+$$;
+
+-- ── Deterministic regime: coverage check (style-agnostic) ────────────────────
+
+CREATE TOOL_API check_terms(section TEXT, required_terms TEXT)
+RETURNS TEXT AS PYTHON $$
+def check_terms(section: str, required_terms: str) -> str:
+    """Verify every required term appears (case-insensitively) in the section.
+    Returns 'pass' or 'fail: missing <comma-separated terms>'."""
+    haystack = section.lower()
+    missing = [
+        term.strip() for term in required_terms.split(",")
+        if term.strip() and term.strip().lower() not in haystack
+    ]
+    if missing:
+        return "fail: missing " + ", ".join(missing)
+    return "pass"
+$$;
+
+-- ── Deterministic regime: timing instrumentation ─────────────────────────────
+-- Identical to the copy in chapter-1-vector-spaces-1A-real-complex.spl — see
+-- that file's header comment for why both scripts ship the same lookup table;
+-- the same reasoning applies here (so timing numbers are directly comparable
+-- across scripts and, later, across distributed-compute runs on Momagrid).
+
+CREATE TOOL_API now_ms()
+RETURNS TEXT AS PYTHON $$
+def now_ms() -> str:
+    """Current wall-clock time as an epoch-millisecond TEXT timestamp."""
+    import time
+    return str(int(time.time() * 1000))
+$$;
+
+CREATE TOOL_API elapsed_ms(start_ms TEXT)
+RETURNS TEXT AS PYTHON $$
+def elapsed_ms(start_ms: str) -> str:
+    """Milliseconds elapsed since start_ms (an epoch-ms TEXT from now_ms())."""
+    import time
+    return str(int(time.time() * 1000) - int(start_ms))
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────────────────────
+
+CREATE FUNCTION write_section(concept TEXT, book_context TEXT)
+RETURN TEXT
+AS $$
+You are an expert linear algebra author writing one self-contained section of
+a concept-book that follows Sheldon Axler's "Linear Algebra Done Right" (4e).
+
+{book_context}
+
+Write a 250-350 word section that:
+1. States the key definitions precisely, using LaTeX for all mathematics
+   (e.g. $\\mathbf{{F}}$, $\\mathbb{{R}}^n$, $a + bi$).
+2. Includes exactly one short worked example illustrating the central idea.
+3. Ends with a single sentence on why this material matters for what follows.
+
+Output only the section text — no chapter/section numbers, no preamble, no
+closing commentary.
+$$;
+
+CREATE FUNCTION refine_section(section TEXT, feedback TEXT)
+RETURN TEXT
+AS $$
+Revise the section below so that it satisfies the feedback exactly. Keep every
+correct sentence unchanged; touch only what the feedback flags as missing.
+
+SECTION:
+{section}
+
+FEEDBACK:
+{feedback}
+
+Output the revised section only. No preamble. No commentary.
+$$;
+
+CREATE FUNCTION write_chapter_intro(sections TEXT)
+RETURN TEXT
+AS $$
+Write a single short paragraph (2-3 sentences) introducing a concept-book
+chapter titled "Vector Spaces", covering these sections in order: {sections}.
+Mention that the chapter builds from concrete examples (Rn, Cn) up to the
+abstract definition of a vector space and its subspaces. No headers, no
+bullet points — just the paragraph.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────────────────────
+
+WORKFLOW chapter1_complete
+  INPUT @sections TEXT := '1A_Rn_and_Cn,1B_definition_of_vector_space,1C_subspaces'
+  OUTPUT @chapter TEXT
+DO
+  CALL now_ms() INTO @t_workflow_start
+
+  GENERATE write_chapter_intro(@sections) INTO @intro
+  @chapter := '# Chapter 1 — Vector Spaces\n\n' + @intro + '\n\n';
+
+  -- Native LIST iteration: splits @sections by comma automatically
+  WHILE @concept IN @sections DO
+    CALL section_context(@concept) INTO @book_context
+    CALL section_terms(@concept) INTO @required_terms
+
+    -- ── Content cache lookup — same (concept, params, rubric_version) recipe
+    -- as the 1A script, so '1A_Rn_and_Cn' resolves to the SAME cache key here.
+    CALL now_ms() INTO @t_section_start
+    CALL cache_get(@concept) INTO @section
+
+    EVALUATE @section
+      WHEN = 'miss' THEN
+        LOGGING f'cache MISS for {@concept} — generating with the LLM' LEVEL INFO
+
+        GENERATE write_section(@concept, @book_context) INTO @section
+
+        CALL check_terms(@section, @required_terms) INTO @check
+        EVALUATE @check
+          WHEN contains('fail') THEN
+            LOGGING f'Coverage check failed: {@check} — refining' LEVEL INFO
+            GENERATE refine_section(@section, @check) INTO @section
+          ELSE
+            LOGGING 'Coverage check passed' LEVEL INFO
+        END
+
+        CALL cache_put(@concept, @section) INTO @cache_key
+        LOGGING f'Stored verified section — cache key {@cache_key}' LEVEL INFO
+
+        CALL elapsed_ms(@t_section_start) INTO @section_ms
+        LOGGING f'[timing] {@concept}: {@section_ms} ms (generated)' LEVEL INFO
+      ELSE
+        LOGGING f'cache HIT for {@concept} — reusing verified section (0 LLM calls, 0 refine passes)' LEVEL INFO
+
+        CALL elapsed_ms(@t_section_start) INTO @section_ms
+        LOGGING f'[timing] {@concept}: {@section_ms} ms (cached)' LEVEL INFO
+    END
+
+    @chapter := @chapter
+             + '\n\n---\n\n## ' + @concept + '\n\n'
+             + @section
+  END
+
+  CALL elapsed_ms(@t_workflow_start) INTO @total_ms
+  LOGGING f'[timing] workflow total: {@total_ms} ms' LEVEL INFO
+
+  RETURN @chapter WITH status = 'complete'
+EXCEPTION
+  WHEN BudgetExceeded THEN
+    RETURN @chapter WITH status = 'budget_limit'
+END;

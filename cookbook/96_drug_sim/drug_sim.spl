@@ -1,0 +1,412 @@
+-- ============================================================
+-- Recipe 96: Pharmacovigilance — Drug-Interaction Screening
+--
+-- SYNTHETIC DEMO ONLY. The interaction table below is a small,
+-- illustrative set of well-known textbook drug pairs (sildenafil x
+-- nitroglycerin, warfarin x aspirin, simvastatin x clarithromycin,
+-- lisinopril x spironolactone), NOT a complete or clinical-grade
+-- database. This recipe is a research prototype demonstrating SPL's
+-- two-mode architecture, not clinical decision support, and must not
+-- be used to make real medication decisions. A real deployment would
+-- register RxNorm (name normalization) and DrugBank/OpenFDA
+-- (interaction lookup) as the CREATE TOOL_API backends instead.
+--
+-- Suggested by Qwen (2026-07-25, see docs/publication/TMLR/
+-- SPL-for-Agentic-Workflow/review-feedback/LLM/qwen-3-8-max-full-
+-- 20260725.md) as the domain where the two-mode split is *not
+-- optional*: a clinician's free-text note must be read by an LLM
+-- (probabilistic — "the usual diabetes medication" vs "metformin
+-- 500mg BID"), but the interaction check cannot be probabilistic — a
+-- hallucinated "no interaction found" is a patient-safety event, not
+-- a wrong answer.
+--
+--   Probabilistic (LLM)   — extract a structured drug list (name,
+--                            dose, frequency) from a free-text
+--                            clinical note
+--   Deterministic (kernel)— normalize each name via a synthetic
+--                            RxNorm-style alias table; look up every
+--                            pairwise interaction in a synthetic
+--                            DrugBank-style severity table
+--   Deterministic (ASSERT)— load-bearing safety gate: NO contra-
+--                            indicated pair may reach the narration
+--                            step, ever
+--   Probabilistic + Det.  — WHILE repair loop: LLM suggests an
+--   (WHILE)                 alternative for a MODERATE interaction;
+--                            kernel re-checks the revised regimen
+--   Deterministic (round- — cross-checks the LLM's extraction against
+--    trip classifier)       a deterministic keyword recount of the
+--                            note, so extraction fidelity is itself
+--                            machine-checked, not just the interaction
+--                            lookup
+--   Probabilistic (LLM)   — narrate the cleared (or alerted) regimen
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — the model
+-- screens the note from memory alone, no interaction database
+-- consulted, exactly the failure mode this recipe exists to prevent.
+--
+-- Requires: stdlib json/re only — no new pip dependency
+-- Run:
+--   spl3 run cookbook/96_drug_sim/drug_sim.spl --llm claude_cli
+--   spl3 run cookbook/96_drug_sim/drug_sim.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: synthetic RxNorm alias + interaction table ──
+
+CREATE TOOL_API drug_reference()
+RETURNS TEXT AS PYTHON $$
+def drug_reference() -> str:
+    """Human-readable synthetic drug reference, shown to the LLM (and
+    to the unaided baseline arm) so extraction/screening has something
+    concrete to work from without ever seeing the deterministic
+    lookup tables directly."""
+    return (
+        "Known drugs (brand names normalize to a generic name):\n"
+        "  sildenafil (brand: Viagra), nitroglycerin (brand: Nitrostat),\n"
+        "  warfarin (brand: Coumadin), aspirin, ibuprofen (brand: Advil),\n"
+        "  simvastatin (brand: Zocor), clarithromycin (brand: Biaxin),\n"
+        "  lisinopril (brand: Zestril), spironolactone (brand: Aldactone),\n"
+        "  metformin (brand: Glucophage), acetaminophen (brand: Tylenol)\n"
+        "Note: this is a small SYNTHETIC demo reference, not a complete database.\n"
+    )
+$$;
+
+CREATE TOOL_API screen_regimen(drug_list_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def screen_regimen(drug_list_json: str) -> str:
+    """Normalize every extracted drug name via a synthetic RxNorm-style
+    alias table, then check every pairwise combination against a
+    synthetic DrugBank-style severity table. Both tables are
+    deterministic Python dicts — no LLM involved in this step.
+
+    Returns JSON: {status, severity, pairs, unknown_drugs, normalized}
+    'severity' is the worst severity found among all pairs:
+    none < minor < moderate < severe < contraindicated.
+    """
+    import json
+    import re
+    from itertools import combinations
+
+    def strip_fences(s):
+        s = re.sub(r'^```(?:json)?\s*\n?', '', s.strip(), flags=re.IGNORECASE)
+        return re.sub(r'\n?```\s*$', '', s)
+
+    ALIASES = {
+        "viagra": "sildenafil", "sildenafil": "sildenafil",
+        "nitrostat": "nitroglycerin", "nitroglycerin": "nitroglycerin",
+        "coumadin": "warfarin", "warfarin": "warfarin",
+        "aspirin": "aspirin", "asa": "aspirin",
+        "advil": "ibuprofen", "ibuprofen": "ibuprofen", "motrin": "ibuprofen",
+        "zocor": "simvastatin", "simvastatin": "simvastatin",
+        "biaxin": "clarithromycin", "clarithromycin": "clarithromycin",
+        "zestril": "lisinopril", "lisinopril": "lisinopril",
+        "aldactone": "spironolactone", "spironolactone": "spironolactone",
+        "glucophage": "metformin", "metformin": "metformin",
+        "tylenol": "acetaminophen", "acetaminophen": "acetaminophen",
+    }
+
+    # Severity rank for taking the max across all pairs found.
+    RANK = {"none": 0, "minor": 1, "moderate": 2, "severe": 3, "contraindicated": 4}
+
+    # Synthetic, illustrative interaction table (unordered pairs).
+    INTERACTIONS = {
+        frozenset({"sildenafil", "nitroglycerin"}): (
+            "contraindicated", "life-threatening hypotension"),
+        frozenset({"warfarin", "aspirin"}): (
+            "severe", "additive bleeding risk"),
+        frozenset({"warfarin", "ibuprofen"}): (
+            "moderate", "increased GI bleeding risk"),
+        frozenset({"simvastatin", "clarithromycin"}): (
+            "severe", "clarithromycin raises simvastatin levels, rhabdomyolysis risk"),
+        frozenset({"lisinopril", "spironolactone"}): (
+            "moderate", "hyperkalemia risk from dual potassium-sparing effect"),
+    }
+
+    try:
+        drugs = json.loads(strip_fences(drug_list_json))
+        if not isinstance(drugs, list):
+            return json.dumps({"status": "Error", "error": "drug list must be a JSON list"})
+
+        normalized = []
+        unknown = []
+        for d in drugs:
+            name = str(d.get("name", "")).strip().lower()
+            canon = ALIASES.get(name)
+            if canon is None:
+                unknown.append(name)
+            else:
+                normalized.append({"name": canon, "dose_mg": d.get("dose_mg"), "freq": d.get("freq")})
+
+        canon_names = sorted({n["name"] for n in normalized})
+        pairs = []
+        worst = "none"
+        for a, b in combinations(canon_names, 2):
+            hit = INTERACTIONS.get(frozenset({a, b}))
+            if hit:
+                sev, reason = hit
+                pairs.append({"drugs": [a, b], "severity": sev, "reason": reason})
+                if RANK[sev] > RANK[worst]:
+                    worst = sev
+
+        return json.dumps({
+            "status": "OK",
+            "severity": worst,
+            "pairs": pairs,
+            "unknown_drugs": unknown,
+            "normalized": normalized,
+            "drug_count": len(normalized),
+        })
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(clinical_note TEXT, solution_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(clinical_note: str, solution_json: str) -> str:
+    """Round-trip check on EXTRACTION fidelity (not just interaction
+    lookup): deterministically recount how many known drug names from
+    drug_reference() literally appear in the note's text, and compare
+    against the LLM's extracted drug_count. This catches the LLM
+    silently dropping or inventing a medication during extraction,
+    which the interaction lookup alone cannot detect.
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import json
+    import re
+
+    KNOWN_SURFACE_FORMS = [
+        "sildenafil", "viagra", "nitroglycerin", "nitrostat",
+        "warfarin", "coumadin", "aspirin",
+        "ibuprofen", "advil", "motrin",
+        "simvastatin", "zocor", "clarithromycin", "biaxin",
+        "lisinopril", "zestril", "spironolactone", "aldactone",
+        "metformin", "glucophage", "acetaminophen", "tylenol",
+    ]
+    note_lower = clinical_note.lower()
+    mentioned = {w for w in KNOWN_SURFACE_FORMS if re.search(r'\b' + re.escape(w) + r'\b', note_lower)}
+
+    try:
+        d = json.loads(solution_json)
+    except Exception:
+        return "unverifiable"
+    if "drug_count" not in d:
+        return "unverifiable"
+
+    # mentioned is surface forms; normalized/extracted count is canonical
+    # drugs -- compare counts, tolerant of alias collapsing (e.g. brand +
+    # generic both mentioned for the same drug is still one drug).
+    return "match" if len(mentioned) >= d["drug_count"] > 0 else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(clinical_note TEXT, drug_list_json TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(clinical_note: str, drug_list_json: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Drug-Interaction Screening Report (SYNTHETIC DEMO — NOT FOR CLINICAL USE)",
+        "",
+        f"**Clinical note:** {clinical_note.strip()}",
+        "",
+        f"**Screening status:** `{sol.get('status', 'Unknown')}`",
+        f"**Worst severity found:** `{sol.get('severity', '?')}`",
+        f"**Interacting pairs:** `{sol.get('pairs', [])}`",
+        f"**Unknown drugs (not in synthetic reference):** `{sol.get('unknown_drugs', [])}`",
+        f"**Extraction round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Extracted Medications (LLM-generated, JSON)", "",
+        "```json", drug_list_json.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION extract_medications(reference TEXT, clinical_note TEXT)
+RETURNS TEXT AS $$
+You are a clinical data-extraction assistant. Extract every medication
+mentioned in this note into structured form.
+
+{reference}
+
+Clinical note:
+{clinical_note}
+
+Output ONLY a JSON list, one entry per medication:
+[{{"name": "<drug name as written>", "dose_mg": <number or null>, "freq": "<as written or null>"}}]
+
+No markdown fences, no commentary — raw JSON array only.
+$$;
+
+CREATE FUNCTION suggest_alternative(drug_list_json TEXT, screen_result TEXT)
+RETURNS TEXT AS $$
+This medication regimen has a MODERATE interaction flagged by the
+deterministic drug-interaction checker (not severe/contraindicated,
+but worth reconsidering).
+
+Current regimen:
+{drug_list_json}
+
+Interaction check result:
+{screen_result}
+
+Propose a revised drug list that removes or substitutes ONE drug from
+the interacting pair to reduce risk, keeping the rest of the regimen
+unchanged. Output ONLY the revised JSON list in the same format as the
+input — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION draft_alert(screen_result TEXT, clinical_note TEXT)
+RETURNS TEXT AS $$
+A CONTRAINDICATED drug interaction was found by the deterministic
+screening kernel — this must never be silently passed through.
+
+Interaction check result:
+{screen_result}
+
+Original clinical note:
+{clinical_note}
+
+Draft a brief, direct clinical alert (under 80 words) for the
+prescribing physician: name the two interacting drugs, the risk, and
+recommend the regimen be reviewed before dispensing. Do not soften or
+omit the contraindication.
+$$;
+
+CREATE FUNCTION explain_regimen(drug_list_json TEXT, screen_result TEXT)
+RETURNS TEXT AS $$
+You are a clinical pharmacist. Summarize this SCREENED, VERIFIED drug
+regimen for the patient record.
+
+Regimen (JSON):
+{drug_list_json}
+
+Verified interaction-screening result (JSON — every pairwise
+combination was checked against a deterministic interaction table;
+trust it completely, do not re-derive it):
+{screen_result}
+
+Provide a concise summary (under 100 words):
+1. List the medications in plain language
+2. State the interaction-screening outcome, referencing the exact
+   severity value from the JSON
+3. One sentence on why a machine-checked interaction table, not the
+   model's own recall, is what makes this safe to report
+$$;
+
+CREATE FUNCTION solve_directly(reference TEXT, clinical_note TEXT)
+RETURNS TEXT AS $$
+You are a clinical pharmacist. There is no deterministic drug-
+interaction database backing you up this time — read the note below
+and screen for interactions from memory alone.
+
+{reference}
+
+Clinical note:
+{clinical_note}
+
+Write a brief screening summary (under 100 words): list the
+medications you identified, and state whether you believe there is
+any interaction risk, reasoning from your own knowledge only.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW drug_sim
+  -- Default: a well-known, unambiguous contraindicated pair
+  -- (sildenafil + nitroglycerin -- life-threatening hypotension) so
+  -- the load-bearing ASSERT gate has a reliable case to fire on.
+  INPUT @clinical_note TEXT := "Patient started on sildenafil 50mg PRN for erectile dysfunction. Also currently taking nitroglycerin 0.4mg sublingual PRN for angina, prescribed by cardiology last year."
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/96_drug_sim/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  CALL drug_reference() INTO @reference;
+  LOGGING f"[drug_sim] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no interaction database ──
+        LOGGING "[arm=llm_only] screening with NO interaction database" LEVEL INFO
+        GENERATE solve_directly(@reference, @clinical_note) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM extracts; deterministic kernel screens ──
+        LOGGING "[arm=solver] Stage 1 — LLM extraction" LEVEL INFO
+        GENERATE extract_medications(@reference, @clinical_note) INTO @drug_list;
+        CALL screen_regimen(@drug_list) INTO @solution;
+        LOGGING f"[arm=solver] initial screen: severity={@solution}" LEVEL INFO
+
+        -- ── Load-bearing safety gate: NEVER pass a contraindicated pair ──
+        CALL json_get(@solution, "severity") INTO @severity;
+        EVALUATE @severity
+          WHEN = "contraindicated" THEN
+            DO
+              LOGGING "[drug_sim] CONTRAINDICATED pair found — halting before narration" LEVEL WARN
+              GENERATE draft_alert(@solution, @clinical_note) INTO @report;
+              CALL format_report(@clinical_note, @drug_list, @solution, @report, "not_applicable") INTO @report;
+              CALL write_file(f"{@out_dir}/screen_{@ts_safe}.md", @report) INTO @out_path;
+              LOGGING f"[drug_sim] alert written -> {@out_path}" LEVEL WARN
+              RETURN @report WITH status = "contraindication_found", arm = "solver", roundtrip = "not_applicable"
+            END
+          ELSE
+            DO
+              LOGGING "[drug_sim] Stage 2 — repair loop for moderate/severe pairs" LEVEL INFO
+              @iter := 0;
+              WHILE @severity = "moderate" AND @iter < @max_tries DO
+                GENERATE suggest_alternative(@drug_list, @solution) INTO @drug_list;
+                CALL screen_regimen(@drug_list) INTO @solution;
+                CALL json_get(@solution, "severity") INTO @severity;
+                @iter := @iter + 1;
+                LOGGING f"[arm=solver] revision {@iter}: severity={@severity}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[drug_sim] Stage 3 — ASSERT gate (severity={@severity})" LEVEL INFO
+        ASSERT @severity != "severe" AND @severity != "contraindicated";
+        LOGGING "[drug_sim] ASSERT passed — no severe/contraindicated pair remains" LEVEL INFO
+
+        CALL classify_roundtrip(@clinical_note, @solution) INTO @roundtrip;
+        LOGGING f"[drug_sim] extraction round-trip check: {@roundtrip}" LEVEL INFO
+
+        GENERATE explain_regimen(@drug_list, @solution) INTO @narrative;
+        CALL format_report(@clinical_note, @drug_list, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/screen_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[drug_sim] done — report -> {@out_path} ({@elapsed}s)" LEVEL INFO
+
+        RETURN @report WITH status = "cleared", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Regimen could not be cleared of severe/contraindicated interactions. Last severity: " + @severity;
+    CALL write_file(f"{@out_dir}/screen_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[drug_sim] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

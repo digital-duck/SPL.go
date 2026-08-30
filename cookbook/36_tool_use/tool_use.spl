@@ -1,0 +1,50 @@
+-- Recipe Name: Tool-Use / Function-Call
+-- Demonstrates registering Python functions as CALL-able tools in SPL 3.0.
+--
+-- Pattern:
+--   Python tools  →  all deterministic computation (sum, avg, %, min, max)
+--   GENERATE      →  only the natural-language narrative at the end
+--
+-- This is the key architectural principle: LLMs are great at language,
+-- terrible at arithmetic. Keep them in their lane.
+--
+-- Usage:
+--   spl3 run cookbook/36_tool_use/tool_use.spl \
+--       --adapter ollama \
+--       --tools cookbook/36_tool_use/tools.py \
+--       sales="1200,1450,1380,1600,1750,1900" \
+--       prev_total="7800" \
+--       period="H1 2025"
+--
+-- Tool dispatch priority in CALL:
+--   1. Python tool (registered via --tools)   ← used here for all math
+--   2. SPL PROCEDURE
+--   3. LLM fallback (last resort — avoid)
+
+WORKFLOW sales_analysis
+  INPUT:
+    @sales     TEXT DEFAULT '1200,1450,1380,1600,1750,1900',
+    @prev_total TEXT DEFAULT '7800',
+    @period    TEXT DEFAULT 'H1 2025'
+  OUTPUT: @report TEXT
+DO
+  -- All math delegated to Python tools — deterministic, instant, zero tokens
+  CALL sum_values(@sales)            INTO @total
+  CALL average_values(@sales)        INTO @avg
+  CALL min_value(@sales)             INTO @low
+  CALL max_value(@sales)             INTO @high
+  CALL percentage_change(@prev_total, @total) INTO @growth
+  CALL format_currency(@total)       INTO @total_fmt
+  CALL format_currency(@avg)         INTO @avg_fmt
+
+  -- Only the narrative goes to the LLM
+  GENERATE sales_report(@period, @sales, @total_fmt, @avg_fmt, @low, @high, @growth) 
+    INTO @report
+
+  RETURN @report WITH status = 'complete'
+
+EXCEPTION
+  WHEN OTHERS THEN
+    GENERATE error_summary(@period) INTO @report
+    RETURN @report WITH status = 'error'
+END

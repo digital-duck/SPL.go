@@ -1,0 +1,365 @@
+-- ============================================================
+-- Recipe 84: SQL Verifier — LLM writes SQL, SQLite proves it
+--
+-- Extends the verifier ladder with a shape distinct from the other
+-- rungs: instead of comparing the LLM's prose answer to a solver's
+-- output, this recipe runs the LLM's OWN generated SQL against a
+-- real SQLite database and row-level diffs the result set against
+-- an independently-written ground-truth query over the SAME seeded
+-- data. "Run it and check the rows" is about as legible a round-trip
+-- story as this pattern gets — no numeric-string parsing needed, the
+-- deterministic tool diffs structured rows directly.
+--
+--   Probabilistic (LLM)   — read the natural-language question and
+--                            write a SQL SELECT statement
+--   Deterministic (SQLite)— stdlib sqlite3 executes BOTH the LLM's
+--                            SQL and a pre-registered ground-truth
+--                            SQL against the same in-memory database
+--   Deterministic (diff)  — row-level, order-insensitive diff between
+--                            the two result sets (classify_from_value
+--                            style: 'match' / 'mismatch' / 'error')
+--   Deterministic (ASSERT)— formal gate: only continue when the LLM's
+--                            SQL executed without error
+--   Probabilistic (LLM)   — narrate the result in plain English
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — the model
+-- answers the natural-language question from the printed schema/rows
+-- alone, with no SQL execution at all (this is where LLMs silently
+-- miscount rows or misread a JOIN in their head).
+--
+-- Requires: stdlib sqlite3 only — no new pip dependency
+-- Run:
+--   spl3 run cookbook/84_sql_verifier/sql_verifier.spl --llm claude_cli
+--   spl3 run cookbook/84_sql_verifier/sql_verifier.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: seeded SQLite database + SQL execution ──
+
+CREATE TOOL_API schema_description()
+RETURNS TEXT AS PYTHON $$
+def schema_description() -> str:
+    """Human-readable schema + sample rows, shown to the LLM (and to the
+    unaided baseline arm) so it can write/reason about SQL without ever
+    seeing the live database connection."""
+    return (
+        "Table: employees(id INTEGER, name TEXT, department TEXT, "
+        "salary REAL, hire_year INTEGER)\n"
+        "Rows:\n"
+        "  1, Alice, Engineering, 95000, 2019\n"
+        "  2, Bob,   Engineering, 87000, 2021\n"
+        "  3, Carol, Sales,       72000, 2018\n"
+        "  4, Dave,  Sales,       68000, 2022\n"
+        "  5, Eve,   Marketing,   77000, 2020\n"
+        "  6, Frank, Engineering, 110000, 2016"
+    )
+$$;
+
+CREATE TOOL_API run_sql(sql TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_sql(sql: str) -> str:
+    """Execute LLM-generated SQL against a freshly-seeded in-memory
+    SQLite database and return a JSON result dict. The LLM writes the
+    SQL; this function is the deterministic oracle — every call gets an
+    identically-seeded database so results are reproducible.
+
+    Returns {"status": "OK", "columns": [...], "rows": [[...], ...]}
+    On any error returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json
+    import re
+    import sqlite3
+
+    sql = re.sub(r'^```(?:sql)?\s*\n?', '', sql.strip(), flags=re.IGNORECASE)
+    sql = re.sub(r'\n?```\s*$', '', sql)
+
+    seed = [
+        (1, "Alice", "Engineering", 95000.0, 2019),
+        (2, "Bob",   "Engineering", 87000.0, 2021),
+        (3, "Carol", "Sales",       72000.0, 2018),
+        (4, "Dave",  "Sales",       68000.0, 2022),
+        (5, "Eve",   "Marketing",   77000.0, 2020),
+        (6, "Frank", "Engineering", 110000.0, 2016),
+    ]
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            "CREATE TABLE employees ("
+            "id INTEGER PRIMARY KEY, name TEXT, department TEXT, "
+            "salary REAL, hire_year INTEGER);"
+        )
+        conn.executemany("INSERT INTO employees VALUES (?,?,?,?,?)", seed)
+        conn.commit()
+        cur = conn.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        return json.dumps({"status": "OK", "columns": cols, "rows": rows})
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+    finally:
+        conn.close()
+$$;
+
+CREATE TOOL_API ground_truth_result(ground_truth_sql TEXT)
+RETURNS TEXT AS PYTHON $$
+def ground_truth_result(ground_truth_sql: str) -> str:
+    """Run the human-authored, KNOWN-CORRECT SQL for this recipe's default
+    question against the identically-seeded database. This is the
+    reference the LLM's own SQL is diffed against — never written by
+    the LLM itself."""
+    import json
+    import sqlite3
+
+    seed = [
+        (1, "Alice", "Engineering", 95000.0, 2019),
+        (2, "Bob",   "Engineering", 87000.0, 2021),
+        (3, "Carol", "Sales",       72000.0, 2018),
+        (4, "Dave",  "Sales",       68000.0, 2022),
+        (5, "Eve",   "Marketing",   77000.0, 2020),
+        (6, "Frank", "Engineering", 110000.0, 2016),
+    ]
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            "CREATE TABLE employees ("
+            "id INTEGER PRIMARY KEY, name TEXT, department TEXT, "
+            "salary REAL, hire_year INTEGER);"
+        )
+        conn.executemany("INSERT INTO employees VALUES (?,?,?,?,?)", seed)
+        conn.commit()
+        cur = conn.execute(ground_truth_sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        return json.dumps({"status": "OK", "columns": cols, "rows": rows})
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+    finally:
+        conn.close()
+$$;
+
+CREATE TOOL_API classify_roundtrip(llm_result_json TEXT, truth_result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(llm_result_json: str, truth_result_json: str) -> str:
+    """Row-level, order-insensitive diff between the LLM's SQL result and
+    the ground-truth SQL result over the identically-seeded database.
+    Floats are rounded to 2dp before comparison to absorb harmless
+    floating-point noise. Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import json
+    try:
+        llm = json.loads(llm_result_json)
+        truth = json.loads(truth_result_json)
+    except Exception:
+        return "unverifiable"
+    if llm.get("status") != "OK" or truth.get("status") != "OK":
+        return "unverifiable"
+
+    def _norm(rows):
+        out = []
+        for r in rows:
+            norm_r = []
+            for v in r:
+                if isinstance(v, float):
+                    norm_r.append(round(v, 2))
+                else:
+                    norm_r.append(v)
+            out.append(tuple(norm_r))
+        return sorted(out, key=lambda t: str(t))
+
+    a = _norm(llm.get("rows", []))
+    b = _norm(truth.get("rows", []))
+    return "match" if a == b else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(question TEXT, llm_sql TEXT, llm_result_json TEXT,
+                              truth_result_json TEXT, narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(question: str, llm_sql: str, llm_result_json: str,
+                  truth_result_json: str, narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        llm_r = json.loads(llm_result_json)
+    except Exception:
+        llm_r = {}
+    try:
+        truth_r = json.loads(truth_result_json)
+    except Exception:
+        truth_r = {}
+    lines = [
+        "# Text-to-SQL Verification Report",
+        "",
+        f"**Question:** {question.strip()}",
+        "",
+        f"**LLM SQL result:** `{llm_r.get('rows', '?')}`",
+        f"**Ground-truth result:** `{truth_r.get('rows', '?')}`",
+        f"**Round-trip check (row diff):** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## LLM-generated SQL", "",
+        "```sql", llm_sql.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_sql(question TEXT, schema TEXT)
+RETURNS TEXT AS $$
+You are a SQL expert. Write ONE SQLite SELECT statement that answers this
+question, using EXACTLY this schema (no other tables or columns exist):
+
+{schema}
+
+Question: {question}
+
+Rules:
+- Output ONLY the raw SQL statement — no markdown fences, no commentary,
+  no trailing explanation
+- Use only the table/columns given above
+- End the statement with a semicolon
+$$;
+
+CREATE FUNCTION repair_sql(question TEXT, schema TEXT, sql TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This SQLite statement produced an error.
+
+Schema:
+{schema}
+
+Question: {question}
+
+Previous SQL:
+{sql}
+
+Error:
+{error_info}
+
+Fix the SQL. Common causes: unknown column name, unknown table name,
+syntax error, wrong aggregate/GROUP BY usage.
+
+Output ONLY the corrected SQL statement — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_sql_result(question TEXT, llm_result_json TEXT)
+RETURNS TEXT AS $$
+You are a data analyst. Interpret this VERIFIED SQL query result for a
+general audience.
+
+Question: {question}
+
+Verified result (JSON — the SQL actually ran against the real database;
+trust these rows completely):
+{llm_result_json}
+
+Provide a concise interpretation (under 80 words) stating the answer to
+the question, referencing the actual row values from the JSON. No
+speculation beyond what the rows show.
+$$;
+
+CREATE FUNCTION solve_directly(question TEXT, schema TEXT)
+RETURNS TEXT AS $$
+Answer this question about the following data, WITHOUT writing or running
+any SQL — reason about the rows yourself, from scratch, in plain English.
+
+{schema}
+
+Question: {question}
+
+Write a clear walkthrough in under 8 sentences that shows your reasoning
+over the rows above and gives the final answer plainly.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW sql_verifier
+  -- Default question has a known, hand-countable ground truth: the
+  -- average Engineering salary is (95000+87000+110000)/3 = 97333.33.
+  INPUT @question TEXT := "What is the average salary in the Engineering department?"
+  INPUT @ground_truth_sql TEXT := "SELECT AVG(salary) AS avg_salary FROM employees WHERE department = 'Engineering';"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/84_sql_verifier/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  CALL schema_description() INTO @schema;
+  LOGGING f"[sql_verifier] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no SQL execution at all ──
+        LOGGING "[arm=llm_only] answering from printed rows, NO SQL execution" LEVEL INFO
+        GENERATE solve_directly(@question, @schema) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM writes SQL; SQLite executes it; row-diff vs ground truth ──
+        LOGGING "[arm=solver] Stage 1 — LLM SQL generation + execution" LEVEL INFO
+        @tries      := 0;
+        @status     := "init";
+        @llm_sql    := "";
+        @llm_result := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_sql(@question, @schema) INTO @llm_sql;
+                CALL run_sql(@llm_sql) INTO @llm_result;
+                CALL result_status(@llm_result) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@llm_result) INTO @error_info;
+                GENERATE repair_sql(@question, @schema, @llm_sql, @error_info) INTO @llm_sql;
+                CALL run_sql(@llm_sql) INTO @llm_result;
+                CALL result_status(@llm_result) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[sql_verifier] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@llm_result);
+        LOGGING "[sql_verifier] ASSERT passed — LLM's SQL executed cleanly" LEVEL INFO
+
+        -- Row-level diff against the independently-authored ground truth.
+        CALL ground_truth_result(@ground_truth_sql) INTO @truth_result;
+        CALL classify_roundtrip(@llm_result, @truth_result) INTO @roundtrip;
+        LOGGING f"[sql_verifier] round-trip row diff: {@roundtrip}" LEVEL INFO
+
+        GENERATE interpret_sql_result(@question, @llm_result) INTO @narrative;
+        CALL format_report(@question, @llm_sql, @llm_result, @truth_result, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/sql_verifier_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[sql_verifier] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "LLM SQL did not execute cleanly after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/sql_verifier_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[sql_verifier] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

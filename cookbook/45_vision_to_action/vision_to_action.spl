@@ -1,0 +1,62 @@
+-- Recipe 45: Vision to Action
+-- Demonstrates handling image metadata or OCR text as INPUT to drive a decision tree.
+-- An LLM classifies the described scene; deterministic EVALUATE branches to the
+-- appropriate action with no further LLM cost.
+--
+-- Note: uses TEXT as a stand-in for the IMAGE type coming in SPL v3.0.
+--
+-- Usage:
+--   spl3 run cookbook/45_vision_to_action/vision_to_action.spl \
+--       --adapter ollama \
+--       image_description="Image shows a package being delivered to the front door."
+
+CREATE FUNCTION classify(image_description TEXT)
+RETURN TEXT
+AS $$
+You are a security analyst reviewing surveillance footage.
+Classify the activity described below into exactly one of: DELIVERY, INTRUSION, or IGNORE.
+
+Definitions:
+- DELIVERY: a known courier or person leaving an item at the door
+- INTRUSION: unauthorized entry or suspicious loitering near entry points
+- IGNORE: routine activity (walking past, cars, wildlife, etc.)
+
+Reply with only the classification word — nothing else.
+
+Image description: {image_description}
+$$;
+
+WORKFLOW vision_to_action
+    INPUT: @image_description TEXT DEFAULT 'Image shows a package being delivered to the front door.'
+    OUTPUT: @action_taken TEXT
+DO
+    LOGGING f'Analyzing image: {@image_description}' LEVEL INFO
+
+    -- Step 1: Classify image content (LLM — one call, bounded output)
+    GENERATE classify(@image_description) INTO @scene_label
+    LOGGING f'Classification: {@scene_label}' LEVEL DEBUG
+
+    -- Step 2: Decision tree (deterministic — no LLM cost)
+    -- Use contains() because LLM may add whitespace or punctuation
+    EVALUATE @scene_label
+        WHEN contains('INTRUSION') THEN
+            LOGGING 'Intrusion detected — sounding alarm and alerting authorities' LEVEL WARN
+            @action_taken := 'SOUND_ALARM_CALL_POLICE'
+        WHEN contains('DELIVERY') THEN
+            LOGGING 'Delivery detected — notifying homeowner' LEVEL INFO
+            @action_taken := 'NOTIFY_HOMEOWNER_DELIVERY'
+        ELSE
+            LOGGING 'Routine activity — no action required' LEVEL DEBUG
+            @action_taken := 'IGNORE'
+    END
+
+    RETURN f'Action taken: {@action_taken}' WITH
+        status  = 'complete',
+        label   = @scene_label,
+        action  = @action_taken
+
+EXCEPTION
+    WHEN GenerationError THEN
+        LOGGING 'Classification failed — defaulting to IGNORE for safety' LEVEL WARN
+        RETURN 'Action taken: IGNORE' WITH status = 'error', reason = 'classification_failed'
+END

@@ -1,0 +1,71 @@
+-- Recipe 48: Credit Risk Assessment
+-- Demonstrates: EVALUATE branching, CALL/GENERATE split, deterministic routing
+--
+-- Usage:
+--   spl3 run cookbook/48_credit_risk/assess_credit_risk.spl \
+--       --adapter ollama \
+--       applicant_data="$(cat cookbook/48_credit_risk/data/applicant_680.json)" \
+--       credit_score=680
+
+CREATE FUNCTION analyze_risk_factors(applicant_data TEXT)
+RETURN TEXT
+AS $$
+You are a senior credit risk analyst at a Tier-1 bank.
+
+Review the applicant data below and produce a structured risk report.
+Include: (1) key risk signals, (2) mitigating factors, and (3) an overall
+risk rating of exactly one word from: low | medium | high.
+
+End your report with a line in this exact format:
+RISK_RATING: <low|medium|high>
+
+Applicant Data:
+{applicant_data}
+$$;
+
+WORKFLOW credit_risk_assessment
+INPUT:
+  @applicant_data TEXT,
+  @credit_score INTEGER,
+  @log_dir TEXT DEFAULT 'cookbook/48_credit_risk/logs-spl'
+OUTPUT: @decision TEXT
+DO
+  LOGGING f'Assessing applicant | score={@credit_score}' LEVEL INFO
+
+  -- Step 1: Deterministic guard — score-based fast path (zero LLM cost)
+  EVALUATE @credit_score
+  WHEN < 600 THEN
+    LOGGING 'Auto-reject: credit score below threshold' LEVEL WARN
+    RETURN 'REJECTED' WITH reason = 'score_below_threshold', score = @credit_score
+  WHEN >= 750 THEN
+    LOGGING 'Auto-approve: excellent credit score' LEVEL INFO
+    RETURN 'APPROVED' WITH reason = 'score_excellent', score = @credit_score
+  ELSE
+    LOGGING 'Score in gray zone — triggering qualitative review' LEVEL INFO
+  END
+
+  -- Step 2: Qualitative LLM analysis
+  GENERATE analyze_risk_factors(@applicant_data) INTO @risk_report
+  CALL write_file(f'{@log_dir}/risk_report.md', @risk_report) INTO NONE
+
+  -- Step 3: Deterministic extraction (zero LLM cost)
+  CALL fin_risk_rating(@risk_report) INTO @risk_rating
+  LOGGING f'Extracted risk rating: {@risk_rating}' LEVEL DEBUG
+  CALL write_file(f'{@log_dir}/risk_rating.md', @risk_rating) INTO NONE
+
+  -- Step 4: Final routing
+  EVALUATE @risk_rating
+  WHEN 'high' THEN
+    RETURN @risk_report WITH reason = 'REJECTED: qualitative_risk_high'
+  WHEN 'medium' THEN
+    RETURN @risk_report WITH reason = 'MANUAL_REVIEW: qualitative_risk_medium'
+  ELSE
+    RETURN @risk_report WITH reason = 'APPROVED: qualitative_risk_low'
+  END
+
+EXCEPTION
+  WHEN ConnectionError THEN
+    @error_message := 'Failed to connect to external data source'
+    LOGGING @error_message LEVEL ERROR
+    RETURN @error_message WITH reason = 'PENDING: system_error'
+END

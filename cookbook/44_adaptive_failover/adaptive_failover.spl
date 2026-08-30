@@ -1,0 +1,98 @@
+-- Recipe 44: Adaptive Failover (Resilience Manager)
+-- Demonstrates dynamic model switching based on quality validation.
+-- The primary (cheap/fast) model is tried first; if its output fails
+-- the quality gate, the workflow transparently retries on the fallback model.
+--
+-- Usage (ollama / Momagrid):
+--   spl3 run cookbook/44_adaptive_failover/adaptive_failover.spl \
+--       --adapter ollama \
+--       query="Explain quantum entanglement for a technical audience." \
+--       primary_model=phi4 \
+--       fallback_model=gemma3
+
+CREATE TOOL_API check_quality(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def check_quality(text: str) -> str:
+    """
+    Heuristic quality gate for generated text.
+
+    Checks:
+      - Minimum word count (>= 50 words for a detailed technical summary)
+      - Not a refusal / error message
+      - Not mostly whitespace
+
+    Returns 'pass' if all checks pass, or 'fail:<reason>' otherwise.
+    This is a deterministic check — zero LLM tokens consumed.
+    """
+    _MIN_WORDS = 50
+    if not text or not text.strip():
+        return "fail:empty_response"
+
+    words = text.split()
+    if len(words) < _MIN_WORDS:
+        return f"fail:too_short({len(words)}_words,min={_MIN_WORDS})"
+
+    lower = text.lower()
+    refusal_markers = [
+        "i cannot", "i can't", "i'm unable", "i am unable",
+        "as an ai", "i don't have", "i do not have",
+        "error:", "exception:", "traceback",
+    ]
+    for marker in refusal_markers:
+        if marker in lower:
+            return "fail:refusal_detected"
+
+    return "pass"
+$$;
+
+CREATE FUNCTION summarize(query TEXT)
+RETURN TEXT
+AS $$
+You are a senior scientist. Provide a detailed, technically accurate summary of the following
+topic or question. Cover the core concept, key mechanisms, and practical significance.
+
+Query: {query}
+$$;
+
+WORKFLOW adaptive_failover
+    INPUT:
+        @query          TEXT DEFAULT 'Write a detailed technical summary of quantum entanglement.',
+        @primary_model  TEXT DEFAULT 'phi4',
+        @fallback_model TEXT DEFAULT 'gemma3',
+        @log_dir TEXT DEFAULT 'cookbook/44_adaptive_failover/logs-spl'
+    OUTPUT: @final_response TEXT
+DO
+    LOGGING f'Attempting generation with primary model: {@primary_model}' LEVEL INFO
+
+    CALL write_file(f'{@log_dir}/query.md', @query) INTO NONE
+
+    -- Step 1: Generate with cheap/fast primary model
+    GENERATE summarize(@query) USING MODEL @primary_model INTO @primary_output
+    LOGGING 'Primary model generation complete — validating quality ...' LEVEL DEBUG
+
+    -- Step 2: Quality gate (deterministic CALL — no LLM cost)
+    CALL check_quality(@primary_output) INTO @quality_status
+    LOGGING f'Quality check: {@quality_status}' LEVEL DEBUG
+
+    -- Step 3: Adaptive failover
+    EVALUATE @quality_status
+        WHEN contains('pass') THEN
+            LOGGING 'Primary model passed quality gate' LEVEL INFO
+            @final_response := @primary_output
+        ELSE
+            LOGGING f'Quality insufficient — failing over to {@fallback_model}' LEVEL WARN
+            GENERATE summarize(@query) USING MODEL @fallback_model INTO @final_response
+            LOGGING 'Fallback model generation complete' LEVEL INFO
+    END
+
+    CALL write_file(f'{@log_dir}/response.md', @final_response) INTO NONE
+
+    RETURN @final_response WITH
+        status  = 'complete',
+        quality = @quality_status,
+        model   = @primary_model
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN @query WITH status = 'error', reason = 'both_models_failed'
+END

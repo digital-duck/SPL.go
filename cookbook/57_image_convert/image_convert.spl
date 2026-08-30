@@ -1,0 +1,36 @@
+-- Recipe 57: Image Format Conversion
+-- Category: media / codec
+-- Convert an image between formats (PNG ↔ JPEG ↔ WebP ↔ BMP ↔ GIF).
+--
+-- This is a deterministic codec operation — no LLM involved.
+-- The SPL workflow provides a composable, loggable wrapper callable via CALL
+-- from any orchestrator workflow.
+--
+-- SPL INPUT type:  IMAGE (source file path)
+-- SPL OUTPUT type: IMAGE (converted file path)
+--
+-- Physical execution: run.py  (uses Pillow for format conversion)
+-- DODA targets: python (local), go (Intel Mini-PC)
+
+WORKFLOW image_convert
+    INPUT:
+        @image         IMAGE  DEFAULT 'cookbook/57_image_convert/sample/photo.png',
+        @target_format TEXT   DEFAULT 'jpeg',
+        @quality       INT    DEFAULT 85,
+        @output_dir    TEXT   DEFAULT 'cookbook/57_image_convert/outputs',
+        @log_dir       TEXT   DEFAULT 'cookbook/57_image_convert/logs-spl'
+    OUTPUT: @converted IMAGE
+DO
+    LOGGING f'[image_convert] {@image} → {@target_format} (quality={@quality})' LEVEL INFO
+    CALL image_convert(@image, @target_format, @quality, @output_dir) INTO @converted
+    LOGGING f'[image_convert] done → {@converted}' LEVEL INFO
+    RETURN @converted
+
+EXCEPTION
+    WHEN FileNotFound THEN
+        LOGGING f'[image_convert] source file not found: {@image}' LEVEL ERROR
+        RETURN '[ERROR] Source image not found.' WITH status = 'failed'
+    WHEN UnsupportedFormat THEN
+        LOGGING f'[image_convert] unsupported target format: {@target_format}' LEVEL ERROR
+        RETURN '[ERROR] Unsupported image format.' WITH status = 'failed'
+END

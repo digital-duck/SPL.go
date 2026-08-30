@@ -1,0 +1,248 @@
+-- ============================================================
+-- Recipe 78b: Supply Chain — Transportation Cost Minimization
+--
+-- Domain: Supply chain / logistics — ship goods from warehouses
+-- to retail stores at minimum cost.
+--
+-- PuLP problem type: Linear Program (LP)
+--   en.wikipedia.org/wiki/Transportation_theory_(mathematics)
+--
+--   Decision variables : x[i][j] = units shipped from warehouse i to store j
+--   Objective          : minimize Σ cost[i][j] · x[i][j]
+--   Constraints        :
+--     supply  — Σ_j x[i][j] ≤ supply[i]  for each warehouse i
+--     demand  — Σ_i x[i][j] = demand[j]  for each store j
+--     non-neg — x[i][j] ≥ 0
+--
+-- Default problem (balanced, hand-verifiable):
+--   Warehouses : W1 (80 units), W2 (60 units)   total supply = 140
+--   Stores     : S1 (50 units), S2 (40 units), S3 (50 units)  total demand = 140
+--   Cost matrix ($/unit):
+--     W1→S1 $2, W1→S2 $3, W1→S3 $1
+--     W2→S1 $5, W2→S2 $4, W2→S3 $8
+--   Known optimal : $370
+--     W1→S3: 50, W1→S1: 30, W2→S1: 20, W2→S2: 40
+--     Verify: 50×1 + 30×2 + 20×5 + 40×4 = 50+60+100+160 = $370
+--
+-- SPL value demonstrated:
+--   The LLM reads the natural-language problem and writes the PuLP
+--   formulation. The solver proves global optimality. ASSERT is the
+--   hard gate — hallucinated shipping plans cannot pass it.
+--
+-- Run:
+--   spl-go run cookbook/78_constraint_opt/supply_chain.spl \
+--       --adapter claude_cli
+--   spl-go run cookbook/78_constraint_opt/supply_chain.spl \
+--       --adapter ollama --model gemma3 \
+--       --param problem="A company has ..."
+-- ============================================================
+
+-- ── Deterministic regime: PuLP solver tools ──────────────────
+
+CREATE TOOL_API run_pulp(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_pulp(code: str) -> str:
+    """Execute LLM-generated PuLP transportation LP and return JSON result.
+
+    Returns {"status": "Optimal", "objective": <total_cost>, "variables": {...}}
+    On any error returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json, re, pulp
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"pulp": pulp}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API is_optimal(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def is_optimal(result_json: str) -> bool:
+    import json
+    try:
+        return json.loads(result_json).get("status") == "Optimal"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, lp_code TEXT,
+                              solution_json TEXT, narrative TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, lp_code: str,
+                  solution_json: str, narrative: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    status    = sol.get("status", "Unknown")
+    objective = sol.get("objective")
+    variables = sol.get("variables", {})
+
+    lines = [
+        "# Supply Chain Optimization Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Solver status:** `{status}`",
+    ]
+    if objective is not None:
+        lines.append(f"**Minimum total shipping cost:** ${objective:.2f}")
+    if variables:
+        lines.append("")
+        lines.append("**Shipping plan (units):**")
+        for route, qty in variables.items():
+            val = float(qty) if not isinstance(qty, (int, float)) else qty
+            if val > 1e-6:
+                lines.append(f"  - {route}: {val:.4g} units")
+    lines += ["", "## Interpretation", "", narrative.strip()]
+    lines += ["", "## Solver Code (LLM-generated, PuLP)", "", "```python", lp_code.strip(), "```"]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_transport_lp(problem TEXT)
+RETURNS TEXT AS $$
+You are an operations research expert specializing in supply chain optimization.
+Convert this transportation / shipping problem to runnable PuLP Python code.
+
+Rules:
+- The `pulp` module is already in scope — do NOT add import statements
+- Model this as a transportation LP:
+    * Create a pulp.LpProblem with sense=pulp.LpMinimize
+    * Decision variables: x[i][j] = units shipped from source i to destination j
+      Use pulp.LpVariable(f"x_{i}_{j}", lowBound=0)
+    * Objective: minimize total shipping cost = Σ cost[i][j] * x[i][j]
+    * Supply constraints: for each source i, Σ_j x[i][j] <= supply[i]
+    * Demand constraints: for each destination j, Σ_i x[i][j] == demand[j]
+    * Call: prob.solve(pulp.PULP_CBC_CMD(msg=0))
+- After solving, store the result EXACTLY as:
+    _result = {
+        "status": pulp.LpStatus[prob.status],
+        "objective": pulp.value(prob.objective),
+        "variables": {v.name: pulp.value(v) for v in prob.variables()}
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem:
+{problem}
+$$;
+
+CREATE FUNCTION repair_transport_lp(problem TEXT, lp_code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This PuLP transportation LP code produced an error or non-Optimal result.
+
+Problem:
+{problem}
+
+Previous code:
+{lp_code}
+
+Error / solver status:
+{error_info}
+
+Fix the code. Common causes for transportation LPs:
+- Demand exceeds total supply (infeasible) — check if supply >= demand
+- Wrong constraint direction (use <= for supply, == for demand)
+- Variable indexing errors (mismatched source/destination names)
+- Missing _result assignment at the end
+- Unbalanced problem: if total supply > total demand, use <= for demand constraints instead of ==
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_shipping_plan(problem TEXT, solution_json TEXT, lang TEXT)
+RETURNS TEXT AS $$
+You are a supply chain analyst. Interpret this shipping optimization result for
+a logistics manager.
+
+Problem:
+{problem}
+
+Optimal solution (JSON):
+{solution_json}
+
+Write a concise interpretation (under 150 words):
+1. What is the total minimum shipping cost?
+2. Which routes carry the most volume? Which routes are unused and why?
+3. Are any warehouse capacities fully used (binding constraints)?
+4. One practical recommendation for the logistics team.
+
+Write in {lang}. No JSON, no code. Round dollar amounts to 2 decimal places.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW supply_chain
+  INPUT @problem TEXT := "A company has two warehouses and three retail stores. Warehouse W1 has 80 units of inventory; Warehouse W2 has 60 units. Store S1 needs 50 units, Store S2 needs 40 units, Store S3 needs 50 units. Shipping costs per unit: W1 to S1 costs $2, W1 to S2 costs $3, W1 to S3 costs $1; W2 to S1 costs $5, W2 to S2 costs $4, W2 to S3 costs $8. All store demand must be met exactly. Minimize total shipping cost."
+  INPUT @max_tries INTEGER := 3
+  INPUT @lang TEXT := "English"
+  INPUT @out_dir TEXT := "./cookbook/78_constraint_opt/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  LOGGING f"[supply_chain] start  ts={@ts_safe}  max_tries={@max_tries}" LEVEL INFO
+
+  -- Stage 1: LLM formulates transportation LP; PuLP solves; repair on failure
+  @tries   := 0;
+  @status  := "init";
+  @lp_code := "";
+  @solution := "{}";
+
+  WHILE @tries < @max_tries DO
+    EVALUATE @status
+      WHEN = "Optimal" THEN
+        @tries := @max_tries;
+
+      WHEN = "init" THEN
+        LOGGING "[supply_chain] attempt 1 — LLM formulating transportation LP" LEVEL INFO
+        GENERATE formulate_transport_lp(@problem) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[supply_chain] attempt {@tries}: status={@status}" LEVEL INFO
+
+      ELSE
+        CALL result_error(@solution) INTO @error_info;
+        LOGGING f"[supply_chain] repair {@tries} — error: {@error_info}" LEVEL INFO
+        GENERATE repair_transport_lp(@problem, @lp_code, @error_info) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[supply_chain] repair {@tries}: status={@status}" LEVEL INFO
+    END;
+  END;
+
+  -- Stage 2: deterministic gate — only Optimal reaches interpretation
+  LOGGING f"[supply_chain] ASSERT gate (status={@status})" LEVEL INFO
+  ASSERT is_optimal(@solution);
+  LOGGING "[supply_chain] ASSERT passed — minimum cost route confirmed" LEVEL INFO
+
+  -- Stage 3: LLM interprets the verified shipping plan
+  GENERATE interpret_shipping_plan(@problem, @solution, @lang) INTO @narrative;
+
+  CALL format_report(@problem, @lp_code, @solution, @narrative) INTO @report;
+
+  CALL write_file(f"{@out_dir}/supply_chain_{@ts_safe}.md", @report) INTO @out_path;
+  CALL time_elapsed(@t_start) INTO @elapsed;
+  LOGGING f"[supply_chain] done — report → {@out_path}  ({@elapsed}s)" LEVEL INFO
+
+  RETURN @report WITH status = "complete";
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Solver did not reach Optimal status after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/supply_chain_{@ts_safe}.md", @report) INTO @out_path;
+    CALL time_elapsed(@t_start) INTO @elapsed;
+    LOGGING f"[supply_chain] infeasible — {@out_path}  ({@elapsed}s)" LEVEL INFO
+    RETURN @report WITH status = "infeasible";
+END;

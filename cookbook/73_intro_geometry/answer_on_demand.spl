@@ -1,0 +1,151 @@
+-- Layer 4b: answer_on_demand.spl
+-- On-demand Q&A over the Intro Geometry concept graph.
+-- Logical view (DODA): the physical artifact is produced by
+--   splc --lang python/intro_geometry answer_on_demand.spl
+--
+-- Given a free-form natural-language @question, resolve it to the nearest
+-- concept node, generate a learning path from the learner's current state
+-- to that concept, and answer in the requested style. Unlike
+-- build_concept_book (which produces a full linear textbook), this
+-- workflow is the "ask anything, get the shortest path to understanding it"
+-- entry point — same graph, same verifier, same style machinery, different
+-- traversal: gap()/learning_path() instead of ancestors()/productivity_order().
+
+-- ── Prompt templates ────────────────────────────────────────────────────────
+
+CREATE FUNCTION resolve_target(question TEXT, concepts TEXT)
+RETURN TEXT
+AS $$
+You are a geometry curriculum expert. A learner asked the following question:
+
+"{question}"
+
+Here is the list of concepts in the curriculum graph (most specific first):
+{concepts}
+
+Identify the SINGLE concept name from the list above that this question is
+really asking about — the most specific concept that, once understood,
+answers the question. Output only that concept's exact name from the list.
+No punctuation, no explanation, no quotes.
+$$;
+
+CREATE FUNCTION write_section(concept TEXT, context TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert geometry author answering a learner's question on demand.
+
+{style_guide}
+
+Write a self-contained section that directly answers a question about: {concept}
+Surrounding context (concepts the learner already knows): {context}
+
+Follow the structure and length specified in the STYLE GUIDE above exactly.
+Describe figures and diagrams in words precisely enough that a reader could
+draw them from the description alone. Use LaTeX for all mathematics.
+Output only the section text. No preamble, no metadata.
+$$;
+
+CREATE FUNCTION refine_section(section TEXT, feedback TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert geometry author. Revise the section below based on
+the feedback provided. Keep all correct content; fix only what is flagged.
+Maintain the style described below throughout the revision.
+
+{style_guide}
+
+SECTION:
+{section}
+
+FEEDBACK:
+{feedback}
+
+Output the revised section only. No preamble. No commentary.
+$$;
+
+-- ── Main workflow ────────────────────────────────────────────────────────────
+
+WORKFLOW answer_on_demand
+    INPUT:
+        @question TEXT,
+        @style TEXT DEFAULT 'textbook',
+        @learner_state LIST DEFAULT []
+    OUTPUT:
+        @answer TEXT
+DO
+    -- 1. Resolve style profile once (deterministic — no LLM involved)
+    SOLVE @style_guide TEXT := style_instruction(@style)
+
+    LOGGING f"Question: {@question}  |  Style: {@style}" LEVEL INFO
+
+    -- 2. Resolve the question to the nearest concept node (LLM, then verified)
+    SOLVE @concept_names LIST := list(@graph.nodes)
+
+    SOLVE @concept_names_text TEXT := join(@concept_names, ", ")
+
+    GENERATE resolve_target(@question, @concept_names_text) INTO @target
+
+    ASSERT in_graph(@graph, @target)
+        OTHERWISE GENERATE resolve_target(@question, @concept_names_text) INTO @target
+
+    LOGGING f"Resolved to concept: {@target}" LEVEL INFO
+
+    -- 3. Compute the gap between what the learner already knows and the target,
+    --    then order that gap into a teachable learning path
+    SOLVE @missing SET := gap(@graph, @target, @learner_state)
+
+    SOLVE @path LIST := learning_path(@graph, @target, @learner_state)
+
+    SOLVE @path_len INT := len(@path)
+
+    LOGGING f"Learning path has {@path_len} concept(s): {@path}" LEVEL INFO
+
+    -- 4. Generate and verify one section per concept on the path, in order
+    @answer := ""
+    @_i := 0
+
+    WHILE @_i < @path_len DO
+        SOLVE @concept TEXT := @path[@_i]
+
+        LOGGING f"Section {@_i}: {@concept}" LEVEL INFO
+
+        -- 4a. Content cache lookup — same write-once, content-addressed
+        --     pattern as build_concept_book.spl: a verified section for
+        --     a given concept, once produced, is reused across every
+        --     question that happens to route through it.
+        CALL cache_get(@concept) INTO @section
+        EVALUATE @section
+            WHEN = "miss" THEN
+                LOGGING f"cache MISS for {@concept} — generating with the LLM" LEVEL INFO
+
+                -- 4b. Generate the section for this concept (style injected via style_guide)
+                GENERATE write_section(@concept, @learner_state, @style_guide) INTO @section
+
+                -- 4c. Symbolic geometry check (SymPy geometry-module recompute
+                --     of every numeric claim in the section — distances, angle
+                --     measures, areas, the Pythagorean relationship, slopes,
+                --     similarity ratios). The single verification gate; geometry
+                --     has no shape_check analogue (no matrices to dimension-check).
+                CALL verify_geometry(@section) INTO @check
+                EVALUATE @check
+                    WHEN contains("fail") THEN
+                        GENERATE refine_section(@section, @check, @style_guide) INTO @section
+                    ELSE
+                        LOGGING "Geometry verified" LEVEL INFO
+                END
+
+                -- 4d. Store the now-verified section — write-once, immutable (CAS)
+                CALL cache_put(@concept, @section) INTO @cache_key
+                LOGGING f"Stored verified section — cache key {@cache_key}" LEVEL INFO
+            ELSE
+                LOGGING f"cache HIT for {@concept} — reusing verified section (0 LLM calls)" LEVEL INFO
+        END
+
+        @answer := @answer + "\n\n---\n\n" + @section
+        @_i := @_i + 1
+    END
+
+    LOGGING f"Answer complete — {@path_len} section(s), style: {@style}" LEVEL INFO
+
+    COMMIT @answer
+END

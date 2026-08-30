@@ -1,0 +1,99 @@
+-- Recipe 80b: OpenCV 5 Parallel Inspection
+-- Category: vision / CALL PARALLEL fan-out over deterministic tools
+--
+-- Pattern: CALL PARALLEL is usually shown fanning out across concurrent LLM
+-- calls (see 64_parallel_news_digest). Here it fans out across three
+-- independent, deterministic OpenCV 5 analyses on the *same* image instead —
+-- proof that SPL's parallel dispatch is just as valid for CPU-bound tool
+-- work as it is for LLM work. A single GENERATE call then synthesizes all
+-- three reports into one human-readable note.
+--
+-- Usage:
+--   spl3 run cookbook/80_opencv_5/opencv5_parallel_inspect.spl \
+--       --adapter ollama --model gemma4 \
+--       --tools cookbook/80_opencv_5/tools.py \
+--       image="cookbook/80_opencv_5/sample/current.jpg"
+
+IMPORT 'tools'
+
+CREATE FUNCTION inspection_synthesis_prompt(circles_json TEXT, exposure_json TEXT, edges_json TEXT)
+RETURN TEXT
+AS $$
+You are summarizing three independent, deterministic computer-vision reports
+about one image — a circular-object scan, an exposure/brightness scan, and
+an edge-density scan. None of these numbers come from a language model; they
+were measured directly from the pixels by OpenCV.
+
+Circular objects: {circles_json}
+Exposure: {exposure_json}
+Edge density: {edges_json}
+
+Write one 3-4 sentence inspection note a human reviewer could read in five
+seconds: what''s likely in the frame, whether image quality is good enough to
+trust the detections, and anything that stands out.
+$$;
+
+-- CALL PARALLEL dispatches registered WORKFLOW names through the composer,
+-- not raw TOOL_API calls directly and not PROCEDUREs either — only
+-- top-level WORKFLOW definitions are composer-registered. These thin
+-- WORKFLOW wrappers are the registrable unit each parallel branch calls.
+WORKFLOW analyze_circles
+    INPUT:  @image_path TEXT
+    OUTPUT: @result TEXT
+DO
+    CALL detect_circular_objects(@image_path) INTO @result
+    RETURN @result
+END
+
+WORKFLOW analyze_exposure
+    INPUT:  @image_path TEXT
+    OUTPUT: @result TEXT
+DO
+    CALL measure_exposure(@image_path) INTO @result
+    RETURN @result
+END
+
+WORKFLOW analyze_edges
+    INPUT:  @image_path TEXT
+    OUTPUT: @result TEXT
+DO
+    CALL detect_edge_density(@image_path) INTO @result
+    RETURN @result
+END
+
+WORKFLOW opencv5_parallel_inspect
+    INPUT:  @image   TEXT DEFAULT 'cookbook/80_opencv_5/sample/current.jpg',
+            @log_dir TEXT DEFAULT 'cookbook/80_opencv_5/logs-spl'
+    OUTPUT: @note TEXT
+DO
+    LOGGING f'[opencv5_parallel_inspect] image={@image}' LEVEL INFO
+
+    -- Three independent, deterministic OpenCV 5 analyses fan out concurrently.
+    -- Each branch receives a snapshot of the parent scope; results flow back
+    -- only via INTO @var — no shared mutable state between branches.
+    CALL PARALLEL
+        analyze_circles(@image)  INTO @circles_json,
+        analyze_exposure(@image) INTO @exposure_json,
+        analyze_edges(@image)    INTO @edges_json
+    END
+
+    LOGGING f'[opencv5_parallel_inspect] circles={@circles_json}' LEVEL DEBUG
+    LOGGING f'[opencv5_parallel_inspect] exposure={@exposure_json}' LEVEL DEBUG
+    LOGGING f'[opencv5_parallel_inspect] edges={@edges_json}' LEVEL DEBUG
+
+    -- Single LLM call synthesizes all three deterministic reports.
+    GENERATE inspection_synthesis_prompt(@circles_json, @exposure_json, @edges_json)
+        INTO @note
+
+    CALL write_file(
+        f'{@log_dir}/inspect.md',
+        f'{@circles_json}\n{@exposure_json}\n{@edges_json}\n\n{@note}'
+    ) INTO NONE
+    LOGGING '[opencv5_parallel_inspect] done' LEVEL INFO
+    RETURN @note WITH status = 'complete'
+
+EXCEPTION
+    WHEN GenerationError THEN
+        LOGGING '[opencv5_parallel_inspect] LLM unavailable — returning raw CV reports' LEVEL ERROR
+        RETURN @circles_json WITH status = 'partial'
+END

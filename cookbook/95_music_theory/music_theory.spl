@@ -1,0 +1,381 @@
+-- ============================================================
+-- Recipe 95: Music Theory — Four-Part Chorale Voice-Leading Verification
+--
+-- Suggested by Qwen (2026-07-25, see docs/publication/TMLR/
+-- SPL-for-Agentic-Workflow/review-feedback/LLM/qwen-3-8-max-full-
+-- 20260725.md) as the "unexpected domain" demonstration: an LLM can
+-- generate a four-part chorale that LOOKS stylistically plausible
+-- (probabilistic — pattern-matching on training data), but classical
+-- voice-leading rules (no parallel fifths/octaves, no voice crossing,
+-- bounded adjacent-voice spacing) are hard, unforgiving constraints
+-- that LLMs routinely violate and cannot self-check reliably in text.
+--
+-- Score representation: a JSON list of {"S","A","T","B"} MIDI pitch
+-- numbers, one entry per beat, chosen deliberately over MusicXML +
+-- music21 to keep this recipe stdlib-only and zero-pip-dependency,
+-- consistent with every other cookbook recipe (music21 is not
+-- installed in this environment; wiring it in as the deterministic
+-- checker is a reasonable future upgrade if richer notation I/O is
+-- wanted, via the same CREATE TOOL_API boundary).
+--
+--   Probabilistic (LLM)   — harmonize a given melody (soprano line)
+--                            into a four-part chorale, as JSON
+--   Deterministic (kernel)— check_voice_leading(): parallel 5ths/8ves
+--                            between every voice pair across every
+--                            consecutive beat pair; voice-crossing;
+--                            adjacent-voice spacing (S-A, A-T <= 1
+--                            octave; S-B <= 2 octaves); large leaps
+--   Probabilistic + Det.  — WHILE repair loop: LLM revises the chord
+--   (WHILE)                 sequence to fix flagged violations; kernel
+--                            re-checks until clean or max_tries
+--   Deterministic (ASSERT)— gate: no violations remain
+--   Deterministic (round- — confirms the LLM did not "fix" violations
+--    trip classifier)       by silently changing the given soprano
+--                            melody itself (checked note-for-note
+--                            against the original input)
+--   Probabilistic (LLM)   — narrate the harmonic/voice-leading analysis
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — the model
+-- harmonizes and self-reports on voice-leading correctness in prose,
+-- with no deterministic checker, exactly where LLMs confidently
+-- describe a parallel fifth they did not actually avoid.
+--
+-- Requires: stdlib json only — no new pip dependency
+-- Run:
+--   spl3 run cookbook/95_music_theory/music_theory.spl --llm claude_cli
+--   spl3 run cookbook/95_music_theory/music_theory.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: voice-leading rules (MIDI pitch, stdlib only) ──
+
+CREATE TOOL_API notation_reference()
+RETURNS TEXT AS PYTHON $$
+def notation_reference() -> str:
+    """Human-readable notation reference, shown to the LLM (and to the
+    unaided baseline arm): MIDI pitch numbers and the four voice-
+    leading rules the deterministic checker enforces."""
+    return (
+        "Pitches are MIDI note numbers (60 = middle C / C4, 72 = C5).\n"
+        "Voices, high to low: S (soprano), A (alto), T (tenor), B (bass).\n"
+        "A chorale is a JSON list, one 4-voice chord object per beat:\n"
+        '  [{"S": 72, "A": 67, "T": 64, "B": 48}, ...]\n'
+        "Rules the deterministic checker enforces:\n"
+        "  1. No parallel fifths or octaves between ANY voice pair across\n"
+        "     consecutive beats (same interval, same direction of motion).\n"
+        "  2. No voice crossing: pitch order must stay S >= A >= T >= B.\n"
+        "  3. Adjacent-voice spacing: S-A and A-T each <= 12 semitones\n"
+        "     (1 octave); S-B <= 24 semitones (2 octaves).\n"
+        "  4. No voice leaps larger than 12 semitones between consecutive beats.\n"
+    )
+$$;
+
+CREATE TOOL_API check_voice_leading(score_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def check_voice_leading(score_json: str) -> str:
+    """Deterministically check a 4-voice chorale (JSON list of per-beat
+    {S,A,T,B} MIDI pitches) against classical voice-leading rules:
+    parallel 5ths/8ves, voice crossing, adjacent-voice spacing, and
+    large leaps. Pure interval arithmetic -- no external library.
+
+    Returns JSON: {status, clean, violations, beat_count}
+    """
+    import json
+    import re
+
+    def strip_fences(s):
+        s = re.sub(r'^```(?:json)?\s*\n?', '', s.strip(), flags=re.IGNORECASE)
+        return re.sub(r'\n?```\s*$', '', s)
+
+    VOICES = ["S", "A", "T", "B"]
+    PAIRS = [(a, b) for i, a in enumerate(VOICES) for b in VOICES[i + 1:]]
+
+    try:
+        score = json.loads(strip_fences(score_json))
+        if not isinstance(score, list) or not score:
+            return json.dumps({"status": "Error", "error": "score must be a non-empty JSON list of beat-chords"})
+        for i, chord in enumerate(score):
+            for v in VOICES:
+                if v not in chord:
+                    return json.dumps({"status": "Error", "error": f"beat {i}: missing voice '{v}'"})
+
+        violations = []
+
+        for i, chord in enumerate(score):
+            # Rule 2: voice crossing (S >= A >= T >= B)
+            if not (chord["S"] >= chord["A"] >= chord["T"] >= chord["B"]):
+                violations.append({"type": "voice_crossing", "beat": i,
+                                    "detail": f"S={chord['S']} A={chord['A']} T={chord['T']} B={chord['B']}"})
+            # Rule 3: adjacent-voice spacing
+            if chord["S"] - chord["A"] > 12:
+                violations.append({"type": "spacing_S_A", "beat": i, "detail": f"{chord['S']-chord['A']} semitones"})
+            if chord["A"] - chord["T"] > 12:
+                violations.append({"type": "spacing_A_T", "beat": i, "detail": f"{chord['A']-chord['T']} semitones"})
+            if chord["S"] - chord["B"] > 24:
+                violations.append({"type": "spacing_S_B", "beat": i, "detail": f"{chord['S']-chord['B']} semitones"})
+
+        for i in range(len(score) - 1):
+            c0, c1 = score[i], score[i + 1]
+            for va, vb in PAIRS:
+                # Rule 4: large leaps (per voice, not per pair)
+                pass
+            for v in VOICES:
+                leap = abs(c1[v] - c0[v])
+                if leap > 12:
+                    violations.append({"type": "large_leap", "beat": i + 1, "voice": v, "detail": f"{leap} semitones"})
+            # Rule 1: parallel 5ths/8ves between beat i and i+1, any voice pair
+            for va, vb in PAIRS:
+                iv0 = (c0[va] - c0[vb]) % 12
+                iv1 = (c1[va] - c1[vb]) % 12
+                motion0 = c1[va] - c0[va]
+                motion1 = c1[vb] - c0[vb]
+                same_direction = (motion0 > 0 and motion1 > 0) or (motion0 < 0 and motion1 < 0)
+                if iv0 == iv1 and iv0 in (7, 0) and same_direction and motion0 != 0:
+                    kind = "fifths" if iv0 == 7 else "octaves"
+                    violations.append({"type": f"parallel_{kind}", "beat": i + 1,
+                                        "voices": [va, vb], "detail": f"beats {i}->{i+1}"})
+
+        return json.dumps({
+            "status": "OK",
+            "clean": len(violations) == 0,
+            "violations": violations,
+            "beat_count": len(score),
+        })
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(original_melody TEXT, score_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(original_melody: str, score_json: str) -> str:
+    """Round-trip check: the repair loop is only allowed to change
+    A/T/B -- the soprano voice must still equal the ORIGINAL input
+    melody, note-for-note, at every beat. This catches the LLM
+    'fixing' a voice-leading violation by silently altering the given
+    melody itself, which would be cheating, not harmonizing.
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import json
+    import re
+
+    def strip_fences(s):
+        s = re.sub(r'^```(?:json)?\s*\n?', '', s.strip(), flags=re.IGNORECASE)
+        return re.sub(r'\n?```\s*$', '', s)
+
+    try:
+        melody = [int(x.strip()) for x in original_melody.split(",") if x.strip()]
+        score = json.loads(strip_fences(score_json))
+        soprano = [beat.get("S") for beat in score]
+    except Exception:
+        return "unverifiable"
+
+    if len(soprano) != len(melody):
+        return "mismatch"
+    return "match" if soprano == melody else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(melody TEXT, score_json TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(melody: str, score_json: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Four-Part Chorale Voice-Leading Report",
+        "",
+        f"**Given melody (soprano, MIDI):** `{melody.strip()}`",
+        "",
+        f"**Checker status:** `{sol.get('status', 'Unknown')}`",
+        f"**Clean (no violations):** `{sol.get('clean', '?')}`",
+        f"**Violations:** `{sol.get('violations', [])}`",
+        f"**Melody round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Harmonized Score (LLM-generated, JSON)", "",
+        "```json", score_json.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION harmonize(reference TEXT, melody TEXT)
+RETURNS TEXT AS $$
+You are a music theory student writing a four-part chorale in the
+style of Bach. Harmonize this soprano melody.
+
+{reference}
+
+Soprano melody (MIDI pitches, one note per beat, in order): {melody}
+
+Output ONLY a JSON list, one 4-voice chord object per beat, with the
+"S" value at each beat EXACTLY matching the given melody note at that
+position (do not alter the melody) — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION fix_violations(reference TEXT, score_json TEXT, violations_json TEXT)
+RETURNS TEXT AS $$
+This four-part chorale has voice-leading violations flagged by a
+deterministic checker.
+
+{reference}
+
+Current score (JSON):
+{score_json}
+
+Violations found:
+{violations_json}
+
+Revise the A, T, and B voices to fix these violations. The S (soprano)
+value at each beat MUST remain EXACTLY unchanged from the current
+score — only change A/T/B. Output ONLY the corrected JSON list, same
+format as the input — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION annotate(score_json TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a music theory teacher. Analyze this VERIFIED, voice-leading-
+clean four-part chorale for a student.
+
+Score (JSON):
+{score_json}
+
+Verified checker result (JSON — independently checked against the
+classical voice-leading rules; trust it completely, do not re-derive
+it):
+{solution_json}
+
+Provide a concise analysis (under 100 words):
+1. Describe the overall harmonic shape in plain language
+2. State that the score passed the voice-leading checker, referencing
+   the exact 'clean' value from the JSON
+3. One sentence on why a deterministic checker, not the model's own
+   sense of the piece, is what makes "no parallel fifths" a real
+   guarantee rather than a stylistic impression
+$$;
+
+CREATE FUNCTION solve_directly(reference TEXT, melody TEXT)
+RETURNS TEXT AS $$
+You are a music theory student writing a four-part chorale. There is
+no voice-leading checker backing you up this time — harmonize the
+melody below and reason in prose about whether you have avoided
+parallel fifths/octaves and voice crossing.
+
+{reference}
+
+Soprano melody (MIDI pitches, one note per beat, in order): {melody}
+
+Write a brief harmonization description (under 100 words): describe
+the A/T/B lines you chose, and state your own assessment of whether
+the voice-leading rules are satisfied, reasoning from your own
+judgment only.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW music_theory
+  -- Default: a simple C-major stepwise melody, 8 beats
+  -- (C5 D5 E5 F5 G5 F5 E5 C5), MIDI: 72,74,76,77,79,77,76,72
+  INPUT @melody TEXT := "72,74,76,77,79,77,76,72"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 4
+  INPUT @out_dir TEXT := "./cookbook/95_music_theory/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  CALL notation_reference() INTO @reference;
+  LOGGING f"[music_theory] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no voice-leading checker ──
+        LOGGING "[arm=llm_only] harmonizing with NO voice-leading checker" LEVEL INFO
+        GENERATE solve_directly(@reference, @melody) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM harmonizes; deterministic voice-leading checker ──
+        LOGGING "[arm=solver] Stage 1 — LLM harmonization" LEVEL INFO
+        @tries := 0;
+        @status := "init";
+        @score  := "[]";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE harmonize(@reference, @melody) INTO @score;
+                CALL check_voice_leading(@score) INTO @solution;
+                CALL json_get(@solution, "clean") INTO @clean_flag;
+                EVALUATE @clean_flag
+                  WHEN = "True" THEN
+                    @status := "OK"
+                  ELSE
+                    @status := "dirty"
+                END
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL json_get(@solution, "violations") INTO @violations;
+                GENERATE fix_violations(@reference, @score, @violations) INTO @score;
+                CALL check_voice_leading(@score) INTO @solution;
+                CALL json_get(@solution, "clean") INTO @clean_flag;
+                EVALUATE @clean_flag
+                  WHEN = "True" THEN
+                    @status := "OK"
+                  ELSE
+                    @status := "dirty"
+                END
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[music_theory] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT @status == "OK";
+        LOGGING "[music_theory] ASSERT passed — no voice-leading violations remain" LEVEL INFO
+
+        CALL classify_roundtrip(@melody, @score) INTO @roundtrip;
+        LOGGING f"[music_theory] melody round-trip check: {@roundtrip}" LEVEL INFO
+
+        GENERATE annotate(@score, @solution) INTO @narrative;
+        CALL format_report(@melody, @score, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/chorale_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[music_theory] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "No voice-leading-clean chorale found after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/chorale_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[music_theory] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

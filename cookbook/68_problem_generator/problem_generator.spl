@@ -1,0 +1,234 @@
+-- ============================================================
+-- Recipe 68: Answer-First Problem Generator
+--
+-- The key innovation: SymPy generates the EXACT ANSWER first,
+-- then the LLM writes the question and explanation around it.
+-- The LLM never touches the math — it only writes the narrative.
+-- Hallucination is structurally impossible on the computation.
+--
+-- Flow per problem:
+--   Deterministic (SymPy)  — generate expression + exact answer
+--   Probabilistic  (LLM)   — write engaging word problem
+--   Probabilistic  (LLM)   — write step-by-step worked solution
+--
+-- Output: complete print-ready exercise set in Markdown.
+--
+-- Supported topics  : quadratic, derivatives, integration,
+--                     factoring, linear
+-- Supported levels  : easy, medium, hard
+-- Problem count     : set @numbers e.g. '1,2,3' = 3 problems
+--
+-- Requires: pip install sympy
+--   (or run with --self-healing for automatic install)
+-- ============================================================
+
+-- ── Deterministic regime: SymPy answer-first generation ──────
+
+CREATE TOOL_API generate_math_problem(topic TEXT, difficulty TEXT)
+RETURNS TEXT AS PYTHON $$
+def generate_math_problem(topic: str, difficulty: str) -> str:
+    """Generate one math problem with a guaranteed exact SymPy answer.
+
+    The answer is computed BEFORE the question is written, so the LLM
+    explanation layer can never hallucinate a wrong result.
+    """
+    import random
+    from sympy import symbols, expand, factor, diff, integrate, Rational
+
+    x = symbols('x')
+    t = topic.strip().lower()
+    d = difficulty.strip().lower()
+
+    if d == 'easy':
+        pool      = list(range(-4, 5))
+        root_pool = [-3, -2, -1, 1, 2, 3]
+    elif d == 'hard':
+        pool      = list(range(-9, 10))
+        root_pool = [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+    else:  # medium
+        pool      = list(range(-6, 7))
+        root_pool = [-4, -3, -2, -1, 1, 2, 3, 4]
+
+    nz = [v for v in pool if v != 0]
+
+    if 'quadratic' in t or 'roots' in t:
+        r1 = random.choice(root_pool)
+        r2 = random.choice([r for r in root_pool if r != r1])
+        expr = expand((x - r1) * (x - r2))
+        ans  = sorted([r1, r2])
+        return (
+            f"topic: Quadratic Equations\n"
+            f"expression: {expr} = 0\n"
+            f"operation: solve for x\n"
+            f"exact_answer: x = {ans[0]}  or  x = {ans[1]}\n"
+            f"factored_form: (x - {r1})(x - {r2}) = 0"
+        )
+
+    elif 'deriv' in t or 'differ' in t:
+        if d == 'easy':
+            a, b, c = random.choice(nz), random.choice(pool), random.choice(pool)
+            expr = a*x**2 + b*x + c
+        else:
+            a, b, c, e = random.choice(nz), random.choice(pool), random.choice(pool), random.choice(nz)
+            expr = a*x**3 + b*x**2 + c*x + e
+        result = diff(expr, x)
+        return (
+            f"topic: Derivatives\n"
+            f"expression: f(x) = {expand(expr)}\n"
+            f"operation: find f'(x)\n"
+            f"exact_answer: f'(x) = {result}\n"
+            f"hint: apply the power rule d/dx[xⁿ] = n·xⁿ⁻¹ to each term"
+        )
+
+    elif 'integr' in t or 'antid' in t:
+        if d == 'easy':
+            a, b = random.choice(nz), random.choice(pool)
+            expr = a*x + b
+        else:
+            a, b, c = random.choice(nz), random.choice(pool), random.choice(pool)
+            expr = a*x**2 + b*x + c
+        result = integrate(expr, x)
+        return (
+            f"topic: Integration\n"
+            f"expression: f(x) = {expand(expr)}\n"
+            f"operation: find the indefinite integral\n"
+            f"exact_answer: ∫f(x)dx = {result} + C\n"
+            f"hint: reverse the power rule — raise exponent by 1, divide by new exponent"
+        )
+
+    elif 'factor' in t:
+        r1 = random.choice(root_pool)
+        r2 = random.choice([r for r in root_pool if r != r1])
+        expr   = expand((x - r1) * (x - r2))
+        result = factor(expr)
+        return (
+            f"topic: Factoring\n"
+            f"expression: {expr}\n"
+            f"operation: factor completely\n"
+            f"exact_answer: {result}\n"
+            f"hint: find two numbers that multiply to {r1 * r2} and add to {-(r1 + r2)}"  # noqa: E501 — SymPy signs
+        )
+
+    elif 'linear' in t:
+        a = random.choice(nz)
+        b = random.choice(pool)
+        c = random.choice(pool)
+        sol = Rational(c - b, a)
+        sign = '+' if b >= 0 else '-'
+        return (
+            f"topic: Linear Equations\n"
+            f"expression: {a}x {sign} {abs(b)} = {c}\n"
+            f"operation: solve for x\n"
+            f"exact_answer: x = {sol}\n"
+            f"hint: subtract {b} from both sides, then divide by {a}"
+        )
+
+    else:
+        # Default: quadratic
+        r1 = random.choice(root_pool)
+        r2 = random.choice([r for r in root_pool if r != r1])
+        expr = expand((x - r1) * (x - r2))
+        ans  = sorted([r1, r2])
+        return (
+            f"topic: Quadratic Equations\n"
+            f"expression: {expr} = 0\n"
+            f"operation: solve for x\n"
+            f"exact_answer: x = {ans[0]}  or  x = {ans[1]}\n"
+            f"factored_form: (x - {r1})(x - {r2}) = 0"
+        )
+$$;
+
+-- ── Probabilistic regime: LLM wraps exact answers in narrative ─
+
+CREATE FUNCTION write_lesson_intro(topic TEXT, difficulty TEXT, count TEXT)
+RETURNS TEXT AS $$
+Write one short paragraph (2-3 sentences) introducing a {difficulty}-level practice
+set of {count} problems on {topic}. Mention what skill is being practiced and why it
+is useful. No headers, no bullet points, no options — just the paragraph.
+$$;
+
+CREATE FUNCTION write_word_problem(topic TEXT, raw_problem TEXT)
+RETURNS TEXT AS $$
+You are given a math problem with a guaranteed correct answer from a symbolic engine:
+
+{raw_problem}
+
+Write a 2-sentence exercise for a student:
+  Sentence 1: one short real-world context (e.g. "A ball is thrown upward...").
+  Sentence 2: the exact equation to solve, written in standard notation.
+
+Rules:
+- Do NOT reveal the answer.
+- Do NOT add extra sentences, options, or commentary.
+- Return only the 2 sentences.
+$$;
+
+CREATE FUNCTION write_worked_solution(word_problem TEXT, raw_problem TEXT)
+RETURNS TEXT AS $$
+Solve this math problem step by step.
+
+Problem: {word_problem}
+
+Symbolic engine result (treat this as ground truth — do not recompute):
+{raw_problem}
+
+Write exactly 3-4 numbered steps showing the algebraic work.
+Final step must state the exact_answer from above, unchanged.
+No introductory sentence. No closing commentary. Steps only.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW problem_generator
+  INPUT @topic      TEXT := 'quadratic equations'
+  INPUT @difficulty TEXT := 'medium'
+  INPUT @numbers    TEXT := '1,2,3'
+  INPUT @log_dir    TEXT := 'cookbook/68_problem_generator/logs-spl'
+  OUTPUT @lesson    TEXT
+DO
+  -- Build lesson header with LLM-written intro
+  GENERATE write_lesson_intro(@topic, @difficulty, @numbers) INTO @intro;
+  @lesson := '# ' + @topic + ' — Practice Problems\n\n' + @intro + '\n\n---\n\n';
+
+  CALL now_iso() INTO @run_ts;
+  CALL replace(@run_ts, ':', '') INTO @run_ts;
+  @log_file := f'{@log_dir}/chain_trace-{@run_ts}.md';
+
+  CALL write_file(@log_file,
+    f"# Problem Generator — chain trace\n\n**Topic:** {@topic}\n**Difficulty:** {@difficulty}\n**Problems:** {@numbers}\n**Started:** {@run_ts}\n\n") INTO NONE;
+
+  -- Answer-first loop: SymPy computes exact answer, LLM writes around it
+  WHILE @n IN @numbers DO
+    CALL now_iso() INTO @t_problem;
+
+    -- Deterministic: SymPy generates expression + exact answer
+    CALL generate_math_problem(@topic, @difficulty) INTO @raw;
+
+    -- Probabilistic: LLM writes the question (never sees the derivation)
+    GENERATE write_word_problem(@topic, @raw) INTO @problem_text;
+
+    -- Probabilistic: LLM explains the solution using the exact SymPy answer
+    GENERATE write_worked_solution(@problem_text, @raw) INTO @solution;
+
+    @lesson := @lesson
+            + '## Problem ' + @n + '\n\n'
+            + @problem_text + '\n\n'
+            + '<details><summary>Worked Solution</summary>\n\n'
+            + @solution + '\n\n</details>\n\n---\n\n';
+
+    CALL write_file(@log_file,
+      f"## Problem {@n} (at {@t_problem})\n**Raw:** {@raw}\n\n**Question:** {@problem_text}\n\n**Solution:** {@solution}\n\n---\n\n", 'a') INTO NONE;
+  END;
+
+  CALL now_iso() INTO @t_done;
+  CALL write_file(@log_file,
+    f"## Final lesson (at {@t_done})\n{@lesson}\n\n---\n*status: complete*\n", 'a') INTO NONE;
+
+  RETURN @lesson WITH status = 'complete';
+EXCEPTION
+  WHEN BudgetExceeded THEN
+    CALL now_iso() INTO @t_done;
+    CALL write_file(@log_file,
+      f"## Exception — BudgetExceeded (at {@t_done})\n**Partial lesson:** {@lesson}\n\n---\n*status: budget_limit*\n", 'a') INTO NONE;
+    RETURN @lesson WITH status = 'budget_limit';
+END;

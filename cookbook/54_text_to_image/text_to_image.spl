@@ -1,0 +1,72 @@
+-- Recipe 52: Text to Image
+-- Category: multimodal
+-- Generate an image from a text prompt using DALL-E 3 (cloud) or local SD.
+--
+-- SPL INPUT type:  TEXT  (prompt, style, negative prompt)
+-- SPL OUTPUT type: IMAGE (file path of generated image saved to outputs/)
+--
+-- DODA compile targets:
+--   cloud  → OpenAI DALL-E 3 (default, highest quality)
+--   local  → Stable Diffusion via ComfyUI REST / diffusers (no API key)
+--
+-- Physical execution: run.py
+
+CREATE FUNCTION enhance_prompt(prompt TEXT, style TEXT, aspect TEXT)
+RETURN TEXT
+AS $$
+You are a professional prompt engineer for image generation models.
+
+Enhance the following image prompt to be more vivid, specific, and effective
+for DALL-E 3 or Stable Diffusion.
+
+Original prompt: {prompt}
+Desired style:   {style}
+Aspect ratio:    {aspect}
+
+Rules:
+- Keep the core subject intact
+- Add lighting, camera angle, and mood details
+- Add style keywords appropriate for the style
+- Keep it under 200 words
+- Return ONLY the enhanced prompt, no explanation
+
+$$;
+
+
+WORKFLOW text_to_image
+    INPUT:
+        @prompt       TEXT   DEFAULT 'A serene mountain lake at golden hour, reflection of snow-capped peaks',
+        @style        TEXT   DEFAULT 'photorealistic',
+        @aspect       TEXT   DEFAULT 'landscape',
+        @quality      TEXT   DEFAULT 'hd',
+        @enhance      BOOL   DEFAULT TRUE,
+        @model        TEXT   DEFAULT 'dall-e-3',
+        @output_dir   TEXT   DEFAULT 'cookbook/54_text_to_image/outputs',
+        @llm_model    TEXT   DEFAULT 'gemma4:e4b',
+        @log_dir      TEXT   DEFAULT 'cookbook/54_text_to_image/logs-spl'
+    OUTPUT: @image_path IMAGE
+DO
+    LOGGING f'[text_to_image] prompt="{@prompt}" style={@style}' LEVEL INFO
+
+    EVALUATE @enhance
+        WHEN = TRUE THEN
+            GENERATE enhance_prompt(@prompt, @style, @aspect)
+                WITH OUTPUT BUDGET 512 TOKENS
+                USING MODEL @llm_model
+                INTO @final_prompt
+            LOGGING f'[text_to_image] enhanced prompt ready' LEVEL DEBUG
+        ELSE
+            @final_prompt := @prompt
+    END
+
+    -- IMAGE generation is handled by the physical runner (run.py)
+    -- The runner calls the appropriate backend and saves the file.
+    -- @image_path receives the saved file path as a TEXT-encoded IMAGE value.
+    LOGGING f'[text_to_image] generating image via {@model}' LEVEL INFO
+    RETURN @final_prompt
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[text_to_image] image model unavailable — check OPENAI_API_KEY' LEVEL ERROR
+        RETURN '[ERROR] Image generation model unavailable.' WITH status = 'failed'
+END

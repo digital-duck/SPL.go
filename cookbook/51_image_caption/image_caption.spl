@@ -1,0 +1,86 @@
+-- Recipe 50: Image Caption
+-- Category: multimodal
+-- Describe an image using a vision-capable model (Gemma 4 via Ollama).
+--
+-- This is the DODA logical view — hardware-agnostic, model-agnostic.
+-- Physical execution: run.py  (uses spl.codecs + LiquidAdapter / OllamaAdapter)
+-- splc target: python/liquid (edge), go + Ollama (Intel Mini-PC)
+--
+-- SPL type: IMAGE  (spl/types.py SPL3Type.IMAGE)
+-- Runtime note: IMAGE params are encoded by the codec layer (spl/codecs/image_codec.py)
+-- before being passed to generate_multimodal().  The SPL executor will handle this
+-- natively once multimodal param pass-through is implemented.
+
+CREATE FUNCTION caption(photo IMAGE, question TEXT)
+RETURN TEXT
+AS $$
+You are a precise visual analyst.
+
+Look at the image and answer the following question concisely and accurately.
+
+Question: {question}
+$$;
+
+CREATE FUNCTION detailed_caption(photo IMAGE)
+RETURN TEXT
+AS $$
+You are a detailed visual analyst. Describe this image comprehensively.
+
+Cover:
+- Main subject(s) and their key characteristics
+- Setting, background, environment
+- Colors, lighting, and overall mood
+- Any visible text, signs, or notable details
+$$;
+
+CREATE FUNCTION ocr(photo IMAGE)
+RETURN TEXT
+AS $$
+You are an OCR engine. Extract all visible text from this image exactly as it appears.
+If no text is present, reply with: [NO TEXT FOUND]
+$$;
+
+
+WORKFLOW image_caption
+    INPUT:
+        @photo    IMAGE  DEFAULT 'cookbook/51_image_caption/sample/photo.jpg',
+        @question TEXT   DEFAULT 'What is in this image? Describe it in detail.',
+        @mode     TEXT   DEFAULT 'caption',
+        @model    TEXT   DEFAULT 'gemma4:12b',
+        @output_budget INT DEFAULT 1024,
+        @log_dir TEXT DEFAULT 'cookbook/51_image_caption/logs-spl'
+    OUTPUT: @result TEXT
+DO
+    LOGGING f'[image_caption] photo={@photo} mode={@mode} model={@model}' LEVEL INFO
+
+    EVALUATE @mode
+        WHEN = 'caption' THEN
+            GENERATE caption(@photo, @question)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'detailed' THEN
+            GENERATE detailed_caption(@photo)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'ocr' THEN
+            GENERATE ocr(@photo)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        ELSE
+            GENERATE caption(@photo, @question)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+    END
+
+    LOGGING f'[image_caption] done | output_len={len(@result)}' LEVEL INFO
+    RETURN @result
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[image_caption] model unavailable — check Ollama is running and gemma4 is pulled' LEVEL ERROR
+        RETURN '[ERROR] Vision model unavailable.' WITH status = 'failed'
+END

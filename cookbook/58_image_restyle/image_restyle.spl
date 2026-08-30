@@ -1,0 +1,78 @@
+-- Recipe 54: Image Restyle
+-- Category: multimodal
+-- Analyse an image (IMAGE input) and generate a restyled version (IMAGE output).
+-- Intermediate step produces a TEXT description / SD prompt.
+--
+-- SPL INPUT types:  IMAGE (source photo) + TEXT (style instruction)
+-- SPL OUTPUT types: TEXT (description + DALL-E prompt) + IMAGE (restyled image path)
+--
+-- Pipeline:
+--   [source image]  +  [style instruction]
+--         │
+--         ▼  Gemma4 / vision model  (generate_multimodal)
+--   [image description + DALL-E prompt]
+--         │
+--         ▼  DALL-E 3
+--   [restyled image file]
+--
+-- DODA targets:
+--   python/liquid → local vision (Gemma4 Ollama) + cloud image gen (DALL-E)
+--   go            → Intel Mini-PC vision pipeline
+--
+-- Physical execution: run.py
+
+CREATE FUNCTION analyse_and_prompt(photo IMAGE, style TEXT, preserve TEXT)
+RETURN TEXT
+AS $$
+You are a visual artist and prompt engineer.
+
+Analyse this image and create a DALL-E 3 prompt to regenerate it in a new style.
+
+Style to apply: {style}
+Elements to preserve: {preserve}
+
+Return a JSON object with exactly these two fields:
+{{
+  "description": "<1-2 sentence description of what you see in the original image>",
+  "dalle_prompt": "<detailed DALL-E 3 prompt to recreate the scene in the requested style>"
+}}
+
+Rules for dalle_prompt:
+- Preserve the original composition, subjects, and key elements
+- Apply the requested style transformation explicitly
+- Include lighting, mood, and technical details
+- Keep it under 150 words
+$$;
+
+
+WORKFLOW image_restyle
+    INPUT:
+        @photo        IMAGE  DEFAULT 'cookbook/58_image_restyle/sample/photo.jpg',
+        @style        TEXT   DEFAULT 'watercolor painting, soft edges, pastel tones',
+        @preserve     TEXT   DEFAULT 'composition, main subject, mood',
+        @quality      TEXT   DEFAULT 'hd',
+        @dalle_style  TEXT   DEFAULT 'natural',
+        @vision_model TEXT   DEFAULT 'gemma4:12b',
+        @output_dir   TEXT   DEFAULT 'cookbook/58_image_restyle/outputs',
+        @log_dir      TEXT   DEFAULT 'cookbook/58_image_restyle/logs-spl'
+    OUTPUT: @result TEXT
+DO
+    LOGGING f'[image_restyle] photo={@photo} style="{@style}"' LEVEL INFO
+
+    -- Step 1: Vision analysis → DALL-E prompt  (IMAGE in → TEXT out)
+    GENERATE analyse_and_prompt(@photo, @style, @preserve)
+        WITH OUTPUT BUDGET 512 TOKENS
+        USING MODEL @vision_model
+        INTO @result
+
+    LOGGING '[image_restyle] vision analysis done — generating image ...' LEVEL INFO
+
+    -- Step 2: Image generation is handled by run.py using the DALL-E prompt
+    -- extracted from @result (JSON: {description, dalle_prompt})
+    RETURN @result
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[image_restyle] vision model unavailable' LEVEL ERROR
+        RETURN '[ERROR] Vision model unavailable.' WITH status = 'failed'
+END

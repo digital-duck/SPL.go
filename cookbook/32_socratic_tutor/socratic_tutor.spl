@@ -1,0 +1,153 @@
+-- Recipe Name: Socratic Tutor
+-- Ask guiding questions rather than giving answers directly.
+-- Demonstrates persona-constrained generation + iterative dialogue simulation,
+-- with deterministic tools for topic loading, level guidance, and dialogue formatting.
+--
+-- Usage (topic from catalog):
+--   spl3 run cookbook/32_socratic_tutor/socratic_tutor.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/32_socratic_tutor/tools.py \
+--       topic_id=sky_blue subject=science student_level="middle school"
+--
+--   spl3 run cookbook/32_socratic_tutor/socratic_tutor.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/32_socratic_tutor/tools.py \
+--       topic_id=sqrt2_irrational subject=math student_level=undergraduate
+--
+--   spl3 run cookbook/32_socratic_tutor/socratic_tutor.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/32_socratic_tutor/tools.py \
+--       topic_id=recursion subject=programming student_level="high school"
+--
+-- Usage (freeform topic, no catalog):
+--   spl3 run cookbook/32_socratic_tutor/socratic_tutor.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/32_socratic_tutor/tools.py \
+--       topic="Why is the speed of light constant?" student_level=undergraduate
+--
+-- List available topics:
+--   spl3 run ... topic_id=list subject=science    (or math, programming)
+
+-- ── Socratic persona (zero LLM cost — injected as system context) ───────────
+
+IMPORT 'tools'
+
+CREATE FUNCTION socratic_persona(student_level TEXT DEFAULT 'high school')
+RETURN TEXT
+AS $$
+You are a Socratic tutor. Your role is to guide the student to discover answers themselves.
+
+Core rules — NEVER break these:
+1. Ask exactly ONE clear question at a time. Never give two questions in one turn.
+2. Never state facts or give direct answers. All knowledge must come from the student.
+3. Build on what the student just said — start from their words, not a script.
+4. If a student is stuck, give a hint as another question: "What if you considered...?"
+5. Celebrate partial insights: "Good instinct! Now what does that suggest about...?"
+6. Never say "The answer is...", "You should know that...", or "Actually, it's...".
+
+Student level: {student_level}
+Adjust vocabulary, abstraction level, and question complexity accordingly.
+$$;
+
+-- ── Main workflow ───────────────────────────────────────────────────────────
+
+WORKFLOW socratic_tutor
+    INPUT:  @topic         TEXT DEFAULT "",
+            @topic_id      TEXT DEFAULT "",
+            @subject       TEXT DEFAULT "",
+            @student_level TEXT DEFAULT 'high school',
+            @max_questions INT  DEFAULT 5
+    OUTPUT: @dialogue TEXT
+DO
+    LOGGING f'Socratic tutor | level={@student_level} topic={@topic} topic_id={@topic_id}' LEVEL INFO
+
+    -- Step 1: Load structured topic context from catalog (deterministic — no LLM)
+    CALL load_topic(@topic_id, @subject) INTO @topic_context
+
+    -- Step 2: Get level-appropriate vocabulary and scaffolding guidance (deterministic — no LLM)
+    CALL get_level_guidance(@student_level) INTO @level_guide
+    LOGGING 'Topic and level guidance loaded' LEVEL DEBUG
+
+    -- Step 3: Opening Socratic question — grounded by topic context and level guide (LLM)
+    GENERATE opening_question(
+        @topic,
+        @topic_context,
+        socratic_persona(@student_level),
+        @level_guide
+    ) INTO @question_1
+
+    -- Step 4: Simulate a typical student response at the given level (LLM)
+    GENERATE simulate_student_response(
+        @question_1,
+        @topic,
+        @topic_context,
+        @student_level
+    ) INTO @student_1
+
+    -- Step 5: Follow-up question that builds on the student's actual response (LLM)
+    GENERATE followup_question(
+        @question_1,
+        @student_1,
+        @topic,
+        @topic_context,
+        socratic_persona(@student_level)
+    ) INTO @question_2
+
+    -- Step 6: Student works further toward understanding (LLM)
+    GENERATE simulate_student_response(
+        @question_2,
+        @topic,
+        @topic_context,
+        @student_level
+    ) INTO @student_2
+
+    -- Step 7: Assess whether understanding is emerging (LLM — returns 0-10 score)
+    GENERATE assess_understanding(
+        @student_1,
+        @student_2,
+        @topic,
+        @topic_context
+    ) INTO @understanding_score
+    LOGGING f'Understanding score: {@understanding_score}' LEVEL INFO
+
+    -- Step 8: Adapt the third question based on understanding score
+    EVALUATE @understanding_score
+        WHEN > 7 THEN
+            -- Student is getting it — consolidation question to cement understanding
+            GENERATE consolidation_question(
+                @topic,
+                @topic_context,
+                @student_2,
+                socratic_persona(@student_level)
+            ) INTO @question_3
+        ELSE
+            -- Student needs more scaffolding — hint question to unblock
+            GENERATE hint_question(
+                @question_2,
+                @topic,
+                @topic_context,
+                socratic_persona(@student_level),
+                @level_guide
+            ) INTO @question_3
+    END
+
+    -- Step 9: Final student response to the third question (LLM)
+    GENERATE simulate_student_response(
+        @question_3,
+        @topic,
+        @topic_context,
+        @student_level
+    ) INTO @student_3
+
+    -- Step 10: Format the complete dialogue (deterministic — no LLM)
+    CALL compile_dialogue(
+        @question_1, @student_1,
+        @question_2, @student_2,
+        @question_3, @student_3,
+        @topic,
+        @understanding_score
+    ) INTO @dialogue
+
+    LOGGING f'Dialogue compiled | understanding_score={@understanding_score}' LEVEL INFO
+    RETURN @dialogue WITH status = 'complete', understanding_score = @understanding_score
+END

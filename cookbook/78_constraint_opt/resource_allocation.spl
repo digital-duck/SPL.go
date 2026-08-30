@@ -1,0 +1,262 @@
+-- ============================================================
+-- Recipe 78d: Resource Allocation — Project Portfolio Selection (Binary ILP)
+--
+-- Domain: Strategic planning / IT — select which projects to fund
+-- given a limited budget and headcount to maximize total value.
+--
+-- PuLP problem type: Binary Integer Linear Program (0-1 Knapsack variant)
+--   en.wikipedia.org/wiki/Knapsack_problem
+--
+--   Decision variables : y[p] ∈ {0,1} — project p is selected (1) or not (0)
+--   Objective          : maximize Σ value[p] · y[p]
+--   Constraints        :
+--     budget    — Σ cost[p]   · y[p] ≤ budget
+--     headcount — Σ devmos[p] · y[p] ≤ capacity
+--     y[p] ∈ {0, 1}
+--
+-- Default problem (6 projects, hand-verifiable):
+--
+--   Project | Cost ($K) | Dev-months | Value
+--   --------|-----------|------------|------
+--   P1      |   120     |     3      |   8
+--   P2      |    80     |     2      |   5
+--   P3      |   200     |     5      |  10
+--   P4      |   150     |     3      |   9
+--   P5      |    60     |     2      |   4
+--   P6      |    90     |     2      |   6
+--
+--   Budget: $500K   Headcount: 10 dev-months
+--
+--   Known optimal: select P1+P2+P4+P6 → value = 28
+--     Cost:      120+80+150+90 = $440K  ≤ $500K ✓
+--     Dev-months: 3+2+3+2      = 10     ≤ 10    ✓
+--     Value: 8+5+9+6 = 28
+--
+--   Why not P1+P2+P4+P5? → value=26 (worse)
+--   Why not P1+P3+P2?    → cost=$400K, dev=10, value=23 (worse)
+--   Why not P1+P2+P4+P6+P5? → dev=12 > 10 (infeasible)
+--
+-- SPL value demonstrated:
+--   Binary ILP for strategic decisions. The ASSERT gate ensures that
+--   only a proven-optimal portfolio reaches the interpretation step —
+--   no "sounds reasonable" LLM guesses about project combinations.
+--
+-- Run:
+--   spl-go run cookbook/78_constraint_opt/resource_allocation.spl \
+--       --adapter claude_cli
+--   spl-go run cookbook/78_constraint_opt/resource_allocation.spl \
+--       --llm ollama:gemma3 \
+--       --param problem="We have 8 research grants ..."
+-- ============================================================
+
+-- ── Deterministic regime: PuLP ILP solver ────────────────────
+
+CREATE TOOL_API run_pulp(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_pulp(code: str) -> str:
+    import json, re, pulp
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"pulp": pulp}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API is_optimal(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def is_optimal(result_json: str) -> bool:
+    import json
+    try:
+        return json.loads(result_json).get("status") == "Optimal"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API format_portfolio(problem TEXT, lp_code TEXT,
+                                 solution_json TEXT, narrative TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_portfolio(problem: str, lp_code: str,
+                     solution_json: str, narrative: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    status    = sol.get("status", "Unknown")
+    objective = sol.get("objective")
+    variables = sol.get("variables", {})
+
+    lines = [
+        "# Resource Allocation Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Solver status:** `{status}`",
+    ]
+    if objective is not None:
+        lines.append(f"**Maximum portfolio value:** {objective:.4g}")
+    if variables:
+        selected = [k for k, v in variables.items()
+                    if float(v) > 0.5 if not isinstance(v, str)]
+        rejected = [k for k, v in variables.items()
+                    if float(v) <= 0.5 if not isinstance(v, str)]
+        lines += ["", "**Selected projects:**"]
+        for p in selected:
+            lines.append(f"  ✓ {p}")
+        lines += ["", "**Rejected projects:**"]
+        for p in rejected:
+            lines.append(f"  ✗ {p}")
+    lines += ["", "## Interpretation", "", narrative.strip()]
+    lines += ["", "## Solver Code (LLM-generated, PuLP)", "", "```python", lp_code.strip(), "```"]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_portfolio_ilp(problem TEXT)
+RETURNS TEXT AS $$
+You are an operations research expert specializing in resource allocation and
+portfolio optimization. Convert this project selection problem to runnable PuLP
+Binary Integer Linear Program (0-1 ILP) code.
+
+Rules:
+- The `pulp` module is already in scope — do NOT add import statements
+- Model this as a binary knapsack / portfolio ILP:
+    * Create a pulp.LpProblem with sense=pulp.LpMaximize
+    * Decision variables: y[project] = binary (1 if selected, 0 if rejected)
+      Use pulp.LpVariable(f"y_{project_id}", cat='Binary')
+    * Objective: maximize total value = Σ value[p] · y[p]
+    * Budget constraint:    Σ cost[p]      · y[p] ≤ total_budget
+    * Headcount constraint: Σ devmonths[p] · y[p] ≤ total_devmonths
+    * Call: prob.solve(pulp.PULP_CBC_CMD(msg=0))
+- After solving, store the result EXACTLY as:
+    _result = {
+        "status": pulp.LpStatus[prob.status],
+        "objective": pulp.value(prob.objective),
+        "variables": {v.name: pulp.value(v) for v in prob.variables()}
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem:
+{problem}
+$$;
+
+CREATE FUNCTION repair_portfolio_ilp(problem TEXT, lp_code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This PuLP project portfolio ILP produced an error or non-Optimal result.
+
+Problem:
+{problem}
+
+Previous code:
+{lp_code}
+
+Error / solver status:
+{error_info}
+
+Fix the code. Common causes:
+- Forgot cat='Binary' (treats selection as fractional — wrong)
+- Wrong objective sense: use LpMaximize for value maximization
+- Budget/headcount constraint direction must be <= (upper bound)
+- Infeasible: if even the cheapest/smallest project exceeds all constraints
+- Variable name collision (use consistent naming like y_P1, y_P2, ...)
+- Missing _result assignment
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_portfolio(problem TEXT, solution_json TEXT, lang TEXT)
+RETURNS TEXT AS $$
+You are a strategic planning analyst. Interpret this project portfolio optimization
+result for a leadership team making investment decisions.
+
+Problem:
+{problem}
+
+Optimal portfolio (JSON — variables with value 1.0 are selected):
+{solution_json}
+
+Write a concise briefing (under 200 words):
+1. Which projects are selected and what is the total portfolio value?
+2. What is the total cost and headcount utilized vs. available?
+3. Which high-value projects were left out and why (budget, headcount, or both)?
+4. One strategic observation — e.g., is there a project combination the team might
+   want to revisit if additional budget or headcount became available?
+
+Write in {lang}. No JSON, no code. Address this to decision-makers, not engineers.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW resource_allocation
+  INPUT @problem TEXT := "An IT department must select a portfolio of projects for next quarter. Six candidate projects are available. Project P1 costs $120K and requires 3 developer-months, delivering strategic value 8. Project P2 costs $80K and requires 2 developer-months, delivering value 5. Project P3 costs $200K and requires 5 developer-months, delivering value 10. Project P4 costs $150K and requires 3 developer-months, delivering value 9. Project P5 costs $60K and requires 2 developer-months, delivering value 4. Project P6 costs $90K and requires 2 developer-months, delivering value 6. The total budget is $500K and the team has 10 developer-months available. Each project is either fully funded or not funded — no partial investment. Select which projects to fund to maximize total strategic value."
+  INPUT @max_tries INTEGER := 3
+  INPUT @lang TEXT := "English"
+  INPUT @out_dir TEXT := "./cookbook/78_constraint_opt/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  LOGGING f"[resource_allocation] start  ts={@ts_safe}  max_tries={@max_tries}" LEVEL INFO
+
+  -- Stage 1: LLM formulates binary ILP; PuLP solves; repair on failure
+  @tries   := 0;
+  @status  := "init";
+  @lp_code := "";
+  @solution := "{}";
+
+  WHILE @tries < @max_tries DO
+    EVALUATE @status
+      WHEN = "Optimal" THEN
+        @tries := @max_tries;
+
+      WHEN = "init" THEN
+        LOGGING "[resource_allocation] attempt 1 — LLM formulating portfolio ILP" LEVEL INFO
+        GENERATE formulate_portfolio_ilp(@problem) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[resource_allocation] attempt {@tries}: status={@status}" LEVEL INFO
+
+      ELSE
+        CALL result_error(@solution) INTO @error_info;
+        LOGGING f"[resource_allocation] repair {@tries} — error: {@error_info}" LEVEL INFO
+        GENERATE repair_portfolio_ilp(@problem, @lp_code, @error_info) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[resource_allocation] repair {@tries}: status={@status}" LEVEL INFO
+    END;
+  END;
+
+  -- Stage 2: deterministic gate — only a proven-optimal portfolio proceeds
+  LOGGING f"[resource_allocation] ASSERT gate (status={@status})" LEVEL INFO
+  ASSERT is_optimal(@solution);
+  LOGGING "[resource_allocation] ASSERT passed — portfolio is provably optimal" LEVEL INFO
+
+  -- Stage 3: LLM frames the portfolio decision for leadership
+  GENERATE interpret_portfolio(@problem, @solution, @lang) INTO @narrative;
+
+  CALL format_portfolio(@problem, @lp_code, @solution, @narrative) INTO @report;
+
+  CALL write_file(f"{@out_dir}/resource_allocation_{@ts_safe}.md", @report) INTO @out_path;
+  CALL time_elapsed(@t_start) INTO @elapsed;
+  LOGGING f"[resource_allocation] done — report → {@out_path}  ({@elapsed}s)" LEVEL INFO
+
+  RETURN @report WITH status = "complete";
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Portfolio solver did not reach Optimal after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/resource_allocation_{@ts_safe}.md", @report) INTO @out_path;
+    CALL time_elapsed(@t_start) INTO @elapsed;
+    LOGGING f"[resource_allocation] infeasible — {@out_path}  ({@elapsed}s)" LEVEL INFO
+    RETURN @report WITH status = "infeasible";
+END;

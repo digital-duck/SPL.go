@@ -1,0 +1,117 @@
+-- Recipe 43: Prompt Self-Tuning (Meta-Programming)
+-- Demonstrates automated prompt optimization via A/B generation and scoring.
+-- Two improved prompt variants are generated from a baseline + failure case,
+-- then each is tested against that failure case and the winner is selected.
+--
+-- Usage:
+--   spl3 run cookbook/43_prompt_self_tuning/prompt_self_tuning.spl \
+--       --adapter ollama \
+--       baseline_prompt="Summarize this technical document." \
+--       failed_case="The document describes a complex quantum algorithm."
+
+CREATE TOOL_API check_quality(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def check_quality(text: str) -> str:
+    """
+    Heuristic quality gate for generated text.
+
+    Checks:
+      - Minimum word count (>= 30 words)
+      - Not a refusal / error message
+      - Not mostly whitespace
+
+    Returns 'pass' if all checks pass, or 'fail:<reason>' otherwise.
+    This is a deterministic check — zero LLM tokens consumed.
+    """
+    _MIN_WORDS = 30
+    if not text or not text.strip():
+        return "fail:empty_response"
+
+    words = text.split()
+    if len(words) < _MIN_WORDS:
+        return f"fail:too_short({len(words)}_words)"
+
+    lower = text.lower()
+    refusal_markers = [
+        "i cannot", "i can't", "i'm unable", "i am unable",
+        "as an ai", "i don't have", "i do not have",
+        "error:", "exception:", "traceback",
+    ]
+    for marker in refusal_markers:
+        if marker in lower:
+            return "fail:refusal_detected"
+
+    return "pass"
+$$;
+
+CREATE FUNCTION variation_prompt(baseline TEXT, failed_case TEXT, variant_num TEXT)
+RETURN TEXT
+AS $$
+You are a meta-prompting expert. Generate exactly one improved prompt variant (variant {variant_num})
+of the baseline prompt, specifically designed to handle the failing case better.
+
+Output only the improved prompt text — no explanation, no label, no quotes.
+
+Baseline prompt: {baseline}
+Failing case: {failed_case}
+$$;
+
+CREATE FUNCTION test_prompt(prompt_text TEXT, test_case TEXT)
+RETURN TEXT
+AS $$
+{prompt_text}
+
+Input:
+{test_case}
+$$;
+
+WORKFLOW prompt_self_tuning
+    INPUT:
+        @baseline_prompt TEXT DEFAULT 'Summarize this technical document.',
+        @failed_case     TEXT DEFAULT 'The document describes a complex quantum algorithm.',
+        @log_dir TEXT DEFAULT 'cookbook/43_prompt_self_tuning/logs-spl'
+    OUTPUT: @winning_prompt TEXT
+DO
+    LOGGING f'Generating prompt variations for failed case: {@failed_case}' LEVEL INFO
+
+    -- Step 1: Generate two targeted variants (each is its own focused LLM call)
+    GENERATE variation_prompt(@baseline_prompt, @failed_case, '1') INTO @v1
+    GENERATE variation_prompt(@baseline_prompt, @failed_case, '2') INTO @v2
+    LOGGING f'Variant 1: {@v1}' LEVEL DEBUG
+    LOGGING f'Variant 2: {@v2}' LEVEL DEBUG
+
+    -- Step 2: Test each variant against the failing case
+    LOGGING 'Running mini A/B test on variants ...' LEVEL INFO
+
+    GENERATE test_prompt(@v1, @failed_case) INTO @result_v1
+    CALL check_quality(@result_v1) INTO @score_v1
+    LOGGING f'Variant 1 score: {@score_v1}' LEVEL DEBUG
+
+    GENERATE test_prompt(@v2, @failed_case) INTO @result_v2
+    CALL check_quality(@result_v2) INTO @score_v2
+    LOGGING f'Variant 2 score: {@score_v2}' LEVEL DEBUG
+
+    -- Step 3: Select the winner (prefer v1 > v2 > baseline)
+    EVALUATE @score_v1
+        WHEN contains('pass') THEN
+            LOGGING 'Winner: variant 1' LEVEL INFO
+            @winning_prompt := @v1
+        ELSE
+            EVALUATE @score_v2
+                WHEN contains('pass') THEN
+                    LOGGING 'Winner: variant 2' LEVEL INFO
+                    @winning_prompt := @v2
+                ELSE
+                    LOGGING 'No variant passed — retaining baseline prompt' LEVEL WARN
+                    @winning_prompt := @baseline_prompt
+            END
+    END
+
+    CALL write_file(f'{@log_dir}/winning_prompt.md', @winning_prompt) INTO NONE
+
+    RETURN @winning_prompt WITH status = 'complete'
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN @baseline_prompt WITH status = 'baseline_fallback', reason = 'generation_error'
+END

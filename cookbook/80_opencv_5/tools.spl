@@ -1,0 +1,120 @@
+-- Tools for Recipe 80: OpenCV 5
+-- All three tools are deterministic (zero LLM cost) — OpenCV does the seeing,
+-- SPL's GENERATE steps (in the .spl workflows) do the reasoning over the
+-- structured JSON these tools return. None of these functions look at an
+-- LLM; none of the GENERATE steps in the workflows look at raw pixels.
+
+CREATE TOOL_API detect_change(background_path TEXT, current_path TEXT) RETURNS TEXT AS PYTHON $$
+import cv2
+import numpy as np
+import json
+
+def detect_change(background_path, current_path):
+    bg = cv2.imread(background_path)
+    cur = cv2.imread(current_path)
+    if bg is None or cur is None:
+        return json.dumps({"error": "could not read one or both images"})
+
+    if bg.shape != cur.shape:
+        cur = cv2.resize(cur, (bg.shape[1], bg.shape[0]))
+
+    bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+    cur_gray = cv2.cvtColor(cur, cv2.COLOR_BGR2GRAY)
+
+    # OpenCV 5: CV_16F (half-precision float) is a first-class Mat depth.
+    # Diffing in fp16 halves the memory bandwidth of the classic CV_32F
+    # path — the kind of saving that matters when this runs on an edge/
+    # robot HAL backend (KleidiCV on Arm, FastCV on Snapdragon) rather
+    # than a desktop CPU.
+    bg_f16 = bg_gray.astype(np.float16)
+    cur_f16 = cur_gray.astype(np.float16)
+    diff = cv2.absdiff(cur_f16, bg_f16)
+
+    threshold = 25.0
+    changed_mask = (diff > threshold).astype(np.uint8) * 255
+
+    changed_ratio = float(np.count_nonzero(changed_mask)) / changed_mask.size
+
+    contours, _ = cv2.findContours(changed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_bbox = None
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+        largest_bbox = [int(x), int(y), int(w), int(h)]
+
+    return json.dumps({
+        "changed_pixel_ratio": round(changed_ratio, 4),
+        "num_regions": len(contours),
+        "largest_region_bbox": largest_bbox,
+        "motion_detected": changed_ratio > 0.01,
+    })
+$$;
+
+CREATE TOOL_API detect_circular_objects(image_path TEXT) RETURNS TEXT AS PYTHON $$
+import cv2
+import json
+
+def detect_circular_objects(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return json.dumps({"error": "could not read image"})
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    # OpenCV 5''s Python bindings accept keyword arguments on core APIs —
+    # most of these were positional-only through the 4.x series.
+    circles = cv2.HoughCircles(
+        image=gray, method=cv2.HOUGH_GRADIENT, dp=1, minDist=40,
+        param1=50, param2=30, minRadius=8, maxRadius=120,
+    )
+
+    boxes = []
+    if circles is not None:
+        for x, y, r in circles[0]:
+            boxes.append([round(float(x), 1), round(float(y), 1), round(float(r), 1)])
+
+    return json.dumps({"circle_count": len(boxes), "circles_xyr": boxes})
+$$;
+
+CREATE TOOL_API measure_exposure(image_path TEXT) RETURNS TEXT AS PYTHON $$
+import cv2
+import numpy as np
+import json
+
+def measure_exposure(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return json.dumps({"error": "could not read image"})
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean_brightness = float(np.mean(gray))
+
+    hist = cv2.calcHist(images=[gray], channels=[0], mask=None, histSize=[256], ranges=[0, 256])
+    total = float(np.sum(hist))
+    dark_ratio = float(np.sum(hist[:64])) / total
+    bright_ratio = float(np.sum(hist[192:])) / total
+
+    return json.dumps({
+        "mean_brightness": round(mean_brightness, 2),
+        "underexposed_ratio": round(dark_ratio, 4),
+        "overexposed_ratio": round(bright_ratio, 4),
+    })
+$$;
+
+CREATE TOOL_API detect_edge_density(image_path TEXT) RETURNS TEXT AS PYTHON $$
+import cv2
+import numpy as np
+import json
+
+def detect_edge_density(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return json.dumps({"error": "could not read image"})
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(image=gray, threshold1=50, threshold2=150)
+    edge_ratio = float(np.count_nonzero(edges)) / edges.size
+
+    return json.dumps({"edge_pixel_ratio": round(edge_ratio, 4)})
+$$;

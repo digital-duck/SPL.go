@@ -1,0 +1,113 @@
+-- Recipe Name: Sentiment Pipeline
+-- Batch sentiment over a list of inputs, aggregate trend statistics.
+-- Demonstrates iteration over a list with per-item structured output + aggregation,
+-- with deterministic tool calls for loading, splitting, stats, and extreme detection.
+--
+-- Usage (load from file):
+--   spl3 run cookbook/31_sentiment_pipeline/sentiment.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/31_sentiment_pipeline/tools.py \
+--       filename=product_reviews.txt \
+--       domain=product_reviews
+--
+-- Usage (inline pipe-delimited):
+--   spl3 run cookbook/31_sentiment_pipeline/sentiment.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/31_sentiment_pipeline/tools.py \
+--       items="Great product, love it! | Terrible experience, never again | It was okay I guess" \
+--       delimiter="|" \
+--       domain=product_reviews
+--
+-- Sample files in reviews/:
+--   product_reviews.txt   15 product reviews (positive, negative, mixed)
+--   support_tickets.txt   12 customer support messages
+--   social_media.txt      15 social media posts
+
+-- ── Schema (zero LLM cost — injected as grounding context) ─────────────────
+
+IMPORT 'tools'
+
+CREATE FUNCTION sentiment_schema()
+RETURN JSON
+AS $$
+{
+  "type": "array",
+  "description": "One entry per input item, in the same order as the input list.",
+  "items": {
+    "type": "object",
+    "properties": {
+      "item":       {"type": "string", "description": "The original text that was analysed"},
+      "label":      {"type": "string", "enum": ["positive", "negative", "neutral", "mixed"]},
+      "score":      {"type": "number", "minimum": -1, "maximum": 1,
+                     "description": "Sentiment score: -1 most negative, +1 most positive"},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1,
+                     "description": "Model confidence in the label"},
+      "emotions":   {"type": "array", "items": {"type": "string"},
+                     "description": "Detected emotions e.g. joy, anger, frustration, surprise"},
+      "key_phrases":{"type": "array", "items": {"type": "string"},
+                     "description": "Most sentiment-bearing phrases from the text"}
+    },
+    "required": ["item", "label", "score", "confidence"]
+  }
+}
+$$;
+
+-- ── Main workflow ───────────────────────────────────────────────────────────
+
+WORKFLOW sentiment_pipeline
+    INPUT:  @filename  TEXT DEFAULT "",
+            @items     TEXT DEFAULT "",
+            @delimiter TEXT DEFAULT '\n',
+            @domain    TEXT DEFAULT 'general'
+    OUTPUT: @report TEXT
+DO
+    LOGGING f'Sentiment pipeline | domain={@domain} filename={@filename}' LEVEL INFO
+
+    -- Step 1: Load items from file if filename provided (deterministic — no LLM)
+    CALL load_items(@filename) INTO @file_content
+
+    -- Step 2: Split into a clean JSON array (deterministic — no LLM)
+    CALL split_items(@file_content, @items, @delimiter) INTO @item_list
+    LOGGING f'Items loaded and split | list={@item_list}' LEVEL DEBUG
+
+    -- Step 3: Batch sentiment — one structured result per item (LLM)
+    LOGGING 'Running batch sentiment ...' LEVEL INFO
+    GENERATE batch_sentiment(@item_list, sentiment_schema(), @domain) 
+        INTO @sentiment_results
+
+    -- Step 4: Compute aggregate statistics (deterministic — no LLM)
+    CALL compute_stats(@sentiment_results) INTO @stats_json
+    LOGGING f'Stats computed: {@stats_json}' LEVEL DEBUG
+
+    -- Step 5: Identify extreme and notable items (deterministic — no LLM)
+    CALL find_extremes(@sentiment_results) INTO @extremes
+
+    -- Step 6: Generate trend narrative from stats and extremes (LLM)
+    GENERATE summarize_sentiment_trends(
+        @stats_json,
+        @extremes,
+        @domain
+    ) INTO @trend_summary
+    LOGGING 'Trend narrative ready' LEVEL DEBUG
+
+    -- Step 7: Assemble the full report (LLM)
+    GENERATE assemble_sentiment_report(
+        @sentiment_results,
+        @stats_json,
+        @trend_summary,
+        @extremes,
+        @domain
+    ) INTO @report
+
+    LOGGING f'Sentiment report complete | domain={@domain}' LEVEL INFO
+    RETURN @report WITH status = 'complete', domain = @domain
+
+EXCEPTION
+    WHEN ContextLengthExceeded THEN
+        -- Too many items — skip per-item detail, return stats + trend only
+        CALL compute_stats(@sentiment_results) INTO @stats_json
+        CALL find_extremes(@sentiment_results) INTO @extremes
+        GENERATE summarize_sentiment_trends(@stats_json, @extremes, @domain) INTO @trend_summary
+        SET @report = @trend_summary
+        RETURN @report WITH status = 'stats_only', reason = 'context_length_exceeded'
+END

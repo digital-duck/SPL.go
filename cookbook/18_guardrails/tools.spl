@@ -1,0 +1,170 @@
+-- tools.spl — TOOL_API definitions for Recipe 18: Guardrails Pipeline
+-- Imported by guardrails.spl via IMPORT 'tools'
+
+CREATE TOOL_API load_test_input(input_id TEXT)
+RETURNS TEXT AS PYTHON $$
+def load_test_input(input_id: str) -> str:
+    import json
+    import os
+
+    data_dir = "cookbook/18_guardrails"
+    path = os.path.join(data_dir, "test_inputs.json")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    inputs = {t["id"]: t for t in data["test_inputs"]}
+    input_id = input_id.strip().lower()
+
+    if not input_id or input_id == "list":
+        lines = ["Available test inputs:", ""]
+        for t in data["test_inputs"]:
+            pii_flag = " [PII]" if t.get("pii_present") else ""
+            lines.append(
+                f"  {t['id']:25s} [{t['category']:10s}]{pii_flag} — {t['notes'][:55]}..."
+            )
+        return "\n".join(lines)
+
+    entry = inputs.get(input_id)
+    if entry is None:
+        available = ", ".join(inputs.keys())
+        return f"Test input '{input_id}' not found. Available: {available}"
+
+    pii_types = ", ".join(entry.get("pii_types", [])) or "none"
+    lines = [
+        f"TEST INPUT ID  : {entry['id']}",
+        f"CATEGORY       : {entry['category']}",
+        f"EXPECTED CLASS : {entry['expected_class']}",
+        f"PII PRESENT    : {entry['pii_present']} ({pii_types})",
+        f"NOTES          : {entry['notes']}",
+        "",
+        "INPUT TEXT:",
+        f"  {entry['input']}",
+    ]
+    return "\n".join(lines)
+$$;
+
+CREATE TOOL_API list_test_inputs()
+RETURNS TEXT AS PYTHON $$
+def list_test_inputs() -> str:
+    import json
+    import os
+
+    data_dir = "cookbook/18_guardrails"
+    path = os.path.join(data_dir, "test_inputs.json")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    lines = ["Available guardrails test inputs:", ""]
+    for t in data["test_inputs"]:
+        pii_flag = " [PII]" if t.get("pii_present") else ""
+        lines.append(f"ID       : {t['id']}{pii_flag}")
+        lines.append(f"Category : {t['category']}")
+        lines.append(f"Notes    : {t['notes']}")
+        lines.append("")
+    return "\n".join(lines)
+$$;
+
+CREATE TOOL_API detect_pii(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def detect_pii(text: str) -> str:
+    import json
+    import re
+
+    SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+    CREDIT_CARD_RE = re.compile(
+        r"\b(?:\d{4}[-\s]){3}\d{4}\b"
+        r"|\b\d{16}\b"
+    )
+    EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+    PHONE_RE = re.compile(
+        r"(?:\+?1[-.\s]?)?"
+        r"(?:\(\d{3}\)|\d{3})"
+        r"[-.\s]\d{3}[-.\s]\d{4}\b"
+    )
+
+    if not text or not text.strip():
+        return "clean"
+
+    found = {}
+    ssns = SSN_RE.findall(text)
+    if ssns:
+        found["ssn"] = len(ssns)
+
+    ccs = CREDIT_CARD_RE.findall(text)
+    if ccs:
+        found["credit_card"] = len(ccs)
+
+    emails = EMAIL_RE.findall(text)
+    if emails:
+        found["email"] = len(emails)
+
+    phones = PHONE_RE.findall(text)
+    if phones:
+        found["phone"] = len(phones)
+
+    if found:
+        detail = json.dumps(found)
+        return f"pii_found:{detail}"
+    return "clean"
+$$;
+
+CREATE TOOL_API redact_pii(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def redact_pii(text: str) -> str:
+    import re
+
+    SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+    CREDIT_CARD_RE = re.compile(
+        r"\b(?:\d{4}[-\s]){3}\d{4}\b"
+        r"|\b\d{16}\b"
+    )
+    EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+    PHONE_RE = re.compile(
+        r"(?:\+?1[-.\s]?)?"
+        r"(?:\(\d{3}\)|\d{3})"
+        r"[-.\s]\d{3}[-.\s]\d{4}\b"
+    )
+
+    if not text or not text.strip():
+        return text
+
+    text = SSN_RE.sub("[REDACTED-SSN]", text)
+    text = CREDIT_CARD_RE.sub("[REDACTED-CC]", text)
+    text = EMAIL_RE.sub("[REDACTED-EMAIL]", text)
+    text = PHONE_RE.sub("[REDACTED-PHONE]", text)
+    return text
+$$;
+
+CREATE TOOL_API classify_input_keywords(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_input_keywords(text: str) -> str:
+    HARMFUL_KEYWORDS = [
+        "keylogger", "malware", "ransomware", "phishing", "pipe bomb", "bomb",
+        "explosive", "poison", "synthesize drugs", "hack into", "steal credentials",
+        "bypass security", "sql injection", "ddos", "denial of service",
+        "child pornography", "child abuse", "cvv", "card skimmer",
+        "install virus", "trojan horse", "zero-day exploit",
+    ]
+
+    OFF_TOPIC_KEYWORDS = [
+        "buy stock", "stock market", "invest in", "trading advice",
+        "diagnose me", "prescribe", "medical diagnosis", "what medication",
+        "legal advice for my case", "represent me in court",
+        "predict the lottery", "winning lottery numbers",
+    ]
+
+    if not text or not text.strip():
+        return "safe"
+
+    lower = text.lower()
+
+    for kw in HARMFUL_KEYWORDS:
+        if kw in lower:
+            return f"harmful:keyword={kw}"
+
+    for kw in OFF_TOPIC_KEYWORDS:
+        if kw in lower:
+            return f"off_topic:keyword={kw}"
+
+    return "safe"
+$$;

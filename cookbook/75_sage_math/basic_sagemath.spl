@@ -1,0 +1,150 @@
+-- ============================================================
+-- Recipe 75: SageMath Solver — the second rung of the verifier ladder
+--
+-- Companion to Recipe 67 (SymPy), one rung up. Demonstrates the
+-- A-1 milestone of docs/DEV/sage_lean_integration_plan.md:
+-- `spl3 run --kernel-name sagemath` runs this workflow under the
+-- SageMath Jupyter kernel, where SOLVE / ASSERT evaluate with the
+-- full Sage namespace (PARI, GAP, Singular, ...) preloaded.
+--
+--   Probabilistic  (LLM)   — parse natural language problem
+--                             into a Sage expression + operation
+--   Deterministic  (Sage)  — exact computation via SOLVE in the
+--                             Sage kernel (no TOOL_API, no LLM)
+--   Probabilistic  (LLM)   — explain the result in plain English
+--
+-- Every operation here is one SymPy cannot do (or does weakly):
+--   galois  — Galois group of a polynomial over Q        (PARI)
+--   conic   — rational point on a conic over Q, exactly
+--   rank    — Mordell-Weil rank of an elliptic curve     (PARI)
+--   factor  — exact factorization over Q
+--
+-- Requires: pip install 'spl-llm[sage]'
+--   then:   python -m sage.repl.ipython_kernel.install --user
+-- Run:      spl3 run ... --kernel-name sagemath   (implies --kernel)
+-- ============================================================
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION parse_math_problem(problem TEXT)
+RETURNS TEXT AS $$
+Convert this math problem into Sage notation.
+Reply with exactly one line in this format (no other text):
+  <expression>|<operation>
+
+Rules:
+- operation must be exactly one of: galois, conic, rank, factor
+- Use ^ for powers and * for multiplication (Sage notation)
+- galois: expression is a polynomial in x over the rationals
+- factor: expression is a polynomial in x over the rationals
+- conic:  expression is a homogeneous quadratic in x, y, z moved
+  to the "= 0" form (e.g. "x^2 + y^2 = 3*z^2" becomes "x^2 + y^2 - 3*z^2")
+- rank:   expression is the 5-element Weierstrass coefficient list
+  [a1, a2, a3, a4, a6] of the elliptic curve
+  y^2 + a1*x*y + a3*y = x^3 + a2*x^2 + a4*x + a6
+
+Examples:
+  "Galois group of x to the fifth minus x minus 1"        →  x^5 - x - 1|galois
+  "factor x^4 - 1 over the rationals"                     →  x^4 - 1|factor
+  "does x^2 + y^2 = 3*z^2 have a rational solution?"      →  x^2 + y^2 - 3*z^2|conic
+  "rank of the curve y^2 + y = x^3 - x^2 - 10*x - 20"     →  [0, -1, 1, -10, -20]|rank
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION explain_solution(problem TEXT, sage_result TEXT)
+RETURNS TEXT AS $$
+A student asked: "{problem}"
+
+The SageMath computer algebra system computed: {sage_result}
+
+Write a clear, friendly explanation in less than 5 sentences that:
+1. Restates what the problem is asking in plain English
+2. States the exact answer from the computation above
+3. Briefly explains the key concept (Galois group, rational point,
+   rank, or factorization) at an advanced-undergraduate level
+Do not re-derive the answer — trust the Sage result above as exact.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW sage_solver
+  INPUT @problem TEXT := 'what is the Galois group of x^5 - x - 1 over the rationals?'
+  INPUT @log_dir TEXT := 'cookbook/75_sage_math/logs-spl'
+  OUTPUT @explanation TEXT
+DO
+  -- Step 0 (deterministic): preflight — prove we are on the Sage rung.
+  -- The Sage kernel preparses code: integer literals become Sage
+  -- Integers and the Integer type is in scope. Under the plain python3
+  -- kernel this is a NameError and the workflow fails fast — it
+  -- refuses to run on the wrong rung of the ladder.
+  ASSERT isinstance(1, Integer)
+
+  SOLVE @sage_banner TEXT := version()
+  LOGGING f"Verifier engine: {@sage_banner}" LEVEL INFO
+
+  CALL now_iso() INTO @run_ts;
+  CALL replace(@run_ts, ':', '') INTO @run_ts;
+  @log_file := f'{@log_dir}/chain_trace-{@run_ts}.md';
+
+  -- Inject symbolic x, y, z into the kernel globals (Sage predefines
+  -- only x). The conic branch below needs all three.
+  SOLVE @_xyz TEXT := str(var('x y z'))
+
+  -- Step 1 (probabilistic): LLM parses NL problem → Sage expression|operation
+  GENERATE parse_math_problem(@problem) INTO @parsed;
+  CALL trim(@parsed) INTO @parsed;
+
+  LOGGING f"Problem '{@problem}' is translated into Sage:\n\n\n '{@parsed}'\n\n" LEVEL INFO
+
+  -- Extract expression and operation by splitting on '|'
+  CALL split_part(@parsed, '|', '1') INTO @expression;
+  CALL split_part(@parsed, '|', '2') INTO @operation;
+
+  CALL write_file(@log_file,
+    f"# Sage Solver — chain trace\n\n**Engine:** {@sage_banner}\n\n## Step 1 — LLM parse\n**Problem:** {@problem}\n**Parsed:** {@parsed}\n**Expression:** {@expression}\n**Operation:** {@operation}\n") INTO NONE;
+
+  -- Step 2 (deterministic): exact computation, routed to the Sage kernel
+  -- by SOLVE itself — no TOOL_API wrapper, the kernel namespace *is* Sage.
+  -- (Compare recipe 67, where the math runs inside a CREATE TOOL_API body.)
+  -- @expression substitutes as a bare Sage expression: the preparser
+  -- turns ^ into power, and the symbolic x/y/z coerce into QQ[...].
+  -- Lower-case both sides before EVALUATE — see recipe 67's gotcha list.
+  CALL lower(@operation) INTO @operation_lc;
+  SOLVE @_t0 TEXT := str(__import__('time').perf_counter())
+  EVALUATE @operation_lc
+    WHEN = 'galois' THEN
+      SOLVE @sage_result TEXT := str(QQ['x'](@expression).galois_group())
+    WHEN = 'factor' THEN
+      SOLVE @sage_result TEXT := str(factor(QQ['x'](@expression)))
+    WHEN = 'conic' THEN
+      SOLVE @sage_result TEXT := str(Conic(QQ['x,y,z'](@expression)).has_rational_point(point=True))
+    WHEN = 'rank' THEN
+      SOLVE @sage_result TEXT := str(EllipticCurve(@expression).rank())
+    ELSE
+      @sage_result := 'unsupported_operation'
+  END
+  SOLVE @elapsed TEXT := '%.3fs' % (__import__('time').perf_counter() - float('@@_t0@@'))
+
+  -- Kernel state persists across statements (A-1 parity property):
+  -- _spl_solve_result is still live from the last SOLVE above.
+  ASSERT len(str(_spl_solve_result)) > 0
+
+  LOGGING f"Sage computed: {@sage_result} (elapsed: {@elapsed})" LEVEL INFO
+
+  CALL write_file(@log_file,
+    f"## Step 2 — Sage computation\n**Operation:** {@operation_lc}\n**Result:** {@sage_result}\n**Elapsed:** {@elapsed}\n", 'a') INTO NONE;
+
+  -- Step 3 (probabilistic): LLM explains the exact result in plain English
+  GENERATE explain_solution(@problem, @sage_result) INTO @explanation;
+
+  CALL write_file(@log_file,
+    f"## Step 3 — LLM explanation\n{@explanation}\n\n---\n*status: complete*\n", 'a') INTO NONE;
+
+  RETURN @explanation WITH status = 'complete';
+EXCEPTION
+  WHEN BudgetExceeded THEN
+    CALL write_file(@log_file,
+      f"## Exception — BudgetExceeded\n**Partial result:** {@sage_result}\n\n---\n*status: budget_limit*\n", 'a') INTO NONE;
+    RETURN @sage_result WITH status = 'budget_limit';
+END;

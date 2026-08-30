@@ -1,0 +1,109 @@
+-- Recipe Name: Memory-Augmented Conversation
+-- A conversational agent that remembers facts from prior turns using persistent memory.
+-- Demonstrates STORAGE-typed workflow inputs, context accumulation, and stateful interactions.
+--
+-- Usage:
+--   spl3 run cookbook/19_memory_conversation/memory_chat.spl --adapter ollama \
+--       'user_input=My name is Alice and I am a data scientist'
+--   spl3 run cookbook/19_memory_conversation/memory_chat.spl --adapter ollama \
+--       'user_input=What is my name?'
+--
+-- Memory is a first-class INPUT parameter — declared, injected, portable.
+-- Override the default path at call time: memory=path/to/other.db
+--
+-- Memory management:
+--   Inspect:  spl memory get chat_user_profile
+--   Reset:    spl memory delete chat_user_profile && spl memory delete chat_history
+
+-- Extract any personal facts the user shared. Return the exact string 'no_new_facts'
+-- if nothing new was shared, otherwise return a bullet list of facts.
+CREATE FUNCTION extract_facts(user_input TEXT) 
+RETURN TEXT
+AS $$
+
+You are a fact extractor. Read the user message and extract any personal facts they shared
+about themselves (name, job, preferences, location, etc.).
+
+If no personal facts are present, reply with exactly: no_new_facts
+Otherwise reply with a concise bullet list, one fact per line, e.g.:
+- Name: Alice
+- Role: data scientist
+- Preference: Python over R
+
+User message: "{user_input}"
+$$;
+
+-- Merge new facts into an existing profile. Return the updated profile as a bullet list.
+CREATE FUNCTION merge_profile(existing_profile TEXT, new_facts TEXT) 
+RETURN TEXT
+AS $$
+
+You are maintaining a user profile as a concise bullet list.
+If the existing profile is empty or blank, start a new profile from the new facts only.
+Otherwise merge the new facts in, keeping all prior facts unless directly contradicted.
+Do NOT invent or assume any facts not explicitly stated.
+Return ONLY the bullet list, no preamble.
+
+Existing profile:
+{existing_profile}
+
+New facts to merge:
+{new_facts}
+$$;
+
+-- Reply using full context: known profile + conversation history + current message.
+CREATE FUNCTION contextual_reply(user_input TEXT, profile TEXT, history TEXT) 
+RETURN TEXT
+AS $$
+
+Known facts about the user: {profile}
+
+Recent conversation:
+{history}
+
+Based solely on the known facts above, answer in one sentence: "{user_input}"
+If the fact is not listed above, respond: "I don't have that in memory."
+$$;
+
+WORKFLOW memory_conversation
+    INPUT:
+        @user_input TEXT,
+        @memory     STORAGE(sqlite, '~/.spl/memory.db')
+    OUTPUT: @response TEXT
+DO
+    LOGGING f'Memory conversation | input: {@user_input}' LEVEL INFO
+
+    -- Load existing user profile and chat history from the injected storage backend
+    @profile      := @memory['chat_user_profile']
+    @chat_history := @memory['chat_history']
+    LOGGING f'Profile loaded: {@profile}' LEVEL DEBUG
+
+    -- Extract any new personal facts the user shared
+    GENERATE extract_facts(@user_input) INTO @new_facts
+    LOGGING f'New facts: {@new_facts}' LEVEL DEBUG
+
+    -- Update profile only when new facts were actually found (exact string check)
+    EVALUATE @new_facts
+        WHEN = 'no_new_facts' THEN
+            LOGGING 'No new facts — profile unchanged' LEVEL DEBUG
+        ELSE
+            LOGGING 'New facts detected — merging profile' LEVEL DEBUG
+            GENERATE merge_profile(@profile, @new_facts) INTO @profile
+            @memory['chat_user_profile'] := @profile
+    END
+
+    -- Generate response with full context: profile + history + current input
+    GENERATE contextual_reply(@user_input, @profile, @chat_history) INTO @response
+
+    -- Persist updated chat history (keep last 10 turns, deterministic — no LLM cost)
+    @chat_history := @chat_history || '\nUser: ' || @user_input || '\nAssistant: ' || @response
+    CALL trim_turns(@chat_history, '10') INTO @chat_history
+    @memory['chat_history'] := @chat_history
+
+    LOGGING 'Response ready' LEVEL INFO
+    RETURN @response WITH status = 'complete'
+
+EXCEPTION
+    WHEN BudgetExceeded THEN
+        RETURN 'I remember you! But I ran out of budget for this response.' WITH status = 'budget_limit'
+END

@@ -1,0 +1,396 @@
+-- ============================================================
+-- Recipe 91: Chemical Equation Balancing — LLM proposes, atom-count proves
+--
+-- Second recipe in the computational-science domain (companion to
+-- 90_compsci_physics and 92_compsci_materials). The LLM's most common
+-- failure mode when balancing a chemical equation isn't picking the
+-- wrong reaction — it's proposing coefficients that LOOK plausible but
+-- silently violate conservation of mass (an element's atom count
+-- differs between the reactant and product side). Atom-counting is a
+-- categorical, hand-checkable oracle: no library (RDKit et al.) is
+-- required — elemental bookkeeping from the chemical formulas alone
+-- is enough to prove or disprove a proposed balance.
+--
+--   Probabilistic (LLM)   — read the natural-language reaction and
+--                            propose a fully-balanced equation with
+--                            explicit integer coefficients
+--   Deterministic (parser)— parse every formula (with parentheses,
+--                            e.g. Ca(OH)2) into element:count maps
+--   Deterministic (check) — sum atoms x coefficient on each side per
+--                            element; the equation balances iff every
+--                            element's total matches exactly and every
+--                            coefficient is a positive integer
+--   Deterministic (ASSERT)— formal gate: only continue when the
+--                            proposed equation is exactly balanced
+--   Probabilistic (LLM)   — narrate the result, restating the
+--                            balanced equation explicitly
+--   Deterministic (round- — regex-and-compare classifier confirms the
+--    trip classifier)       LLM's stated final coefficients match the
+--                            verified balanced equation (WITH roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — equation
+-- balancing is exactly where models propose coefficients that look
+-- right (small integers, right formulas) but don't actually conserve
+-- every element.
+--
+-- Requires: stdlib re only — no new pip dependency
+-- Run:
+--   spl3 run cookbook/91_compsci_chemistry/chemistry_balance.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/91_compsci_chemistry/chemistry_balance.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: chemical-formula parser + balance checker ──
+
+CREATE TOOL_API run_balance_check(equation TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_balance_check(equation: str) -> str:
+    """Parse a proposed balanced equation of the form
+        "2 H2 + 1 O2 -> 2 H2O"
+    (coefficients required and explicit, '->' separates reactants from
+    products, '+' separates terms, formulas may include parentheses,
+    e.g. "1 Ca(OH)2 + 2 HCl -> 1 CaCl2 + 2 H2O") and independently check
+    that it conserves mass: every element's total atom count (summed
+    coefficient x atoms-per-formula) must match exactly between the two
+    sides, and every coefficient must be a positive integer.
+    """
+    import json
+    import re
+
+    def parse_formula(formula):
+        """Recursive-descent parser for a chemical formula into an
+        element -> count dict. Supports nested parentheses and
+        multi-letter elements (e.g. Ca, Cl, Na)."""
+        formula = formula.strip()
+        pos = [0]
+
+        def parse_group():
+            counts = {}
+            while pos[0] < len(formula):
+                ch = formula[pos[0]]
+                if ch == '(':
+                    pos[0] += 1
+                    inner = parse_group()
+                    if pos[0] >= len(formula) or formula[pos[0]] != ')':
+                        raise ValueError(f"unbalanced parentheses in '{formula}'")
+                    pos[0] += 1
+                    mult = 1
+                    num_start = pos[0]
+                    while pos[0] < len(formula) and formula[pos[0]].isdigit():
+                        pos[0] += 1
+                    if pos[0] > num_start:
+                        mult = int(formula[num_start:pos[0]])
+                    for el, ct in inner.items():
+                        counts[el] = counts.get(el, 0) + ct * mult
+                elif ch == ')':
+                    break
+                elif ch.isupper():
+                    el_start = pos[0]
+                    pos[0] += 1
+                    while pos[0] < len(formula) and formula[pos[0]].islower():
+                        pos[0] += 1
+                    el = formula[el_start:pos[0]]
+                    num_start = pos[0]
+                    while pos[0] < len(formula) and formula[pos[0]].isdigit():
+                        pos[0] += 1
+                    ct = int(formula[num_start:pos[0]]) if pos[0] > num_start else 1
+                    counts[el] = counts.get(el, 0) + ct
+                else:
+                    raise ValueError(f"unexpected character '{ch}' in '{formula}'")
+            return counts
+
+        result = parse_group()
+        if pos[0] != len(formula):
+            raise ValueError(f"could not fully parse '{formula}'")
+        return result
+
+    def parse_side(side_text):
+        terms = []
+        for raw_term in side_text.split('+'):
+            raw_term = raw_term.strip()
+            if not raw_term:
+                continue
+            m = re.match(r'^(\d+)?\s*([A-Za-z0-9()]+)$', raw_term)
+            if not m:
+                raise ValueError(f"could not parse term '{raw_term}'")
+            coeff = int(m.group(1)) if m.group(1) else 1
+            formula = m.group(2)
+            terms.append((coeff, formula, parse_formula(formula)))
+        return terms
+
+    try:
+        equation = equation.strip()
+        if '->' not in equation:
+            return json.dumps({"status": "Error", "error": "missing '->' separating reactants/products"})
+        left_text, right_text = equation.split('->', 1)
+        reactants = parse_side(left_text)
+        products = parse_side(right_text)
+
+        if any(c < 1 for c, _, _ in reactants + products):
+            return json.dumps({"status": "Error", "error": "all coefficients must be positive integers"})
+
+        totals_left, totals_right = {}, {}
+        for coeff, _, counts in reactants:
+            for el, ct in counts.items():
+                totals_left[el] = totals_left.get(el, 0) + coeff * ct
+        for coeff, _, counts in products:
+            for el, ct in counts.items():
+                totals_right[el] = totals_right.get(el, 0) + coeff * ct
+
+        elements = sorted(set(totals_left) | set(totals_right))
+        mismatches = [
+            f"{el}: {totals_left.get(el, 0)} (left) != {totals_right.get(el, 0)} (right)"
+            for el in elements
+            if totals_left.get(el, 0) != totals_right.get(el, 0)
+        ]
+
+        balanced_str = (
+            " + ".join(f"{c} {f}" for c, f, _ in reactants)
+            + " -> "
+            + " + ".join(f"{c} {f}" for c, f, _ in products)
+        )
+        coeffs_str = ",".join(str(c) for c, _, _ in reactants + products)
+
+        if mismatches:
+            return json.dumps({
+                "status": "Error",
+                "error": "not mass-balanced: " + "; ".join(mismatches),
+            })
+        return json.dumps({
+            "status": "OK",
+            "answer": coeffs_str,
+            "balanced_equation": balanced_str,
+            "element_totals": totals_left,
+        })
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own 'Final answer: ...' line, in
+    its narration of the VERIFIED balanced equation, restate the same
+    coefficient sequence (order-sensitive, comma or space separated
+    digits) as the verified balance?
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.')
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+
+    llm_nums = re.findall(r'\d+', llm_val)
+    truth_nums = truth.split(',')
+    if not llm_nums:
+        return "unverifiable"
+    return "match" if llm_nums == truth_nums else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, equation TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, equation: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Chemical Equation Balancing Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Verifier status:** `{sol.get('status', 'Unknown')}`",
+        f"**Balanced equation:** `{sol.get('balanced_equation', equation.strip())}`",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Proposed Equation (LLM-generated)", "",
+        "```", equation.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_balance(problem TEXT)
+RETURNS TEXT AS $$
+You are a chemist. Balance this chemical reaction with explicit,
+minimal, positive-integer coefficients.
+
+Output ONLY a single line in EXACTLY this format (no markdown fences,
+no commentary, no explanation):
+<coeff> <Formula1> + <coeff> <Formula2> -> <coeff> <Formula3> + <coeff> <Formula4>
+
+Rules:
+- Every term MUST have an explicit integer coefficient, even if it is 1
+- Use '+' to separate terms and '->' to separate reactants from products
+- Use standard chemical formula notation with parentheses where needed,
+  e.g. Ca(OH)2, Al2(SO4)3
+- Coefficients must be the smallest positive integers that balance the
+  equation (do not use fractions)
+
+Reaction: {problem}
+$$;
+
+CREATE FUNCTION repair_balance(problem TEXT, equation TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This proposed balanced equation is not actually mass-balanced.
+
+Reaction: {problem}
+
+Previous proposal:
+{equation}
+
+Error:
+{error_info}
+
+Fix the coefficients so every element''s atom count matches exactly on
+both sides. Output ONLY the corrected equation in the same format:
+<coeff> <Formula1> + <coeff> <Formula2> -> <coeff> <Formula3> + ...
+No markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_balance_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a chemist. Interpret this VERIFIED, mass-balanced equation for
+a general audience.
+
+Reaction: {problem}
+
+Verified result (JSON, independently checked so every element''s atom
+count matches exactly between reactants and products — trust it
+completely, do not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Name the reaction type (e.g. combustion, neutralization, synthesis)
+2. State the balanced equation exactly as verified
+3. One sentence confirming mass is conserved (element by element)
+
+End your response with a line in EXACTLY this format (no extra words,
+just the coefficients in left-to-right order, comma-separated):
+Final answer: <c1>,<c2>,<c3>,<c4>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A student asked you to balance this chemical reaction: "{problem}"
+
+There is no atom-counting checker backing you up this time — balance
+it yourself, from scratch.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Identifies the reactants and products
+2. Shows how you determined the coefficients (element by element)
+3. States the fully balanced equation plainly
+
+End your response with a line in EXACTLY this format (no extra words,
+just the coefficients in left-to-right order, comma-separated):
+Final answer: <c1>,<c2>,<c3>,<c4>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW chemistry_balance
+  -- Default: combustion of methane, a classic 4-term equation with a
+  -- known balance: CH4 + 2 O2 -> CO2 + 2 H2O
+  INPUT @problem TEXT := "Combustion of methane: CH4 + O2 -> CO2 + H2O"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/91_compsci_chemistry/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[chemistry_balance] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no atom-count checker ──
+        LOGGING "[arm=llm_only] solving with NO atom-count checker" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM proposes equation; atom-count-checked balance ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + balance check" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @equation := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_balance(@problem) INTO @equation;
+                CALL trim(@equation) INTO @equation;
+                CALL run_balance_check(@equation) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_balance(@problem, @equation, @error_info) INTO @equation;
+                CALL trim(@equation) INTO @equation;
+                CALL run_balance_check(@equation) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[chemistry_balance] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[chemistry_balance] ASSERT passed — mass balance confirmed" LEVEL INFO
+
+        GENERATE interpret_balance_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[chemistry_balance] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @equation, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/chemistry_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[chemistry_balance] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Equation could not be mass-balanced after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/chemistry_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[chemistry_balance] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;

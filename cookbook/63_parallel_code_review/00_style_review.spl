@@ -1,0 +1,38 @@
+-- 00_style_review.spl
+-- Sub-workflow: review code for style, readability, and correctness.
+-- Imported by parallel_code_review.spl
+
+CREATE FUNCTION style_review_prompt(code TEXT, lang TEXT) RETURN TEXT
+AS $$
+You are a senior {lang} engineer conducting a code review focused on
+style, readability, and correctness.
+
+Review the following {lang} code:
+
+{code}
+
+Provide feedback on:
+1. Naming conventions and clarity
+2. Code structure and organisation
+3. Potential logic errors or edge cases
+4. Adherence to idiomatic {lang} patterns
+
+Format: numbered list, most important issues first.
+Keep your review under 200 words.
+$$;
+
+WORKFLOW style_review
+    INPUT:
+        @code    TEXT,
+        @lang    TEXT DEFAULT 'python',
+        @review_model   TEXT DEFAULT 'gemma4',
+        @log_dir TEXT DEFAULT ""
+    OUTPUT: @feedback TEXT
+DO
+    LOGGING f'[style_review] lang={@lang}' LEVEL DEBUG
+    GENERATE style_review_prompt(@code, @lang)
+        WITH OUTPUT BUDGET 400 TOKENS
+        USING MODEL @review_model
+        INTO @feedback
+    RETURN @feedback
+END

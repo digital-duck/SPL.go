@@ -1,0 +1,82 @@
+-- Recipe 15: Automated Code Review
+-- Multi-pass code review: security audit, performance check, style review, then synthesis.
+-- Demonstrates tool-augmented analysis, multi-criteria evaluation, and structured output.
+--
+-- Usage:
+--   spl3 run cookbook/15_code_review/code_review.spl --adapter ollama --model gemma3 code="$(cat myfile.py)"
+--   spl3 run cookbook/15_code_review/code_review.spl --adapter ollama code="$(cat main.go)" language="Go"
+--   spl3 run cookbook/15_code_review/code_review.spl --adapter ollama code="def foo(x): return eval(x)" language="Python"
+--
+-- Logs written to @log_dir (default: cookbook/15_code_review/logs):
+--   security.md    — security audit findings
+--   performance.md — performance analysis findings
+--   style.md       — style and best-practice findings
+--   bugs.md        — bug detection findings
+--   review.md      — final synthesized review
+
+WORKFLOW code_review
+    INPUT:
+        @code     TEXT,
+        @language TEXT,
+        @log_dir  TEXT DEFAULT 'cookbook/15_code_review/logs'
+    OUTPUT: @review TEXT
+DO
+    LOGGING f'Code review | language={@language}' LEVEL INFO
+
+    -- Pass 1: Security audit
+    GENERATE security_audit(@code, @language) INTO @security_findings
+    LOGGING f'Security findings:\n{@security_findings}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/security.md', @security_findings) INTO NONE
+
+    -- Pass 2: Performance analysis
+    GENERATE performance_review(@code, @language) INTO @perf_findings
+    LOGGING f'Performance findings:\n{@perf_findings}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/performance.md', @perf_findings) INTO NONE
+
+    -- Pass 3: Code style and best practices
+    GENERATE style_review(@code, @language) INTO @style_findings
+    LOGGING f'Style findings:\n{@style_findings}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/style.md', @style_findings) INTO NONE
+
+    -- Pass 4: Bug detection
+    GENERATE bug_detection(@code, @language) INTO @bug_findings
+    LOGGING f'Bug findings:\n{@bug_findings}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/bugs.md', @bug_findings) INTO NONE
+
+    -- Severity scoring for each category
+    GENERATE severity_score(@security_findings) INTO @sec_score
+    GENERATE severity_score(@perf_findings) INTO @perf_score
+    GENERATE severity_score(@bug_findings) INTO @bug_score
+    LOGGING f'Scores | sec={@sec_score} perf={@perf_score} bug={@bug_score}' LEVEL INFO
+
+    -- Synthesize all findings into a structured review
+    GENERATE synthesize_review(
+        @security_findings, @sec_score,
+        @perf_findings, @perf_score,
+        @style_findings,
+        @bug_findings, @bug_score
+    ) INTO @review
+    CALL write_file(f'{@log_dir}/review.md', @review) INTO NONE
+
+    -- Determine overall verdict
+    EVALUATE @sec_score
+        WHEN > 8 THEN
+            LOGGING f'Critical security issues | score={@sec_score}' LEVEL WARN
+            RETURN @review WITH status = 'critical_issues', verdict = 'block'
+        WHEN > 5 THEN
+            RETURN @review WITH status = 'needs_fixes', verdict = 'request_changes'
+        ELSE
+            RETURN @review WITH status = 'approved', verdict = 'approve'
+    END
+
+EXCEPTION
+    WHEN ContextLengthExceeded THEN
+        -- Code too large — review in chunks
+        GENERATE summarize_code(@code) INTO @summary
+        GENERATE quick_review(@summary, @language) INTO @review
+        CALL write_file(f'{@log_dir}/review.md', @review) INTO NONE
+        RETURN @review WITH status = 'partial_large_file'
+    WHEN BudgetExceeded THEN
+        CALL write_file(f'{@log_dir}/security.md', @security_findings) INTO NONE
+        RETURN @security_findings WITH status = 'security_only'
+END

@@ -1,0 +1,75 @@
+-- Recipe 49: Regulatory News Monitor
+-- Demonstrates: WHILE loops, CREATE FUNCTION (persona injection), iterative logging
+--
+-- Usage:
+--   spl3 run cookbook/49_regulatory_news_audit/audit_news.spl \
+--       --adapter ollama \
+--       --tools cookbook/49_regulatory_news_audit/tools.py \
+--       news_batch_path=cookbook/49_regulatory_news_audit/data/news_feed.txt
+
+IMPORT 'tools'
+
+-- Compliance persona + audit instruction combined in one function.
+-- (regulatory_auditor() persona is inlined here so GENERATE receives it
+--  as a rendered template argument — avoids non-builtin function call in expressions.)
+CREATE FUNCTION audit_news(news TEXT)
+RETURN TEXT
+AS $$
+You are a senior compliance officer at a G-SIB.
+Identify regulatory risks in the financial news item below.
+
+Focus on: Sanctions, AML, Market Manipulation, AI Ethics.
+
+Output STRICTLY valid JSON:
+{ "risk_level": "low|medium|high", "flags": ["list"], "summary": "one sentence" }
+
+News item:
+{news}
+$$;
+
+WORKFLOW news_sentiment_monitor
+INPUT:
+  @news_batch_path TEXT DEFAULT 'cookbook/49_regulatory_news_audit/data/news_feed.txt',
+  @log_dir TEXT DEFAULT 'cookbook/49_regulatory_news_audit/logs-spl'
+OUTPUT: @compliance_report TEXT
+DO
+  LOGGING f'Starting compliance feed from "{@news_batch_path}" ...' LEVEL INFO
+
+  CALL read_news_feed(@news_batch_path) INTO @news_batch
+  CALL length(@news_batch) INTO @batch_size
+  LOGGING f'News batch loaded with {@batch_size} items.' LEVEL INFO
+
+  EVALUATE @batch_size
+  WHEN = 0 THEN
+    LOGGING f'No news data found at: {@news_batch_path}' LEVEL ERROR
+    RETURN 'No data' WITH reason = 'feed_empty'
+  END
+
+  @batch_id := 0
+  WHILE @batch_id < @batch_size DO
+    LOGGING f'Processing batch {@batch_id}...' LEVEL INFO
+    CALL list_get(@news_batch, @batch_id + 1) INTO @news
+    LOGGING f'News item:\n{@news}' LEVEL DEBUG
+
+    -- Audit the news item (LLM call)
+    GENERATE audit_news(@news) INTO @audit_result
+
+    -- Persist raw audit output
+    CALL write_file(f'{@log_dir}/batch_{@batch_id}.json', @audit_result) INTO NONE
+
+    -- Extract risk level deterministically
+    CALL json_get(@audit_result, 'risk_level') INTO @current_risk
+
+    EVALUATE @current_risk
+    WHEN 'high' THEN
+      LOGGING f'CRITICAL ALERT in batch {@batch_id}!' LEVEL ERROR
+      CALL alert(@audit_result) INTO NONE
+    ELSE
+      LOGGING f'Batch {@batch_id} clear ({@current_risk})' LEVEL INFO
+    END
+
+    @batch_id := @batch_id + 1
+  END
+
+  RETURN 'Scan Complete' WITH total_batches = @batch_id
+END

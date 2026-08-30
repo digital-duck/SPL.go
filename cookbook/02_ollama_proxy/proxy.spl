@@ -1,0 +1,22 @@
+-- Recipe Name: Ollama Proxy
+-- General-purpose LLM query — proxy any prompt to any adapter/model.
+--
+-- Usage:
+--   spl3 run cookbook/02_ollama_proxy/proxy.spl --adapter ollama --model gemma3 prompt="Explain quantum computing in one sentence"
+--   spl3 run cookbook/02_ollama_proxy/proxy.spl --adapter ollama --model llama3.2 prompt="Write a haiku about coding"
+--   spl3 run cookbook/02_ollama_proxy/proxy.spl --adapter ollama --model mistral prompt="What is 2+2?"
+--   spl3 run cookbook/02_ollama_proxy/proxy.spl --adapter anthropic prompt="Summarise the history of AI"
+--
+-- Parameters:
+--   prompt  (required)  The user prompt / question
+
+CREATE FUNCTION answer(prompt TEXT)
+RETURNS TEXT AS $$
+{prompt}
+$$;
+
+PROMPT ollama_proxy
+SELECT
+    system_role('You are a helpful, knowledgeable assistant.'),
+    context.prompt AS prompt
+GENERATE answer(prompt)

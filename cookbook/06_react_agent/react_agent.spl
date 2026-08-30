@@ -1,0 +1,81 @@
+-- Recipe Name: ReAct Agent — Population Growth
+-- Fetch a country's population for the past two years via WebSearch,
+-- then compute year-over-year growth rate using a Python tool (no LLM math).
+--
+-- Usage:
+--   spl3 run cookbook/06_react_agent/react_agent.spl \
+--       --adapter claude_cli --model claude-sonnet-4-6 \
+--       --allowed-tools WebSearch \
+--       --tools cookbook/06_react_agent/tools.py \
+--       country="France"
+
+-- Tight prompt for search_population: return only the number, no narration.
+CREATE FUNCTION search_population(country TEXT, year INT) 
+RETURN TEXT 
+AS $$
+Use WebSearch to find the total population of {country} for the year {year}.
+
+Return ONLY the population as a plain integer with no commas, spaces, or text.
+Example of valid output: 1409670000
+No explanation. No units. No markdown. Just the number.
+
+$$;
+
+-- calc_growth_rate is a Python tool registered from tools.py via --tools.
+-- CALL routes to Python directly — deterministic, zero LLM cost.
+
+-- Tight prompt for growth_report: plain narrative, no tool use, no file writes.
+CREATE FUNCTION growth_report(country TEXT, year_prev TEXT, pop_prev TEXT, year_curr TEXT, pop_curr TEXT, growth_rate TEXT) 
+RETURN TEXT 
+AS $$
+
+Write a concise 2-3 sentence population growth report for {country}.
+
+Data:
+- {year_prev} population: {pop_prev}
+- {year_curr} population: {pop_curr}
+- Year-over-year growth rate: {growth_rate}%
+
+Plain prose only. No markdown headers. No file creation. No tool use. Just the narrative.
+
+$$;
+
+-- SPL PROCEDURE: search the web for a country's population in a specific year.
+PROCEDURE search_population(country TEXT, year INT)
+RETURN TEXT
+DO
+  GENERATE search_population(country, year) INTO @result
+  RETURN @result
+END
+
+
+WORKFLOW population_growth
+  INPUT:
+    @country TEXT DEFAULT 'China',
+    @year_curr INTEGER DEFAULT 2023
+  OUTPUT: @report TEXT
+DO
+  @year_prev := @year_curr - 1
+
+  LOGGING f'Population growth | country={@country} years={@year_prev}-{@year_curr}' LEVEL INFO
+
+  -- Step 1: Fetch population for each year via WebSearch
+  CALL search_population(@country, @year_prev) INTO @pop_prev
+  CALL search_population(@country, @year_curr) INTO @pop_curr
+  LOGGING f'Population fetched | {@year_prev}={@pop_prev} {@year_curr}={@pop_curr}' LEVEL DEBUG
+
+  -- Step 2: Compute growth rate — routed to Python tool, not LLM
+  CALL calc_growth_rate(@pop_prev, @pop_curr) INTO @growth_rate
+  LOGGING f'Growth rate computed: {@growth_rate}%' LEVEL INFO
+
+  -- Step 3: Compose the final human-readable report
+  GENERATE growth_report(@country, @year_prev, @pop_prev, @year_curr, @pop_curr, @growth_rate) 
+    INTO @report
+
+  RETURN @report WITH status = 'complete'
+
+EXCEPTION
+  WHEN SearchFailed THEN
+    GENERATE search_error_report(@country) INTO @report
+    RETURN @report WITH status = 'error'
+END

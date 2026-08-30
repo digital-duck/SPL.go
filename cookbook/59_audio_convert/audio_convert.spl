@@ -1,0 +1,40 @@
+-- Recipe 58: Audio Format Conversion
+-- Category: media / codec
+-- Convert an audio file between formats (WAV ↔ MP3 ↔ OGG ↔ FLAC ↔ M4A).
+--
+-- This is a deterministic codec operation — no LLM involved.
+-- The SPL workflow provides a composable, loggable wrapper callable via CALL
+-- from any orchestrator workflow (e.g. voice_dialogue post-processing).
+--
+-- SPL INPUT type:  AUDIO (source file path)
+-- SPL OUTPUT type: AUDIO (converted file path)
+--
+-- Physical execution: run.py  (uses pydub + ffmpeg)
+-- DODA targets: python (local), go (Intel Mini-PC via ffmpeg)
+
+WORKFLOW audio_convert
+    INPUT:
+        @audio         AUDIO  DEFAULT 'cookbook/59_audio_convert/sample/clip.wav',
+        @target_format TEXT   DEFAULT 'mp3',
+        @bitrate       TEXT   DEFAULT '192k',
+        @sample_rate   INT    DEFAULT 44100,
+        @output_dir    TEXT   DEFAULT 'cookbook/59_audio_convert/outputs',
+        @log_dir       TEXT   DEFAULT 'cookbook/59_audio_convert/logs-spl'
+    OUTPUT: @converted AUDIO
+DO
+    LOGGING f'[audio_convert] {@audio} → {@target_format} (bitrate={@bitrate} sample_rate={@sample_rate})' LEVEL INFO
+    CALL audio_convert(@audio, @target_format, @bitrate, @sample_rate, @output_dir) INTO @converted
+    LOGGING f'[audio_convert] done → {@converted}' LEVEL INFO
+    RETURN @converted
+
+EXCEPTION
+    WHEN FileNotFound THEN
+        LOGGING f'[audio_convert] source file not found: {@audio}' LEVEL ERROR
+        RETURN '[ERROR] Source audio not found.' WITH status = 'failed'
+    WHEN UnsupportedFormat THEN
+        LOGGING f'[audio_convert] unsupported target format: {@target_format}' LEVEL ERROR
+        RETURN '[ERROR] Unsupported audio format.' WITH status = 'failed'
+    WHEN CodecError THEN
+        LOGGING '[audio_convert] ffmpeg codec error — check ffmpeg is installed' LEVEL ERROR
+        RETURN '[ERROR] Codec error during conversion.' WITH status = 'failed'
+END

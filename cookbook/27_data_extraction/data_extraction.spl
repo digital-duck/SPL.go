@@ -1,0 +1,62 @@
+-- Recipe Name: Data Extraction
+-- Pull structured fields from messy text: names, dates, amounts, references.
+-- Demonstrates schema-constrained extraction on real-world noisy input.
+--
+-- Usage:
+--   spl3 run cookbook/27_data_extraction/data_extraction.spl --adapter ollama --model gemma3 \
+--       text="Please process payment of USD 4,250.00 to Riverside Consulting (ref: PO-8821) by end of March."
+--
+--   spl3 run cookbook/27_data_extraction/data_extraction.spl --adapter ollama \
+--       text="$(cat invoice.txt)" format="invoice"
+
+CREATE FUNCTION extraction_schema(format TEXT DEFAULT 'general')
+RETURN JSON
+AS $$
+SELECT CASE format
+  WHEN 'invoice' THEN '{
+    "type": "object",
+    "properties": {
+      "invoice_number": {"type": "string"},
+      "vendor":         {"type": "string"},
+      "amount":         {"type": "number"},
+      "currency":       {"type": "string", "default": "USD"},
+      "issue_date":     {"type": "string", "format": "date"},
+      "due_date":       {"type": "string", "format": "date"},
+      "line_items":     {"type": "array", "items": {"type": "object", "properties": {"description": {"type": "string"}, "amount": {"type": "number"}}}},
+      "payment_terms":  {"type": "string"},
+      "po_reference":   {"type": "string"}
+    }
+  }'
+  WHEN 'contract' THEN '{
+    "type": "object",
+    "properties": {
+      "parties":        {"type": "array", "items": {"type": "string"}},
+      "effective_date": {"type": "string", "format": "date"},
+      "expiry_date":    {"type": "string", "format": "date"},
+      "value":          {"type": "number"},
+      "currency":       {"type": "string"},
+      "jurisdiction":   {"type": "string"},
+      "key_obligations":{"type": "array", "items": {"type": "string"}}
+    }
+  }'
+  ELSE '{
+    "type": "object",
+    "properties": {
+      "names":        {"type": "array", "items": {"type": "string"}},
+      "organizations":{"type": "array", "items": {"type": "string"}},
+      "dates":        {"type": "array", "items": {"type": "object", "properties": {"value": {"type": "string"}, "label": {"type": "string"}}}},
+      "amounts":      {"type": "array", "items": {"type": "object", "properties": {"value": {"type": "number"}, "currency": {"type": "string"}, "label": {"type": "string"}}}},
+      "references":   {"type": "array", "items": {"type": "string"}},
+      "locations":    {"type": "array", "items": {"type": "string"}}
+    }
+  }'
+END
+$$;
+
+PROMPT extract_fields
+SELECT
+    system_role('You are a data extraction specialist. Extract all relevant fields from the text and return valid JSON matching the schema exactly. If a field is not present in the text, omit it. Return only the JSON object.'),
+    context.text AS text,
+    extraction_schema(context.format) AS schema,
+    context.format AS format
+GENERATE extract(text, schema)

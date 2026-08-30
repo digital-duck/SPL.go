@@ -1,0 +1,110 @@
+-- Recipe Name: Vertex AI Quickstart
+-- Run the same prompt across Gemini model tiers on Google Cloud Vertex AI
+-- and compare quality, speed, and cost characteristics.
+--
+-- Prerequisites:
+--   pip install google-genai
+--   gcloud auth application-default login   (local dev)
+--   or set GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+--   export GOOGLE_CLOUD_PROJECT=my-gcp-project-id
+--
+-- Enable the Vertex AI API:
+--   gcloud services enable aiplatform.googleapis.com
+--
+-- Usage:
+--   spl3 run cookbook/39_vertex_quickstart/vertex_quickstart.spl --adapter vertex \
+--       prompt="Explain the CAP theorem in two sentences."
+--
+--   spl3 run cookbook/39_vertex_quickstart/vertex_quickstart.spl --adapter vertex \
+--       prompt="What are the trade-offs between REST and GraphQL?" \
+--       model_pro="gemini-2.5-pro" \
+--       model_flash="gemini-2.5-flash" \
+--       model_lite="gemini-2.0-flash-lite"
+
+CREATE FUNCTION compare_tiers(
+    prompt      TEXT,
+    model_pro   TEXT, answer_pro   TEXT,
+    model_flash TEXT, answer_flash TEXT,
+    model_lite  TEXT, answer_lite  TEXT
+) RETURN TEXT
+AS $$
+You are evaluating three Gemini model tiers on Vertex AI for the same prompt.
+
+Prompt: "{prompt}"
+
+=== {model_pro} (Pro — highest capability) ===
+{answer_pro}
+
+=== {model_flash} (Flash — balanced) ===
+{answer_flash}
+
+=== {model_lite} (Lite — fastest, lowest cost) ===
+{answer_lite}
+
+Evaluate each response on:
+- Accuracy and depth
+- Conciseness
+- Best value for this type of query (which tier gives enough quality for the cost?)
+
+Conclude with a recommendation: which tier would you deploy for this use case in production?
+$$;
+
+WORKFLOW vertex_quickstart
+    INPUT:
+        @prompt     TEXT DEFAULT 'Explain the CAP theorem in two sentences.',
+        @model_pro   TEXT DEFAULT 'gemini-2.5-pro',
+        @model_flash TEXT DEFAULT 'gemini-2.5-flash',
+        @model_lite  TEXT DEFAULT 'gemini-2.0-flash-lite'
+    OUTPUT: @comparison TEXT
+DO
+    -- Fan out the same prompt to all three Gemini tiers in parallel CTEs
+    WITH
+        response_pro AS (
+            PROMPT ask_pro
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_pro
+        ),
+        response_flash AS (
+            PROMPT ask_flash
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_flash
+        ),
+        response_lite AS (
+            PROMPT ask_lite
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_lite
+        )
+    SELECT
+        response_pro.answer   AS answer_pro,
+        response_flash.answer AS answer_flash,
+        response_lite.answer  AS answer_lite
+    INTO @answer_pro, @answer_flash, @answer_lite
+
+    -- Compare all three tiers
+    GENERATE compare_tiers(
+        @prompt,
+        @model_pro,   @answer_pro,
+        @model_flash, @answer_flash,
+        @model_lite,  @answer_lite
+    ) INTO @comparison
+
+    RETURN @comparison WITH
+        status      = 'complete',
+        model_pro   = @model_pro,
+        model_flash = @model_flash,
+        model_lite  = @model_lite
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'One or more Vertex AI models failed. Check project, IAM permissions, and API enablement.'
+        WITH status = 'error'
+END

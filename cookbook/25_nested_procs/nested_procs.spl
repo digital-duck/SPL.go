@@ -1,0 +1,82 @@
+-- Recipe Name: Nested Procedures
+-- Demonstrates PROCEDURE calling PROCEDURE — deep composability without external orchestration.
+-- Pattern: a high-level workflow delegates subtasks to reusable PROCEDURE units.
+--
+-- Usage:
+--   spl3 run cookbook/25_nested_procs/nested_procs.spl --adapter ollama --model gemma3 \
+--       topic="quantum computing" audience="high school students"
+--
+--   spl3 run cookbook/25_nested_procs/nested_procs.spl --adapter ollama \
+--       topic="CRISPR gene editing" audience="policy makers" depth="deep"
+
+-- Inner PROCEDURE: generate a single explanation layer
+PROCEDURE explain_layer(content TEXT, audience TEXT, style TEXT DEFAULT 'clear and engaging')
+RETURN TEXT
+DO
+    GENERATE explain(content, audience, style) INTO @explanation
+    RETURN @explanation
+END
+
+-- Inner PROCEDURE: generate a concrete example for a concept
+PROCEDURE make_example(concept TEXT, context TEXT, audience TEXT)
+RETURN TEXT
+DO
+    GENERATE concrete_example(concept, context, audience) INTO @example
+    RETURN @example
+END
+
+-- Inner PROCEDURE: check comprehension level and simplify if needed
+PROCEDURE calibrate_complexity(text TEXT, audience TEXT, target_grade INT DEFAULT 8)
+RETURN TEXT
+DO
+    GENERATE assess_reading_level(text) INTO @reading_level
+    EVALUATE @reading_level
+        WHEN > target_grade THEN
+            GENERATE simplify(text, audience) INTO @calibrated
+            RETURN @calibrated
+        ELSE
+            RETURN text
+    END
+END
+
+-- Outer WORKFLOW: orchestrates the inner procedures
+WORKFLOW layered_explainer
+    INPUT:  @topic    TEXT,
+            @audience TEXT,
+            @depth    TEXT DEFAULT 'standard'
+    OUTPUT: @article TEXT
+DO
+    -- Step 1: Research the topic
+    GENERATE research_overview(@topic) INTO @overview
+
+    -- Step 2: Delegate explanation to inner procedure
+    CALL explain_layer(
+        content  = @overview,
+        audience = @audience,
+        style    = 'clear, engaging, avoid jargon'
+    ) INTO @base_explanation
+
+    -- Step 3: Generate a concrete example via another inner procedure
+    CALL make_example(
+        concept  = @topic,
+        context  = @base_explanation,
+        audience = @audience
+    ) INTO @example
+
+    -- Step 4: Calibrate complexity (nested call inside a conditional)
+    CALL calibrate_complexity(
+        text         = @base_explanation,
+        audience     = @audience,
+        target_grade = 8
+    ) INTO @calibrated_explanation
+
+    -- Step 5: Assemble the final article
+    GENERATE assemble_article(
+        @topic,
+        @calibrated_explanation,
+        @example,
+        @depth
+    ) INTO @article
+
+    RETURN @article WITH status = 'complete', audience = @audience
+END

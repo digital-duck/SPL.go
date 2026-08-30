@@ -1,0 +1,89 @@
+-- Recipe Name: Map-Reduce Summarizer
+-- Splits a large document into chunks, summarizes each chunk (map),
+-- then combines all summaries into a final summary (reduce).
+-- Demonstrates the map-reduce pattern for handling content beyond context limits.
+--
+-- Usage:
+--   spl3 run cookbook/13_map_reduce/map_reduce.spl --tools cookbook/13_map_reduce/tools.py --adapter ollama --model gemma3 document="$(cat large_doc.txt)"
+--   spl3 run cookbook/13_map_reduce/map_reduce.spl --tools cookbook/13_map_reduce/tools.py --adapter ollama document="$(cat README.md)" style="bullet points"
+--   spl3 run cookbook/13_map_reduce/map_reduce.spl --tools cookbook/13_map_reduce/tools.py --adapter ollama document="long text here..." style="executive brief"
+--
+-- Tools: chunk_plan(), extract_chunk() are in tools.py (CALL, zero tokens).
+--        write_file(), read_file() are SPL built-ins — no --tools flag needed.
+--        summarize_chunk(), reduce_summaries(), quality_score(), improve_summary() call the LLM.
+--
+-- Logs written to @log_dir (default: cookbook/13_map_reduce/logs):
+--   chunk_00.md, chunk_01.md, ...    — raw extracted chunks
+--   summary_00.md, summary_01.md, ... — per-chunk LLM summaries
+--   final_summary.md                  — combined final summary
+
+WORKFLOW map_reduce_summarizer
+    INPUT:  
+        @document TEXT, 
+        @style TEXT,
+        @log_dir TEXT DEFAULT 'cookbook/13_map_reduce/logs-spl'
+    OUTPUT: @final_summary TEXT
+DO
+    @chunk_index := 0
+    @summaries := []          -- LIST: accumulates per-chunk summaries
+
+    LOGGING 'Starting map-reduce | document length: ' + @document
+
+    -- Step 1: Determine how to split the document (deterministic, 0 tokens)
+    CALL chunk_plan(@document) INTO @chunk_count
+
+    LOGGING 'Document split into ' + @chunk_count + ' chunks'
+
+    -- Step 2: MAP — summarize each chunk independently
+    WHILE @chunk_index < @chunk_count DO
+        CALL extract_chunk(@document, @chunk_index, @chunk_count) INTO @chunk   -- deterministic, 0 tokens
+
+        -- Save raw chunk to logs/
+        CALL write_file(f'{@log_dir}/chunk_{@chunk_index}.md', @chunk) INTO NONE
+
+        GENERATE summarize_chunk(@chunk, @chunk_index) INTO @chunk_summary
+
+        -- Save chunk summary to logs/
+        CALL write_file(f'{@log_dir}/summary_{@chunk_index}.md', @chunk_summary) INTO NONE
+
+        LOGGING f'[Chunk {@chunk_index}/{@chunk_count}] summary saved'
+
+        @summaries := list_append(@summaries, @chunk_summary)
+        @chunk_index := @chunk_index + 1
+    END
+
+    -- Step 3: REDUCE — concat all chunk summaries, then combine into final
+    @summaries_text := list_concat(@summaries, '\n')
+    GENERATE reduce_summaries(@summaries_text, @style) 
+        INTO @final_summary
+
+    -- Step 4: Quality check the final summary
+    GENERATE quality_score(@final_summary, @document) 
+        INTO @score
+
+    EVALUATE @score
+        WHEN > 0.7 THEN
+            CALL write_file(f'{@log_dir}/final_summary.md', @final_summary) INTO NONE
+            LOGGING f'Final summary saved to {@log_dir}/final_summary.md (score={@score})'
+            RETURN @final_summary WITH status = 'complete', chunks = @chunk_count
+        ELSE
+            GENERATE improve_summary(@final_summary, @summaries_text) INTO @final_summary
+            CALL write_file(f'{@log_dir}/final_summary.md', @final_summary) INTO NONE
+            LOGGING f'Improved summary saved to {@log_dir}/final_summary.md (score={@score})'
+            RETURN @final_summary WITH status = 'refined', chunks = @chunk_count
+    END
+
+EXCEPTION
+    WHEN ContextLengthExceeded THEN
+        @summaries_text := list_concat(@summaries, '\n')
+        GENERATE reduce_summaries(@summaries_text, @style) 
+            INTO @final_summary
+        CALL write_file(f'{@log_dir}/final_summary.md', @final_summary) INTO NONE
+        RETURN @final_summary WITH status = 'partial'
+    WHEN BudgetExceeded THEN
+        @summaries_text := list_concat(@summaries, '\n')
+        GENERATE reduce_summaries(@summaries_text, @style) 
+            INTO @final_summary
+        CALL write_file(f'{@log_dir}/final_summary.md', @final_summary) INTO NONE
+        RETURN @final_summary WITH status = 'budget_limit'
+END

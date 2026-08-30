@@ -1,0 +1,118 @@
+-- Recipe Name: Debate Arena
+-- Two LLM personas argue opposing sides of a topic, then a judge picks the winner.
+-- Demonstrates multi-perspective reasoning, adversarial generation, and semantic evaluation.
+--
+-- Usage:
+--   spl3 run cookbook/11_debate_arena/debate.spl --adapter ollama --model gemma3 topic="AI should be open-sourced"
+--   spl3 run cookbook/11_debate_arena/debate.spl --adapter ollama --model llama3.2 topic="Remote work is better than office work"
+--   spl3 run cookbook/11_debate_arena/debate.spl --adapter ollama topic="Tabs are better than spaces"
+
+CREATE FUNCTION pro_argument(topic TEXT, previous TEXT) 
+RETURNS TEXT
+AS $$
+You are a skilled debate champion arguing STRONGLY IN FAVOR of the following motion:
+
+Motion: "{topic}"
+
+Your opponent's last argument (or "opening statement" if this is your first turn):
+{previous}
+
+Write a focused, persuasive argument supporting the motion. If this is a rebuttal round,
+directly address and counter your opponent's points. Be concise (3-5 paragraphs).
+Do NOT offer balanced views — you are arguing one side.
+$$;
+
+CREATE FUNCTION con_argument(topic TEXT, previous TEXT) 
+RETURNS TEXT
+AS $$
+You are a skilled debate champion arguing STRONGLY AGAINST the following motion:
+
+Motion: "{topic}"
+
+Your opponent's last argument (or "opening statement" if this is your first turn):
+{previous}
+
+Write a focused, persuasive argument opposing the motion. If this is a rebuttal round,
+directly address and counter your opponent's points. Be concise (3-5 paragraphs).
+Do NOT offer balanced views — you are arguing one side.
+$$;
+
+CREATE FUNCTION judge_debate(topic TEXT, pro_history TEXT, con_history TEXT) 
+RETURNS TEXT
+AS $$
+You are an impartial debate judge evaluating the following debate.
+
+Motion: "{topic}"
+
+--- PRO SIDE (arguing IN FAVOR) ---
+{pro_history}
+
+--- CON SIDE (arguing AGAINST) ---
+{con_history}
+
+Evaluate the debate on these criteria:
+1. Strength of arguments
+2. Quality of rebuttals
+3. Clarity and persuasiveness
+
+Declare a winner (PRO or CON) and explain your reasoning in 2-3 paragraphs.
+$$;
+
+WORKFLOW debate_arena
+    INPUT:
+        @topic TEXT DEFAULT 'AI should be open-sourced',
+        @max_rounds INTEGER DEFAULT 3,
+        @log_dir TEXT DEFAULT 'cookbook/11_debate_arena/logs-spl'
+    OUTPUT: @verdict TEXT
+DO
+    @round := 0
+    @pro_history := ""
+    @con_history := ""
+
+    LOGGING f'Debate started | topic: {@topic} | rounds: {@max_rounds}' LEVEL INFO
+
+    -- Opening statements
+    GENERATE pro_argument(@topic, 'opening statement') INTO @pro
+    GENERATE con_argument(@topic, 'opening statement') INTO @con
+
+    @pro_history := @pro
+    @con_history := @con
+
+    LOGGING 'Opening statements complete' LEVEL INFO
+    CALL write_file(f'{@log_dir}/opening_pro.md', @pro) INTO NONE
+    CALL write_file(f'{@log_dir}/opening_con.md', @con) INTO NONE
+
+    -- Rebuttal rounds
+    WHILE @round < @max_rounds DO
+        LOGGING f'Round {@round} | pro rebuttal ...' LEVEL DEBUG
+        -- Pro rebuts Con's latest point
+        GENERATE pro_argument(@topic, @con_history) INTO @pro_rebuttal
+        @pro_history := @pro_history || '\n---\n' || @pro_rebuttal
+        CALL write_file(f'{@log_dir}/round_{@round}_pro.md', @pro_rebuttal) INTO NONE
+
+        LOGGING f'Round {@round} | con rebuttal ...' LEVEL DEBUG
+        -- Con rebuts Pro's latest point
+        GENERATE con_argument(@topic, @pro_history) INTO @con_rebuttal
+        @con_history := @con_history || '\n---\n' || @con_rebuttal
+        CALL write_file(f'{@log_dir}/round_{@round}_con.md', @con_rebuttal) INTO NONE
+
+        @round := @round + 1
+        LOGGING f'Round {@round} complete' LEVEL INFO
+    END
+
+    LOGGING 'All rounds done — judge deliberating ...' LEVEL INFO
+
+    -- Judge evaluates both sides
+    GENERATE judge_debate(@topic, @pro_history, @con_history) INTO @verdict
+
+    LOGGING f'Verdict ready | rounds={@round}' LEVEL INFO
+    CALL write_file(f'{@log_dir}/verdict.md', @verdict) INTO NONE
+    RETURN @verdict WITH status = 'complete', rounds = @round
+
+EXCEPTION
+    WHEN MaxIterationsReached THEN
+        GENERATE judge_debate(@topic, @pro_history, @con_history) INTO @verdict
+        RETURN @verdict WITH status = 'partial'
+    WHEN BudgetExceeded THEN
+        RETURN @pro_history WITH status = 'budget_limit'
+END

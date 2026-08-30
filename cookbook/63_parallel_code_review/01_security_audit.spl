@@ -1,0 +1,40 @@
+-- 01_security_audit.spl
+-- Sub-workflow: audit code for security vulnerabilities.
+-- Imported by parallel_code_review.spl
+
+CREATE FUNCTION security_audit_prompt(code TEXT, lang TEXT) RETURN TEXT
+AS $$
+You are a security engineer conducting a static analysis of {lang} code.
+
+Review the following {lang} code for security vulnerabilities:
+
+{code}
+
+Check for (where applicable):
+1. Injection risks (SQL, command, path traversal)
+2. Insecure input validation or missing bounds checks
+3. Hard-coded credentials or secrets
+4. Insecure use of cryptographic primitives
+5. Race conditions or unsafe concurrency
+6. Excessive permissions or privilege escalation paths
+
+Format: numbered list, CRITICAL issues first, then MODERATE, then LOW.
+If no issues found, say "No security issues detected."
+Keep your audit under 200 words.
+$$;
+
+WORKFLOW security_audit
+    INPUT:
+        @code    TEXT,
+        @lang    TEXT DEFAULT 'python',
+        @review_model   TEXT DEFAULT 'gemma3',
+        @log_dir TEXT DEFAULT ""
+    OUTPUT: @feedback TEXT
+DO
+    LOGGING f'[security_audit] lang={@lang}' LEVEL DEBUG
+    GENERATE security_audit_prompt(@code, @lang)
+        WITH OUTPUT BUDGET 400 TOKENS
+        USING MODEL @review_model
+        INTO @feedback
+    RETURN @feedback
+END

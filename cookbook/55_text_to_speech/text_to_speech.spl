@@ -1,0 +1,72 @@
+-- Recipe 53: Text to Speech
+-- Category: multimodal
+-- Convert text to natural-sounding speech and save as an audio file.
+--
+-- SPL INPUT type:  TEXT  (script, voice, instructions)
+-- SPL OUTPUT type: AUDIO (file path of generated WAV/MP3 saved to outputs/)
+--
+-- DODA compile targets:
+--   cloud → OpenAI TTS (tts-1 / tts-1-hd, gpt-4o-mini-tts)  requires OPENAI_API_KEY
+--   local → system TTS via `say` (macOS) or `espeak` (Linux)  zero dependencies
+--
+-- Use cases: accessibility, podcast narration, voice notifications,
+-- spoken summaries of long documents, audio versions of AI responses.
+--
+-- Physical execution: run.py
+
+CREATE FUNCTION prep_script(raw_text TEXT, tone TEXT)
+RETURN TEXT
+AS $$
+You are a script editor preparing text for text-to-speech narration.
+
+Tone: {tone}
+
+Clean up the following text for natural speech:
+- Expand abbreviations (e.g. "e.g." → "for example")
+- Remove markdown formatting symbols (**, #, -, etc.)
+- Replace URLs with brief descriptions
+- Add natural pause punctuation where helpful
+- Keep the meaning intact
+
+Text to clean:
+{raw_text}
+
+Return ONLY the cleaned script, no explanation.
+$$;
+
+
+WORKFLOW text_to_speech
+    INPUT:
+        @text         TEXT   DEFAULT 'Welcome to SPL 3.0. The future of agentic workflows is here.',
+        @voice        TEXT   DEFAULT 'alloy',
+        @tone         TEXT   DEFAULT 'neutral',
+        @model        TEXT   DEFAULT 'tts-1',
+        @prep         BOOL   DEFAULT FALSE,
+        @output_dir   TEXT   DEFAULT 'cookbook/55_text_to_speech/outputs',
+        @llm_model    TEXT   DEFAULT 'gemma4:e4b',
+        @log_dir      TEXT   DEFAULT 'cookbook/55_text_to_speech/logs-spl'
+    OUTPUT: @audio_path AUDIO
+DO
+    LOGGING f'[text_to_speech] voice={@voice} model={@model} chars={len(@text)}' LEVEL INFO
+
+    EVALUATE @prep
+        WHEN = TRUE THEN
+            GENERATE prep_script(@text, @tone)
+                WITH OUTPUT BUDGET 2048 TOKENS
+                USING MODEL @llm_model
+                INTO @script
+            LOGGING '[text_to_speech] script prep done' LEVEL DEBUG
+        ELSE
+            @script := @text
+    END
+
+    -- AUDIO generation is handled by the physical runner (run.py).
+    -- @audio_path receives the saved file path as a TEXT-encoded AUDIO value.
+    LOGGING f'[text_to_speech] synthesising via {@model} voice={@voice}' LEVEL INFO
+    RETURN @script
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[text_to_speech] TTS model unavailable — check OPENAI_API_KEY or espeak' LEVEL ERROR
+        RETURN '[ERROR] TTS model unavailable.' WITH status = 'failed'
+END

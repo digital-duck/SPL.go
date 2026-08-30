@@ -1,0 +1,107 @@
+-- Recipe Name: Bedrock Quickstart
+-- Fan out the same prompt across three Bedrock model families and compare.
+-- Default models: Claude Sonnet 4 (Anthropic), Claude Haiku 4.5 (Anthropic), Nova Pro (Amazon).
+--
+-- Prerequisites:
+--   pip install boto3
+--   AWS credentials configured (env vars, ~/.aws/credentials, or IAM role)
+--   Models enabled in your AWS account:
+--     https://console.aws.amazon.com/bedrock/home#/modelaccess
+--
+-- Usage:
+--   spl3 run cookbook/38_bedrock_quickstart/bedrock_quickstart.spl --adapter bedrock \
+--       prompt="Explain the CAP theorem in two sentences."
+--
+--   spl3 run cookbook/38_bedrock_quickstart/bedrock_quickstart.spl --adapter bedrock \
+--       prompt="What are the main trade-offs between SQL and NoSQL databases?" \
+--       model_1="anthropic.claude-opus-4-0-20250514-v1:0" \
+--       model_2="anthropic.claude-3-5-haiku-20241022-v1:0" \
+--       model_3="amazon.nova-lite-v1:0"
+
+CREATE FUNCTION compare_models(
+    prompt  TEXT,
+    model_1 TEXT, answer_1 TEXT,
+    model_2 TEXT, answer_2 TEXT,
+    model_3 TEXT, answer_3 TEXT
+) RETURN TEXT
+AS $$
+You are a neutral evaluator comparing responses from three AWS Bedrock models.
+
+Prompt given to all models: "{prompt}"
+
+Reproduce raw response by each model exactly as given:
+
+=== {model_1} ===
+{answer_1}
+
+=== {model_2} ===
+{answer_2}
+
+=== {model_3} ===
+{answer_3}
+
+Then provide a brief evaluation:
+- Which response is most accurate?
+- Which is most concise?
+- Which would you recommend for production use and why?
+$$;
+
+WORKFLOW bedrock_quickstart
+    INPUT:
+        @prompt  TEXT    DEFAULT 'Explain the CAP theorem in two sentences.',
+        @model_1 TEXT    DEFAULT 'anthropic.claude-sonnet-4-20250514-v1:0',
+        @model_2 TEXT    DEFAULT 'anthropic.claude-haiku-4-5-20251001-v1:0',
+        @model_3 TEXT    DEFAULT 'amazon.nova-pro-v1:0'
+    OUTPUT: @comparison TEXT
+DO
+    -- Fan out the same prompt to all three models in parallel CTEs
+    WITH
+        response_1 AS (
+            PROMPT ask_model_1
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_1
+        ),
+        response_2 AS (
+            PROMPT ask_model_2
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_2
+        ),
+        response_3 AS (
+            PROMPT ask_model_3
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @model_3
+        )
+    SELECT
+        response_1.answer AS answer_1,
+        response_2.answer AS answer_2,
+        response_3.answer AS answer_3
+    INTO @answer_1, @answer_2, @answer_3
+
+    -- Judge all three responses with the best available model
+    GENERATE compare_models(
+        @prompt,
+        @model_1, @answer_1,
+        @model_2, @answer_2,
+        @model_3, @answer_3
+    ) INTO @comparison
+
+    RETURN @comparison WITH
+        status  = 'complete',
+        model_1 = @model_1,
+        model_2 = @model_2,
+        model_3 = @model_3
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'One or more Bedrock models failed. Check region, model access, and IAM permissions.'
+        WITH status = 'error'
+END

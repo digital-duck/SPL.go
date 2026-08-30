@@ -1,0 +1,153 @@
+-- Tools for Recipe 31: Sentiment Pipeline
+
+CREATE TOOL_API load_items(filename TEXT) RETURNS TEXT AS PYTHON $$
+import os
+
+_REVIEWS_DIR = "cookbook/31_sentiment_pipeline/reviews"
+
+def load_items(filename):
+    filename = filename.strip()
+    if not filename:
+        return ""
+
+    path = os.path.join(_REVIEWS_DIR, filename)
+    if not os.path.isfile(path):
+        available = ", ".join(sorted(os.listdir(_REVIEWS_DIR)))
+        return f"File not found: '{filename}'. Available files: {available}"
+
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+$$;
+
+CREATE TOOL_API split_items(file_content TEXT, inline_items TEXT, delimiter TEXT) RETURNS TEXT AS PYTHON $$
+import json
+
+def split_items(file_content, inline_items, delimiter):
+    text = file_content.strip() if file_content.strip() else inline_items.strip()
+    if not text:
+        return json.dumps([])
+
+    if delimiter == "\\n":
+        delimiter = "\n"
+
+    parts = [p.strip() for p in text.split(delimiter)]
+    items = [p for p in parts if p]
+
+    return json.dumps(items, ensure_ascii=False)
+$$;
+
+CREATE TOOL_API compute_stats(sentiment_json TEXT) RETURNS TEXT AS PYTHON $$
+import json
+import math
+
+def compute_stats(sentiment_json):
+    sentiment_json = sentiment_json.strip()
+    if not sentiment_json:
+        return json.dumps({"error": "No sentiment results to aggregate."})
+
+    try:
+        results = json.loads(sentiment_json)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Could not parse sentiment results JSON."})
+
+    if not isinstance(results, list) or not results:
+        return json.dumps({"error": "Sentiment results must be a non-empty array."})
+
+    labels = ["positive", "negative", "neutral", "mixed"]
+    counts = {l: 0 for l in labels}
+    scores = []
+    confidences = []
+
+    for item in results:
+        label = (item.get("label") or "neutral").lower()
+        if label in counts:
+            counts[label] += 1
+        else:
+            counts["neutral"] += 1
+
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            scores.append(float(score))
+
+        conf = item.get("confidence")
+        if isinstance(conf, (int, float)):
+            confidences.append(float(conf))
+
+    total = len(results)
+    pct = {l: round(counts[l] / total * 100, 1) for l in labels}
+
+    def _stats(vals):
+        if not vals:
+            return {"mean": 0, "min": 0, "max": 0, "std_dev": 0}
+        mean = sum(vals) / len(vals)
+        variance = sum((v - mean) ** 2 for v in vals) / len(vals)
+        return {
+            "mean":    round(mean, 3),
+            "min":     round(min(vals), 3),
+            "max":     round(max(vals), 3),
+            "std_dev": round(math.sqrt(variance), 3),
+        }
+
+    pos = counts["positive"]
+    neg = counts["negative"]
+    ratio = round(pos / max(1, neg), 2)
+
+    return json.dumps({
+        "total":           total,
+        "label_counts":    counts,
+        "label_pct":       pct,
+        "score":           _stats(scores),
+        "confidence":      _stats(confidences),
+        "sentiment_ratio": ratio,
+    }, indent=2)
+$$;
+
+CREATE TOOL_API find_extremes(sentiment_json TEXT) RETURNS TEXT AS PYTHON $$
+import json
+
+def find_extremes(sentiment_json):
+    sentiment_json = sentiment_json.strip()
+    if not sentiment_json:
+        return json.dumps({"error": "No sentiment results provided."})
+
+    try:
+        results = json.loads(sentiment_json)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Could not parse sentiment results JSON."})
+
+    if not isinstance(results, list) or not results:
+        return json.dumps({"error": "Sentiment results must be a non-empty array."})
+
+    scored = [r for r in results if isinstance(r.get("score"), (int, float))]
+    if not scored:
+        return json.dumps({"error": "No items with numeric score found."})
+
+    most_positive = max(scored, key=lambda r: r["score"])
+    most_negative = min(scored, key=lambda r: r["score"])
+
+    conf_items = [r for r in results if isinstance(r.get("confidence"), (int, float))]
+    lowest_conf = min(conf_items, key=lambda r: r["confidence"]) if conf_items else None
+
+    mixed    = [r for r in results if (r.get("label") or "").lower() == "mixed"]
+    negative = [r for r in results if (r.get("label") or "").lower() == "negative"]
+
+    def _summarise(r):
+        return {
+            "item":       r.get("item", ""),
+            "label":      r.get("label", ""),
+            "score":      r.get("score"),
+            "confidence": r.get("confidence"),
+            "emotions":   r.get("emotions", []),
+            "key_phrases":r.get("key_phrases", []),
+        }
+
+    return json.dumps({
+        "most_positive":      _summarise(most_positive),
+        "most_negative":      _summarise(most_negative),
+        "lowest_confidence":  _summarise(lowest_conf) if lowest_conf else None,
+        "all_mixed":          [_summarise(r) for r in mixed],
+        "all_negative":       [_summarise(r) for r in negative],
+        "negative_count":     len(negative),
+        "mixed_count":        len(mixed),
+    }, indent=2)
+$$;

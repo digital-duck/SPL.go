@@ -1,0 +1,123 @@
+-- Recipe 60: Video Summary
+-- Category: multimodal / understanding
+-- Analyse a video clip and produce a text summary, transcript, or key moments.
+--
+-- SPL INPUT type:  VIDEO (file path or URL)
+-- SPL OUTPUT type: TEXT  (summary, transcript, or structured key moments)
+--
+-- Primary model: gemma4 (native multimodal — text + vision + audio via Ollama)
+--
+-- Modes:
+--   summary    — concise narrative summary of the video content
+--   transcript — verbatim speech transcript with timestamps
+--   key_moments — structured list of significant moments with timestamps
+--   chapters   — chapter-style breakdown with titles and descriptions
+--
+-- Physical execution: run.py  (video frames + audio extracted by codec layer)
+-- DODA targets: python/ollama (local), go (Intel Mini-PC)
+-- Note: VIDEO is a first-class SPL 3.0 type (spl/types.py SPL3Type.VIDEO)
+
+CREATE FUNCTION summarise_video(clip VIDEO, style TEXT)
+RETURN TEXT
+AS $$
+You are a video analyst. Watch the video and produce a summary.
+
+Style: {style}
+
+Cover:
+- Main subject, topic, or narrative
+- Key events or actions in chronological order
+- Setting, environment, and visual tone
+- Any speech or audio content (summarised, not verbatim)
+- Overall conclusion or outcome
+$$;
+
+CREATE FUNCTION transcribe_video(clip VIDEO)
+RETURN TEXT
+AS $$
+You are an accurate transcription engine.
+
+Listen to the audio in this video and produce a verbatim transcript.
+Format: [MM:SS] Speaker (if identifiable): text
+If speech is unclear, mark with [?].
+If no speech is present, output: [NO SPEECH]
+$$;
+
+CREATE FUNCTION key_moments(clip VIDEO)
+RETURN TEXT
+AS $$
+You are a video editor identifying the most significant moments in a video.
+
+For each key moment provide:
+- Timestamp [MM:SS]
+- A one-line description of what happens
+- Why it is significant
+
+Format as a numbered list ordered by timestamp.
+$$;
+
+CREATE FUNCTION chapter_breakdown(clip VIDEO)
+RETURN TEXT
+AS $$
+You are a video producer creating chapter markers for a video.
+
+Divide the video into logical chapters. For each chapter provide:
+- Start timestamp [MM:SS]
+- Chapter title (concise, 3–6 words)
+- 1–2 sentence description of the content
+
+Format as structured Markdown.
+$$;
+
+
+WORKFLOW video_summary
+    INPUT:
+        @clip          VIDEO  DEFAULT 'cookbook/53_video_summary/sample/clip.mp4',
+        @mode          TEXT   DEFAULT 'summary',
+        @style         TEXT   DEFAULT 'concise paragraph',
+        @model         TEXT   DEFAULT 'gemma4:e4b',
+        @output_budget INT    DEFAULT 2048,
+        @log_dir       TEXT   DEFAULT 'cookbook/53_video_summary/logs-spl'
+    OUTPUT: @result TEXT
+DO
+    LOGGING f'[video_summary] clip={@clip} mode={@mode} model={@model}' LEVEL INFO
+
+    EVALUATE @mode
+        WHEN = 'summary' THEN
+            GENERATE summarise_video(@clip, @style)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'transcript' THEN
+            GENERATE transcribe_video(@clip)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'key_moments' THEN
+            GENERATE key_moments(@clip)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'chapters' THEN
+            GENERATE chapter_breakdown(@clip)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        ELSE
+            GENERATE summarise_video(@clip, @style)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+    END
+
+    LOGGING f'[video_summary] done | output_len={len(@result)}' LEVEL INFO
+    RETURN @result
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING f'[video_summary] model unavailable: {@model}' LEVEL ERROR
+        RETURN '[ERROR] Video model unavailable.' WITH status = 'failed'
+    WHEN FileNotFound THEN
+        LOGGING f'[video_summary] video file not found: {@clip}' LEVEL ERROR
+        RETURN '[ERROR] Video file not found.' WITH status = 'failed'
+END

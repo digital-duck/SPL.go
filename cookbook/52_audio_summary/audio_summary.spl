@@ -1,0 +1,91 @@
+-- Recipe 51: Audio Summary
+-- Category: multimodal
+-- Transcribe and/or summarise an audio clip using a speech-capable model.
+--
+-- Primary model: Liquid AI LFM-2.5 (audio + text, via OpenRouter or Ollama)
+-- Fallback:      whisper-based transcription + text summarisation pipeline
+--
+-- This is the DODA logical view — hardware-agnostic.
+-- Physical execution: run.py  (uses spl.codecs.encode_audio + LiquidAdapter)
+-- splc target: python/liquid (edge audio on ARM / laptop)
+--
+-- SPL type: AUDIO  (spl/types.py SPL3Type.AUDIO)
+-- Runtime note: AUDIO params are encoded by spl/codecs/audio_codec.py before
+-- being passed to generate_multimodal() as AudioPart dicts.
+
+CREATE FUNCTION transcribe(clip AUDIO)
+RETURN TEXT
+AS $$
+You are an accurate speech transcription engine.
+
+Listen to the audio and produce a verbatim transcript.
+Format: plain text, with speaker changes on new lines if distinguishable.
+If the audio is unclear, mark uncertain words with [?].
+$$;
+
+CREATE FUNCTION summarise(clip AUDIO, style TEXT)
+RETURN TEXT
+AS $$
+You are a concise summariser. Listen to the audio and produce a summary.
+
+Style: {style}
+
+Guidelines:
+- Capture the main topic, key points, and any conclusions.
+- Preserve names, dates, figures, and decisions exactly.
+- Omit filler words and off-topic remarks.
+$$;
+
+CREATE FUNCTION key_points(clip AUDIO)
+RETURN TEXT
+AS $$
+You are a meeting analyst. Listen to the audio and extract:
+
+1. Main topic / agenda item
+2. Key points discussed (bullet list)
+3. Decisions made (if any)
+4. Action items with owners (if mentioned)
+
+Format as structured Markdown.
+$$;
+
+
+WORKFLOW audio_summary
+    INPUT:
+        @clip         AUDIO  DEFAULT 'cookbook/52_audio_summary/sample/clip.wav',
+        @mode         TEXT   DEFAULT 'summary',
+        @style        TEXT   DEFAULT 'concise paragraph',
+        @model        TEXT   DEFAULT 'liquid/lfm-2.5-1.2b-instruct:free',
+        @output_budget INT   DEFAULT 2048,
+        @log_dir       TEXT  DEFAULT 'cookbook/52_audio_summary/logs-spl'
+    OUTPUT: @result TEXT
+DO
+    LOGGING f'[audio_summary] clip={@clip} mode={@mode} model={@model}' LEVEL INFO
+
+    EVALUATE @mode
+        WHEN = 'transcribe' THEN
+            GENERATE transcribe(@clip)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        WHEN = 'key_points' THEN
+            GENERATE key_points(@clip)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+        ELSE
+            -- default: 'summary'
+            GENERATE summarise(@clip, @style)
+                WITH OUTPUT BUDGET @output_budget TOKENS
+                USING MODEL @model
+                INTO @result
+    END
+
+    LOGGING f'[audio_summary] done | output_len={len(@result)}' LEVEL INFO
+    RETURN @result
+
+EXCEPTION
+    WHEN ModelUnavailable THEN
+        LOGGING '[audio_summary] LFM-2.5 unavailable — check OPENROUTER_API_KEY or Ollama' LEVEL ERROR
+        RETURN '[ERROR] Audio model unavailable.' WITH status = 'failed'
+END

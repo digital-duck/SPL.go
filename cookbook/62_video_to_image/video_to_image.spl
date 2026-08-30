@@ -1,0 +1,95 @@
+-- Recipe 62: Video to Image
+-- Category: media / codec + optional multimodal
+-- Extract one or more frames from a video file as images.
+-- Optionally caption the extracted frame(s) using gemma4 vision.
+--
+-- Pipeline:
+--   [video file]
+--         │
+--         ▼  codec layer (ffmpeg)
+--   [extracted frame(s) as IMAGE]
+--         │  (if @caption = TRUE)
+--         ▼  gemma4 vision
+--   [frame caption TEXT appended to result]
+--
+-- SPL INPUT type:  VIDEO (source file path)
+-- SPL OUTPUT type: IMAGE (extracted frame file path)
+--
+-- Physical execution: run.py  (ffmpeg frame extraction + optional Ollama caption)
+-- DODA targets: python (local), go (Intel Mini-PC)
+
+CREATE FUNCTION caption_frame(frame IMAGE, context TEXT)
+RETURN TEXT
+AS $$
+You are a precise visual analyst describing a single video frame.
+
+Context about the video: {context}
+
+Describe this frame concisely and accurately:
+- What is happening in this moment?
+- Key subjects, actions, and environment visible
+- Any text or notable details in the frame
+
+Keep the description under 100 words.
+$$;
+
+
+WORKFLOW video_to_image
+    INPUT:
+        @video         VIDEO  DEFAULT 'cookbook/62_video_to_image/sample/clip.mp4',
+        @mode          TEXT   DEFAULT 'middle',
+        @timestamp     TEXT   DEFAULT '00:00:05',
+        @fps           FLOAT  DEFAULT 1.0,
+        @max_frames    INT    DEFAULT 10,
+        @caption       BOOL   DEFAULT FALSE,
+        @context       TEXT   DEFAULT "",
+        @model         TEXT   DEFAULT 'gemma4',
+        @output_dir    TEXT   DEFAULT 'cookbook/62_video_to_image/outputs',
+        @log_dir       TEXT   DEFAULT 'cookbook/62_video_to_image/logs-spl'
+    OUTPUT: @frame IMAGE
+DO
+    LOGGING f'[video_to_image] {@video} mode={@mode}' LEVEL INFO
+
+    -- Frame extraction (codec operation via run.py)
+    -- Modes:
+    --   'first'     → extract first frame
+    --   'middle'    → extract frame at video midpoint
+    --   'last'      → extract final frame
+    --   'timestamp' → extract frame at @timestamp (HH:MM:SS)
+    --   'sample'    → extract @max_frames evenly spaced frames at @fps
+    EVALUATE @mode
+        WHEN = 'timestamp' THEN
+            CALL video_extract_frame(@video, @timestamp, @output_dir) INTO @frame
+            LOGGING f'[video_to_image] frame extracted at {@timestamp}' LEVEL INFO
+        ELSE
+            CALL video_extract_frame(@video, @mode, @output_dir) INTO @frame
+            LOGGING f'[video_to_image] frame extracted (mode={@mode})' LEVEL INFO
+    END
+
+    -- Optional: caption the extracted frame with gemma4 vision
+    EVALUATE @caption
+        WHEN = TRUE THEN
+            LOGGING '[video_to_image] captioning frame ...' LEVEL DEBUG
+            GENERATE caption_frame(@frame, @context)
+                WITH OUTPUT BUDGET 256 TOKENS
+                USING MODEL @model
+                INTO @frame_caption
+            LOGGING f'[video_to_image] caption: "{@frame_caption}"' LEVEL INFO
+        ELSE
+            @frame_caption := ""
+    END
+
+    LOGGING f'[video_to_image] done → {@frame}' LEVEL INFO
+    RETURN @frame
+
+EXCEPTION
+    WHEN FileNotFound THEN
+        LOGGING f'[video_to_image] video file not found: {@video}' LEVEL ERROR
+        RETURN '[ERROR] Video file not found.' WITH status = 'failed'
+    WHEN InvalidTimestamp THEN
+        LOGGING f'[video_to_image] timestamp out of range: {@timestamp}' LEVEL ERROR
+        RETURN '[ERROR] Timestamp exceeds video duration.' WITH status = 'failed'
+    WHEN ModelUnavailable THEN
+        LOGGING '[video_to_image] caption model unavailable — returning frame without caption' LEVEL WARN
+        RETURN @frame WITH status = 'partial'
+END

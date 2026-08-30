@@ -1,0 +1,141 @@
+-- Recipe Name: Customer Support Triage
+-- Classify → route → draft response in a single workflow.
+-- Demonstrates multi-step pipeline with branching, deterministic tool calls for
+-- order lookup, and LLM generation grounded in real order data.
+--
+-- Usage:
+--   spl3 run cookbook/28_support_triage/support_triage.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/28_support_triage/tools.py \
+--       ticket="My account has been charged twice for the same order #ORD-12345"
+--
+--   spl3 run cookbook/28_support_triage/support_triage.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/28_support_triage/tools.py \
+--       ticket="Package for order ORD-67890 hasn't arrived, it's been 10 days" \
+--       product="CloudDash" tone="empathetic"
+--
+--   spl3 run cookbook/28_support_triage/support_triage.spl \
+--       --adapter ollama --model gemma3 \
+--       --tools cookbook/28_support_triage/tools.py \
+--       ticket="I can't log in, password reset email never arrives" \
+--       tone="friendly"
+
+-- ── Helper functions (evaluated locally, zero LLM cost) ────────────────────
+
+IMPORT 'tools'
+
+CREATE FUNCTION support_categories()
+RETURN TEXT
+AS $$
+Ticket categories and their routing:
+- billing:      finance team, SLA 4h,  high priority
+                Covers: duplicate charges, wrong amounts, refund requests, invoice issues
+- account:      auth team,    SLA 2h,  high priority
+                Covers: login failures, password reset, account locked, 2FA issues
+- shipping:     fulfillment,  SLA 6h,  high priority
+                Covers: delayed delivery, wrong item received, missing package, tracking problems
+- technical:    engineering,  SLA 8h,  medium priority
+                Covers: app bugs, API errors, integration failures, data export issues
+- product:      product team, SLA 24h, medium priority
+                Covers: feature requests, how-to questions, documentation gaps
+- complaint:    customer success, SLA 1h, urgent
+                Covers: angry customers, escalation threats, repeated unresolved issues
+- general:      first-line,   SLA 48h, low priority
+                Covers: general inquiries, account queries, other
+$$;
+
+CREATE FUNCTION response_tone_guide(tone TEXT DEFAULT 'professional')
+RETURN TEXT
+AS $$
+SELECT CASE tone
+  WHEN 'empathetic' THEN 'Warm and understanding. Acknowledge frustration. Use "I understand" and "I am sorry". Avoid jargon. Refer to the customer by first name.'
+  WHEN 'formal'     THEN 'Professional and precise. Use formal language. Reference ticket numbers and order IDs explicitly. State next steps clearly.'
+  WHEN 'friendly'   THEN 'Conversational and positive. Use the customer first name. End with an enthusiastic offer to help further.'
+  ELSE                   'Professional but approachable. Concise. Action-oriented. Reference specific order details when available. No excessive apologies.'
+END
+$$;
+
+CREATE FUNCTION order_context_prompt(order_context TEXT)
+RETURN TEXT
+AS $$
+SELECT CASE
+  WHEN order_context = 'No order number found in this ticket.'
+    THEN 'No order number was referenced — respond based on the ticket text alone.'
+  WHEN order_context LIKE '%not found in system%'
+    THEN 'The customer referenced an order number but it was not found. Ask them to confirm the order ID.'
+  ELSE
+    'Use the following verified order record to ground your response with accurate details (amounts, dates, status):
+
+' || order_context
+END
+$$;
+
+-- ── Main workflow ───────────────────────────────────────────────────────────
+
+WORKFLOW support_triage
+    INPUT:  @ticket  TEXT,
+            @product TEXT DEFAULT 'CloudDash',
+            @tone    TEXT DEFAULT 'professional'
+    OUTPUT: @drafted_response TEXT
+DO
+    LOGGING f'Support triage | product={@product} tone={@tone}' LEVEL INFO
+
+    -- Step 1: Extract any order numbers mentioned in the ticket (deterministic tool — no LLM)
+    CALL extract_order_numbers(@ticket) INTO @order_numbers
+
+    -- Step 2: Fetch the matching order record(s) from orders.json (deterministic tool — no LLM)
+    CALL lookup_order(@order_numbers) INTO @order_context
+    LOGGING f'Order context loaded | order_numbers={@order_numbers}' LEVEL DEBUG
+
+    -- Step 3: Classify the ticket using categories + order data as grounding context
+    GENERATE classify_ticket(@ticket, support_categories(), order_context_prompt(@order_context)) 
+        INTO @classification_json
+    LOGGING f'Classification: {@classification_json}' LEVEL DEBUG
+
+    -- Step 4: Extract key structured details from the ticket
+    GENERATE extract_ticket_details(@ticket, @order_context) 
+        INTO @details_json
+
+    -- Step 5: Score urgency 0-10 based on ticket text and classification
+    GENERATE detect_urgency(@ticket, @classification_json) INTO @urgency_score
+    LOGGING f'Urgency score: {@urgency_score}' LEVEL INFO
+
+    -- Step 6: Route — escalate immediately if urgency > 8, otherwise draft response
+    EVALUATE @urgency_score
+        WHEN > 8 THEN
+            LOGGING f'High urgency — escalating | score={@urgency_score}' LEVEL WARN
+            GENERATE escalation_alert(@ticket, @classification_json, @order_context) INTO @alert
+            RETURN @alert WITH status = 'escalated', priority = 'critical'
+        ELSE
+            -- Step 7: Draft a grounded, tone-appropriate response
+            GENERATE draft_response(
+                @ticket,
+                @classification_json,
+                @details_json,
+                @order_context,
+                @product,
+                response_tone_guide(@tone)
+            ) INTO @drafted_response
+
+            -- Step 8: Quality-check the draft (0-10); revise once if score < 6
+            GENERATE check_response_quality(@drafted_response, @ticket, @order_context) 
+                INTO @quality_score
+            LOGGING f'Draft quality score: {@quality_score}' LEVEL DEBUG
+
+            EVALUATE @quality_score
+                WHEN < 6 THEN
+                    LOGGING f'Quality below threshold — revising | score={@quality_score}' LEVEL WARN
+                    GENERATE improve_response(@drafted_response, @ticket, @order_context) INTO @drafted_response
+                    RETURN @drafted_response WITH status = 'drafted_revised'
+                ELSE
+                    RETURN @drafted_response WITH status = 'drafted', quality = @quality_score
+            END
+    END
+
+EXCEPTION
+    WHEN GenerationError THEN
+        GENERATE fallback_response(@ticket, @product) 
+            INTO @drafted_response
+        RETURN @drafted_response WITH status = 'fallback'
+END

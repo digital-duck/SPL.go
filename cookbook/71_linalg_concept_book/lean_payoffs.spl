@@ -1,0 +1,257 @@
+-- ============================================================
+-- Recipe 71 × Lean: lean_payoffs.spl — the B-2 post-pass
+--
+-- Statement-level Lean checking for the concept-book's payoff
+-- concepts (docs/DEV/sage_lean_integration_plan.md §B.1 use case 1,
+-- milestone B-2), run AFTER a build_concept_book run — Lean stays
+-- off the default pipeline path (§B.4 scope discipline).
+--
+-- Per payoff concept:
+--   Probabilistic  (LLM)   — formalize its canonical claim as a Lean
+--                             prop in mathlib vocabulary
+--   Deterministic  (Lean)  — statement_ok typecheck, capped repair loop
+--   Probabilistic  (LLM)   — faithfulness judge (§B.4): UNFAITHFUL
+--                             *gates* the badge here, unlike recipe 76
+--                             where it is only reported — these are real
+--                             textbook entries being promoted
+--   Deterministic  (Lean)  — find_citation: local exact? first, Loogle
+--                             fallback (B-5), every candidate
+--                             kernel-checked
+--   Deterministic  (cache) — on a kernel-checked proof, promote the
+--                             concept's cached section to machine_proved
+--                             with the statement stored for side-by-side
+--                             audit. The entry already holds
+--                             machine_verified from the build run's CAS
+--                             checks — the first two-axis badge sets.
+--
+-- Requires: bash cookbook/tools/lean/setup_lean.sh --with-mathlib
+-- Run:      spl3 run cookbook/71_linalg_concept_book/lean_payoffs.spl
+--               --kernel --llm claude_cli
+-- ============================================================
+
+-- ── Deterministic helpers (in-process, zero tokens) ──────────
+
+CREATE TOOL_API payoff_claim(concept TEXT)
+RETURNS TEXT AS PYTHON $$
+def payoff_claim(concept: str) -> str:
+    """Canonical prose claim per payoff concept (linalg_graph.py node ids).
+    These are the 'instances or light specializations of existing mathlib
+    lemmas' band (§B.4) — linear algebra over ℝ is well covered."""
+    claims = {
+        "rank_nullity": (
+            "for any linear map f between finite-dimensional real vector "
+            "spaces, the dimension of the range of f plus the dimension of "
+            "the kernel of f equals the dimension of the domain"
+        ),
+        # diagonalization's computational payoff: in the decoupled form,
+        # global quantities read off the diagonal
+        "diagonalization": (
+            "for any diagonal real square matrix D, the determinant of D "
+            "is the product of its diagonal entries"
+        ),
+        "spectral_theorem": (
+            "every eigenvalue of a symmetric linear operator on a complex "
+            "inner product space equals its own complex conjugate, i.e. "
+            "is real"
+        ),
+    }
+    return claims.get(concept.strip(), "")
+$$;
+
+CREATE TOOL_API strip_fences(text TEXT)
+RETURNS TEXT AS PYTHON $$
+def strip_fences(text: str) -> str:
+    """Remove markdown code fences and surrounding noise from LLM output."""
+    s = text.strip()
+    if s.startswith("```"):
+        lines = [ln for ln in s.splitlines() if not ln.strip().startswith("```")]
+        s = "\n".join(lines).strip()
+    return s.rstrip(".").strip().replace("'''", "")
+$$;
+
+CREATE TOOL_API make_theorem(stmt TEXT, tactics TEXT)
+RETURNS TEXT AS PYTHON $$
+def make_theorem(stmt: str, tactics: str) -> str:
+    """Assemble the final theorem deterministically: the verified statement
+    is spliced in verbatim — the LLM never contributes to it (recipe 67)."""
+    body = tactics.strip()
+    if body.startswith(":="):
+        body = body[2:].strip()
+    if body == "by" or body.startswith(("by\n", "by ")):
+        body = body[2:].strip()
+    return f"theorem spl_claim : {stmt} := by\n  {body}"
+$$;
+
+CREATE TOOL_API append_summary(summary TEXT, concept TEXT, badge TEXT,
+                               stmt TEXT, faithful TEXT, citation TEXT)
+RETURNS TEXT AS PYTHON $$
+def append_summary(summary: str, concept: str, badge: str,
+                   stmt: str, faithful: str, citation: str) -> str:
+    if not summary.strip():
+        summary = ("# Lean payoff pass (B-2)\n\n"
+                   "| concept | badge | formalization | faithfulness | citation |\n"
+                   "|---|---|---|---|---|")
+    verdict = faithful.strip().splitlines()[0] if faithful.strip() else "—"
+    return (f"{summary}\n| {concept} | `{badge}` | `{stmt or '—'}` "
+            f"| {verdict} | `{citation or '—'}` |")
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formalize_claim(claim TEXT)
+RETURNS TEXT AS $$
+Translate this mathematical claim into a single Lean 4 proposition.
+Mathlib IS imported — use mathlib vocabulary and notation.
+
+Rules:
+- Output ONLY the proposition — what goes after `example :`. No proof,
+  no `example`, no markdown fences, no commentary.
+- Bind every variable and every typeclass instance explicitly
+  (autoImplicit is off): universes, [Field ...], [AddCommGroup ...],
+  [Module ...], [FiniteDimensional ...] as needed.
+- Prefer the formulation closest to mathlib's own (Module.finrank,
+  LinearMap.range, LinearMap.ker, Matrix.IsHermitian, ...).
+- Example output for "rank plus nullity equals domain dimension":
+  ∀ {V W : Type} [AddCommGroup V] [Module ℝ V] [FiniteDimensional ℝ V] [AddCommGroup W] [Module ℝ W] (f : V →ₗ[ℝ] W), Module.finrank ℝ (LinearMap.range f) + Module.finrank ℝ (LinearMap.ker f) = Module.finrank ℝ V
+
+Claim: {claim}
+$$;
+
+CREATE FUNCTION fix_formalization(claim TEXT, lean_stmt TEXT, feedback TEXT)
+RETURNS TEXT AS $$
+This Lean 4 proposition failed to typecheck. Mathlib IS imported.
+
+Claim (prose): {claim}
+Attempted proposition: {lean_stmt}
+Lean's diagnostics:
+{feedback}
+
+Output ONLY the corrected proposition (what goes after `example :`).
+No proof, no fences, no commentary. Bind every variable and typeclass
+instance explicitly (autoImplicit is off).
+$$;
+
+CREATE FUNCTION judge_faithfulness(claim TEXT, lean_stmt TEXT)
+RETURNS TEXT AS $$
+A prose mathematical claim was formalized in Lean 4 (mathlib).
+
+Prose claim: {claim}
+Lean proposition: {lean_stmt}
+
+Does the Lean proposition say exactly what the prose claims — same
+quantifiers, no vacuous hypotheses, no degenerate specialization?
+Reply with exactly one line: FAITHFUL or UNFAITHFUL, then a dash and
+one short reason.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW lean_payoffs
+  INPUT @concepts TEXT := 'rank_nullity,diagonalization,spectral_theorem'
+  INPUT @max_tries INT := 3
+  OUTPUT @report TEXT
+DO
+  -- Step 0 (deterministic): persistent Lean REPL over the mathlib
+  -- project (setup_lean.sh --with-mathlib). The warm-up pays the
+  -- mathlib import once; every check branches off the warm env.
+  CALL run_python('from spl3.lean_bridge import LeanREPL; _spl_lean = LeanREPL.mathlib().start(); print("ready")') INTO @lean_status;
+  LOGGING f"Lean REPL (mathlib): {@lean_status}" LEVEL INFO
+
+  CALL run_python(f"print(len('{@concepts}'.split(',')))") INTO @n;
+  @summary := "";
+  @i := 0;
+
+  WHILE @i < @n DO
+    CALL run_python(f"print('{@concepts}'.split(',')[{@i}].strip())") INTO @concept;
+    CALL payoff_claim(@concept) INTO @claim;
+    LOGGING f"[{@i}] {@concept}: {@claim}" LEVEL INFO
+
+    -- ── Stage 1: formalize, capped typecheck-repair loop ──
+    @lean_stmt := "";
+    @stmt_ok_lc := 'init';
+    @tries := 0;
+    WHILE @tries < @max_tries DO
+      EVALUATE @stmt_ok_lc
+        WHEN = 'true' THEN
+          @tries := @tries + 1
+        WHEN = 'init' THEN
+          GENERATE formalize_claim(@claim) INTO @stmt_raw;
+          CALL strip_fences(@stmt_raw) INTO @lean_stmt;
+          @check_code := f"print(_spl_lean.statement_ok(r'''{@lean_stmt}'''))";
+          CALL run_python(@check_code) INTO @stmt_ok;
+          CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+          CALL lower(@stmt_ok) INTO @stmt_ok_lc;
+          @tries := @tries + 1;
+          LOGGING f"{@concept} formalize {@tries}: {@stmt_ok}" LEVEL INFO
+        ELSE
+          GENERATE fix_formalization(@claim, @lean_stmt, @lean_feedback) INTO @stmt_raw;
+          CALL strip_fences(@stmt_raw) INTO @lean_stmt;
+          @check_code := f"print(_spl_lean.statement_ok(r'''{@lean_stmt}'''))";
+          CALL run_python(@check_code) INTO @stmt_ok;
+          CALL run_python('print(_spl_lean.feedback)') INTO @lean_feedback;
+          CALL lower(@stmt_ok) INTO @stmt_ok_lc;
+          @tries := @tries + 1;
+          LOGGING f"{@concept} repair {@tries}: {@stmt_ok}" LEVEL INFO
+      END
+    END
+
+    -- ── Stage 2 + 3: faithfulness gate, then citation-first proof ──
+    @faithful := 'not judged (formalization failed)';
+    @badge_out := 'unverified';
+    @citation := "";
+    EVALUATE @stmt_ok_lc
+      WHEN = 'true' THEN
+        @badge_out := 'statement_checked';
+        GENERATE judge_faithfulness(@claim, @lean_stmt) INTO @faithful;
+        EVALUATE @faithful
+          WHEN contains("UNFAITHFUL") THEN
+            -- §B.4 gate: an unfaithful formalization never earns the
+            -- badge — these are real textbook entries being promoted.
+            LOGGING f"{@concept}: UNFAITHFUL formalization — badge withheld" LEVEL INFO
+          ELSE
+            -- B-5 citation path: exact? locally, Loogle fallback over
+            -- HTTP, every candidate kernel-checked inside find_citation.
+            @find_code := f"print(_spl_lean.find_citation(r'''{@lean_stmt}'''))";
+            CALL run_python(@find_code) INTO @citation;
+            CALL lower(@citation) INTO @citation_lc;
+            EVALUATE @citation_lc
+              WHEN = 'none' THEN
+                @citation := "";
+                LOGGING f"{@concept}: no library citation — stays statement-checked" LEVEL INFO
+              ELSE
+                -- Re-check the assembled theorem: the verified statement
+                -- is spliced in verbatim, the citation is the proof.
+                CALL make_theorem(@lean_stmt, @citation) INTO @proof;
+                @check_code := f"print(_spl_lean.check(r'''{@proof}''')['ok'])";
+                CALL run_python(@check_code) INTO @proof_ok;
+                CALL lower(@proof_ok) INTO @proof_ok_lc;
+                EVALUATE @proof_ok_lc
+                  WHEN = 'true' THEN
+                    @badge_out := 'machine_proved';
+                    -- B-4: promote the build run's cached section — it
+                    -- already holds machine_verified (CAS), this adds the
+                    -- claim axis top badge + the audited statement.
+                    CALL cache_promote(@concept, 'machine_proved', statement=@lean_stmt) INTO @promoted;
+                    EVALUATE @promoted
+                      WHEN contains("error") THEN
+                        LOGGING f"{@concept}: no cached section to promote ({@promoted})" LEVEL INFO
+                      ELSE
+                        LOGGING f"{@concept}: badges now {@promoted}" LEVEL INFO
+                    END
+                  ELSE
+                    LOGGING f"{@concept}: citation failed kernel check — stays statement-checked" LEVEL INFO
+                END
+            END
+        END
+    END
+
+    CALL append_summary(@summary, @concept, @badge_out, @lean_stmt, @faithful, @citation) INTO @summary;
+    @i := @i + 1
+  END
+
+  @report := @summary;
+  RETURN @report WITH status = 'complete';
+EXCEPTION
+  WHEN BudgetExceeded THEN
+    RETURN @report WITH status = 'budget_limit';
+END;

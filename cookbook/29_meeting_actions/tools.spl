@@ -1,0 +1,152 @@
+-- Tools for Recipe 29: Meeting Notes → Action Items
+
+CREATE TOOL_API load_transcript(filename TEXT) RETURNS TEXT AS PYTHON $$
+import os
+
+_TRANSCRIPTS_DIR = "cookbook/29_meeting_actions/transcripts"
+
+def load_transcript(filename):
+    filename = filename.strip()
+    if not filename:
+        return ""
+
+    path = os.path.join(_TRANSCRIPTS_DIR, filename)
+    if not os.path.isfile(path):
+        available = ", ".join(sorted(os.listdir(_TRANSCRIPTS_DIR)))
+        return f"File not found: '{filename}'. Available transcripts: {available}"
+
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+$$;
+
+CREATE TOOL_API extract_speakers(text TEXT) RETURNS TEXT AS PYTHON $$
+import re
+
+def extract_speakers(text):
+    speakers = []
+    seen = set()
+
+    # "Attendees: Alice (PM), Bob (Backend), ..."
+    for m in re.finditer(r'Attendees?:\s*(.+)', text, re.IGNORECASE):
+        for part in m.group(1).split(","):
+            name = re.sub(r'\s*\(.*?\)', "", part).strip()
+            if name and name not in seen:
+                seen.add(name)
+                speakers.append(name)
+
+    # "Speaker: ..." or "Speaker (Role): ..."
+    for m in re.finditer(r'^([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s*(?:\([^)]*\))?:', text, re.MULTILINE):
+        name = m.group(1).strip()
+        if name not in seen and name.lower() not in {"date", "attendees", "facilitator", "format"}:
+            seen.add(name)
+            speakers.append(name)
+
+    return ", ".join(speakers) if speakers else "Unknown"
+$$;
+
+CREATE TOOL_API normalize_dates(json_str TEXT) RETURNS TEXT AS PYTHON $$
+import json
+from datetime import date, timedelta
+
+def _today():
+    return date.today()
+
+def _next_weekday(weekday):
+    today = _today()
+    days_ahead = weekday - today.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    return today + timedelta(days=days_ahead)
+
+def _resolve_date_phrase(phrase):
+    phrase = phrase.strip().lower()
+    today = _today()
+    weekdays = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+
+    if phrase in ("today",):
+        return today.isoformat()
+    if phrase in ("tomorrow",):
+        return (today + timedelta(days=1)).isoformat()
+    if phrase in ("end of day", "eod"):
+        return today.isoformat()
+    if phrase in ("this week", "end of week", "eow"):
+        return _next_weekday(4).isoformat()
+    if phrase in ("next week",):
+        return (today + timedelta(days=7)).isoformat()
+    if phrase in ("end of sprint", "end of this sprint"):
+        return (_next_weekday(4) + timedelta(days=7)).isoformat()
+    if phrase in ("next sprint",):
+        return (today + timedelta(weeks=2)).isoformat()
+    if phrase in ("end of month",):
+        next_month = date(today.year, today.month % 12 + 1, 1) if today.month < 12 else date(today.year + 1, 1, 1)
+        return (next_month - timedelta(days=1)).isoformat()
+
+    for name, idx in weekdays.items():
+        if phrase == name or phrase == f"this {name}":
+            return _next_weekday(idx).isoformat()
+        if phrase == f"next {name}":
+            base = _next_weekday(idx)
+            if (base - today).days < 7:
+                base += timedelta(days=7)
+            return base.isoformat()
+
+    for prep in ("by ", "before ", "by end of day "):
+        if phrase.startswith(prep):
+            return _resolve_date_phrase(phrase[len(prep):])
+
+    return None
+
+def normalize_dates(json_str):
+    json_str = json_str.strip()
+    if not json_str:
+        return json_str
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        return json_str
+
+    items = data.get("action_items", [])
+    for item in items:
+        raw = item.get("due_date", "")
+        if raw:
+            resolved = _resolve_date_phrase(raw)
+            if resolved:
+                item["due_date"] = resolved
+
+    return json.dumps(data, indent=2)
+$$;
+
+CREATE TOOL_API validate_ownership(json_str TEXT) RETURNS TEXT AS PYTHON $$
+import json
+
+def validate_ownership(json_str):
+    json_str = json_str.strip()
+    if not json_str:
+        return "No action items to validate."
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        return "Could not parse action items JSON for validation."
+
+    issues = []
+    no_owner_values = {"", "tbd", "unknown", "unassigned", "n/a", "none"}
+
+    for item in data.get("action_items", []):
+        priority = (item.get("priority") or "").lower()
+        owner = (item.get("owner") or "").strip().lower()
+        task = item.get("task", "(unnamed task)")
+
+        if priority == "high" and owner in no_owner_values:
+            issues.append(f"- [HIGH] '{task}' has no owner assigned.")
+
+    if not issues:
+        return "All high-priority items have owners."
+
+    header = f"{len(issues)} high-priority item(s) without an owner:\n"
+    return header + "\n".join(issues)
+$$;

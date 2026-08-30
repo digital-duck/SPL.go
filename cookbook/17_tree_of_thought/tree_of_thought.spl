@@ -1,0 +1,134 @@
+-- Recipe 17: Tree of Thought (Dynamic)
+-- Explores multiple reasoning paths in parallel using a list of models.
+-- Uses MAP and LIST for dynamic path management and evaluation.
+
+CREATE FUNCTION initial_approach(problem TEXT) 
+RETURN TEXT
+AS $$
+Provide an initial high-level approach or reasoning path for the following problem:
+{problem}
+
+Focus on a unique perspective or specialized methodology.
+$$;
+
+CREATE FUNCTION develop(path TEXT, problem TEXT) 
+RETURN TEXT
+AS $$
+Take the following initial approach and develop it one level deeper, adding specific steps and technical details:
+Approach: {path}
+Problem: {problem}
+$$;
+
+CREATE FUNCTION evaluate_path(path TEXT, problem TEXT) 
+RETURN TEXT
+AS $$
+Score the following reasoning path on a scale of 1-10 based on its feasibility and depth.
+Problem: {problem}
+Path: {path}
+
+Output only the numeric score.
+$$;
+
+CREATE FUNCTION select_best(results_map TEXT, problem TEXT) 
+RETURN TEXT
+AS $$
+Review the following developed reasoning paths and their scores provided in a JSON map:
+{results_map}
+
+Problem: {problem}
+
+Identify the path with the best reasoning and provide the content of that path as the output.
+$$;
+
+CREATE FUNCTION refine_solution(path TEXT, problem TEXT) RETURN TEXT
+AS $$
+Refine the following reasoning path into a complete, polished solution for the problem.
+Problem: {problem}
+Path: {path}
+$$;
+
+CREATE FUNCTION verify(solution TEXT, problem TEXT) RETURN TEXT
+AS $$
+Verify if the following solution is sound and fully addresses the problem.
+Problem: {problem}
+Solution: {solution}
+
+Output 'sound' if it is correct, otherwise provide a brief critique.
+$$;
+
+CREATE FUNCTION synthesize_all(results_map TEXT, problem TEXT) RETURN TEXT
+AS $$
+Synthesize insights from all the following reasoning paths to create a comprehensive final solution.
+Problem: {problem}
+Paths: {results_map}
+$$;
+
+WORKFLOW tree_of_thought
+    INPUT:
+        @problem TEXT DEFAULT 'Design a sustainable urban transport system.',
+        @models LIST DEFAULT ['gemma3', 'phi4'],
+        @log_dir TEXT DEFAULT 'cookbook/17_tree_of_thought/logs-spl'
+    OUTPUT: @best_solution TEXT
+DO
+    LOGGING f'Tree of thought | problem: {@problem} | models: {@models}' LEVEL INFO
+
+    @results := {}
+    @count := COUNT(@models)
+    @i := 0
+
+    -- Step 1 & 2: Generate and Develop paths in a loop
+    WHILE @i < @count DO
+        @current_model := @models[@i]
+        LOGGING f'Exploring path {@i + 1}/{@count} using {@current_model}...'
+        
+        GENERATE initial_approach(@problem) 
+            USING MODEL @current_model 
+            INTO @init_path
+        GENERATE develop(@init_path, @problem) 
+            USING MODEL @current_model 
+            INTO @developed_path
+        GENERATE evaluate_path(@developed_path, @problem) 
+            INTO @score
+        
+        -- Store path and score in map
+        @path_data := {}
+        @path_data['content'] := @developed_path
+        @path_data['score'] := @score
+        @results[@current_model] := @path_data
+        
+        CALL write_file(f'{@log_dir}/path_{@current_model}.md', @developed_path) INTO NONE
+        
+        @i := @i + 1
+    END
+
+    -- Step 4: Select the best path
+    LOGGING 'Evaluating all paths to select the best...'
+    GENERATE select_best(@results, @problem) INTO @best_path
+
+    -- Step 5: Refine the winning path into a final solution
+    LOGGING 'Refining winning path...'
+    GENERATE refine_solution(@best_path, @problem) INTO @best_solution
+
+    -- Step 6: Verify the solution holds up
+    GENERATE verify(@best_solution, @problem) INTO @verification
+    LOGGING f'Verification result: {@verification}' LEVEL INFO
+
+    EVALUATE @verification
+        WHEN 'sound' THEN
+            RETURN @best_solution WITH status = 'complete', paths_explored = @count
+        ELSE
+            -- If verification fails, combine insights from all paths
+            LOGGING 'Verification failed — synthesizing all paths' LEVEL WARN
+            GENERATE synthesize_all(@results, @problem) 
+                INTO @best_solution
+            RETURN @best_solution WITH status = 'synthesized', paths_explored = @count
+    END
+
+    CALL write_file(f'{@log_dir}/final_solution.md', @best_solution) INTO NONE
+
+EXCEPTION
+    WHEN BudgetExceeded THEN
+        RETURN @best_solution WITH status = 'budget_limit'
+    WHEN HallucinationDetected THEN
+        RETRY WITH temperature = 0.1 LIMIT 3
+END

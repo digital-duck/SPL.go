@@ -1,0 +1,109 @@
+-- Recipe Name: Azure OpenAI Quickstart
+-- Run the same prompt across multiple Azure OpenAI deployments and compare.
+-- Useful for validating model quality differences between GPT tiers
+-- deployed in your own Azure subscription.
+--
+-- Prerequisites:
+--   pip install openai
+--   export AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
+--   export AZURE_OPENAI_API_KEY=<your-key>
+--   Deployments created in Azure AI Studio / Azure OpenAI Studio
+--
+-- Usage:
+--   spl3 run cookbook/40_azure_openai_quickstart/azure_openai_quickstart.spl --adapter azure_openai \
+--       prompt="Explain the CAP theorem in two sentences."
+--
+--   # Custom deployments (match names you created in Azure)
+--   spl3 run cookbook/40_azure_openai_quickstart/azure_openai_quickstart.spl --adapter azure_openai \
+--       prompt="Summarise the key benefits of microservices." \
+--       deployment_1="gpt-4o" \
+--       deployment_2="gpt-4o-mini" \
+--       deployment_3="gpt-35-turbo"
+
+CREATE FUNCTION compare_deployments(
+    prompt       TEXT,
+    deployment_1 TEXT, answer_1 TEXT,
+    deployment_2 TEXT, answer_2 TEXT,
+    deployment_3 TEXT, answer_3 TEXT
+) RETURN TEXT
+AS $$
+You are evaluating three Azure OpenAI deployments on the same prompt.
+
+Prompt: "{prompt}"
+
+=== {deployment_1} ===
+{answer_1}
+
+=== {deployment_2} ===
+{answer_2}
+
+=== {deployment_3} ===
+{answer_3}
+
+Evaluate each response on:
+- Accuracy and completeness
+- Clarity and conciseness
+- Cost-effectiveness for this type of query
+
+Conclude with which deployment best fits this use case in a production setting.
+$$;
+
+WORKFLOW azure_openai_quickstart
+    INPUT:
+        @prompt       TEXT DEFAULT 'Explain the CAP theorem in two sentences.',
+        @deployment_1 TEXT DEFAULT 'gpt-4o',
+        @deployment_2 TEXT DEFAULT 'gpt-4o-mini',
+        @deployment_3 TEXT DEFAULT 'gpt-35-turbo'
+    OUTPUT: @comparison TEXT
+DO
+    -- Fan out the same prompt to all three deployments in parallel CTEs
+    WITH
+        response_1 AS (
+            PROMPT ask_deployment_1
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @deployment_1
+        ),
+        response_2 AS (
+            PROMPT ask_deployment_2
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @deployment_2
+        ),
+        response_3 AS (
+            PROMPT ask_deployment_3
+            SELECT
+                system_role('You are a helpful, knowledgeable assistant.'),
+                @prompt AS prompt
+            GENERATE answer(prompt)
+            USING MODEL @deployment_3
+        )
+    SELECT
+        response_1.answer AS answer_1,
+        response_2.answer AS answer_2,
+        response_3.answer AS answer_3
+    INTO @answer_1, @answer_2, @answer_3
+
+    -- Compare all three deployments
+    GENERATE compare_deployments(
+        @prompt,
+        @deployment_1, @answer_1,
+        @deployment_2, @answer_2,
+        @deployment_3, @answer_3
+    ) INTO @comparison
+
+    RETURN @comparison WITH
+        status       = 'complete',
+        deployment_1 = @deployment_1,
+        deployment_2 = @deployment_2,
+        deployment_3 = @deployment_3
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'One or more Azure OpenAI deployments failed. Check endpoint, API key, and deployment names.'
+        WITH status = 'error'
+END

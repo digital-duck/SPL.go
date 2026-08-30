@@ -1,0 +1,409 @@
+-- ============================================================
+-- Recipe 72: Verify arXiv References
+--
+-- Citation-integrity check, automated. Given raw text — a "##
+-- References" block, a full paper draft, or any other text that
+-- cites arXiv work — this recipe:
+--
+--   1. Scans the text for arXiv citations (arXiv:XXXX.XXXXX or an
+--      arxiv.org/abs|pdf URL) wherever they appear, deduplicating
+--      repeat citations of the same id down to one entry — no
+--      "## References" heading or blank-line-separated bibliography
+--      format is required,
+--   2. Extracts an arXiv id where one is cited (arXiv:XXXX.XXXXX
+--      or an arxiv.org/abs|pdf URL) — entries with no arXiv id
+--      (books, journals, ...) are logged and skipped,
+--   3. Looks up the *actual* record on arXiv (title, authors,
+--      abstract) via the public Atom API — this is the ground
+--      truth the citation is checked against,
+--   4. Downloads the PDF to @out_dir,
+--   5. Has the LLM write a <5-sentence digest of the verified
+--      abstract (summary_desc — fluency/condensation only; the
+--      facts come from arXiv, not from the model),
+--   6. Appends one row per verified reference to summary.csv
+--      (arxiv_id, title, summary_desc, authors),
+--   7. Logs every skipped reference to summary-skipped.csv
+--      (ref_index, arxiv_id, reason, ref_text) — covers entries
+--      with no arXiv id and entries where lookup/download failed,
+--   8. Writes all log messages to both console and a timestamped
+--      log file under ~/.spl/logs/ via the log TOOL_API.
+--
+-- Reuses the download/cache shape of cookbook/47_arxiv_morning_brief
+-- (download_arxiv_pdf -> download_pdf_to: rate-limited GET, write
+-- to disk, skip if already cached) and its DO/EXCEPTION-per-item
+-- loop structure, generalised from "list of URLs" to "parsed
+-- reference entries with a lookup-then-download step."
+--
+-- Note: most TOOL_API bodies are defined INLINE here. The logging
+-- tools (log_init, log) live in stdlib_log and must be
+-- promoted first:  spl3 tool-api promote cookbook/tools/stdlib_log.spl
+--
+-- Why this matters: a reviewer (Opus 4.8) fact-checked one of our
+-- own citations by hand and found a misattributed author list —
+-- this recipe automates exactly that check across a whole
+-- reference section, and produces a verifiable record (PDF +
+-- arXiv-sourced metadata) for each entry it could resolve.
+--
+-- Run:
+--   spl3 run cookbook/72_verify_arxiv_references/verify_arxiv_references.spl \
+--       --llm ollama:gemma3 \
+--       in_refs="$(cat references.md)" \
+--       out_dir="cookbook/72_verify_arxiv_references/output"
+-- ============================================================
+
+-- ── TOOL_API: deterministic helpers ───────────────────────────
+-- log_init / log come from stdlib_log (promoted to ~/.spl/tool_apis/)
+
+CREATE TOOL_API parse_references(raw TEXT)
+RETURNS TEXT AS PYTHON $$
+def parse_references(raw: str) -> str:
+    """Scan raw text for arXiv citations and return a deduped JSON list of
+    entry strings, one per distinct arXiv id found.
+
+    *raw* can be either inline text or a file path — if it looks like
+    a path to an existing file (no newlines, file exists on disk), its
+    contents are read first.
+
+    No '## References' heading or blank-line-separated bibliography format
+    is required — this looks for the citation patterns themselves
+    ('arXiv:XXXX.XXXXX' or an arxiv.org/abs|pdf/XXXX.XXXXX URL) wherever
+    they occur in the text, line by line. Each entry is normalised to start
+    with 'arXiv:<id>' so extract_arxiv_id always resolves it unambiguously
+    — including when a single line cites more than one id — followed by
+    the source line for context. Repeat citations of the same id collapse
+    to their first occurrence."""
+    import json
+    import re
+    from pathlib import Path
+
+    text = raw.strip()
+    if '\n' not in text and Path(text).is_file():
+        text = Path(text).read_text(encoding='utf-8')
+
+    pattern = re.compile(
+        r'arxiv\s*:\s*(\d{4}\.\d{4,5})'
+        r'|arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})',
+        re.IGNORECASE,
+    )
+
+    seen: set[str] = set()
+    entries: list[str] = []
+    for line in text.splitlines():
+        for m in pattern.finditer(line):
+            arxiv_id = m.group(1) or m.group(2)
+            if arxiv_id in seen:
+                continue
+            seen.add(arxiv_id)
+            context = re.sub(r'\s+', ' ', line).strip()
+            entries.append(f'arXiv:{arxiv_id} — {context}')
+
+    return json.dumps(entries)
+$$;
+
+CREATE TOOL_API extract_arxiv_id(ref_text TEXT)
+RETURNS TEXT AS PYTHON $$
+def extract_arxiv_id(ref_text: str) -> str:
+    """Pull an arXiv id ('XXXX.XXXXX') from 'arXiv:...' text or an
+    arxiv.org/abs|pdf URL. Returns "" when the reference cites no arXiv id
+    (books, journals, conference proceedings, ...)."""
+    import re
+
+    m = re.search(r'arxiv\s*:\s*(\d{4}\.\d{4,5})', ref_text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})', ref_text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
+$$;
+
+CREATE TOOL_API lookup_arxiv(arxiv_id TEXT)
+RETURNS TEXT AS PYTHON $$
+def lookup_arxiv(arxiv_id: str) -> str:
+    """Query the public arXiv Atom API for the ground-truth record (title,
+    authors, abstract, pdf url) of arxiv_id. This is the source of truth a
+    citation is checked against — NOT the citing paper's own description."""
+    import json
+    import re
+    import xml.etree.ElementTree as ET
+
+    import httpx
+
+    api_url = f'http://export.arxiv.org/api/query?id_list={arxiv_id}'
+    try:
+        resp = httpx.get(api_url, timeout=30.0, follow_redirects=True)
+    except Exception as e:
+        raise RuntimeError(f'Network error querying arXiv API for {arxiv_id}: {e}') from e
+    if resp.status_code != 200:
+        raise RuntimeError(f'HTTP {resp.status_code} from arXiv API for {arxiv_id}')
+
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+    root = ET.fromstring(resp.text)
+    entry = root.find('atom:entry', ns)
+    if entry is None:
+        raise RuntimeError(f'No arXiv entry found for id {arxiv_id} (withdrawn or mistyped)')
+
+    def _clean(s):
+        return re.sub(r'\s+', ' ', (s or "")).strip()
+
+    title   = _clean(entry.findtext('atom:title', default="", namespaces=ns))
+    summary = _clean(entry.findtext('atom:summary', default="", namespaces=ns))
+    authors = [
+        _clean(a.findtext('atom:name', default="", namespaces=ns))
+        for a in entry.findall('atom:author', ns)
+    ]
+    authors = [a for a in authors if a]
+
+    pdf_url = ""
+    for link in entry.findall('atom:link', ns):
+        if link.get('title') == 'pdf' or link.get('type') == 'application/pdf':
+            pdf_url = link.get('href', "")
+            break
+    if not pdf_url:
+        pdf_url = f'https://arxiv.org/pdf/{arxiv_id}'
+
+    return json.dumps({
+        'arxiv_id': arxiv_id,
+        'title':    title,
+        'authors':  '; '.join(authors),
+        'summary':  summary,
+        'pdf_url':  pdf_url,
+    })
+$$;
+
+CREATE TOOL_API json_field(json_str TEXT, field TEXT)
+RETURNS TEXT AS PYTHON $$
+def json_field(json_str: str, field: str) -> str:
+    """Pull a single named field out of a JSON object string."""
+    import json
+
+    try:
+        obj = json.loads(json_str)
+        return str(obj.get(field, ""))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ""
+$$;
+
+CREATE TOOL_API download_pdf_to(pdf_url TEXT, out_dir TEXT, arxiv_id TEXT)
+RETURNS TEXT AS PYTHON $$
+def download_pdf_to(pdf_url: str, out_dir: str, arxiv_id: str) -> str:
+    """Download pdf_url into out_dir as '<arxiv_id>.pdf' (cached, rate-limited).
+    Same shape as cookbook/47_arxiv_morning_brief's download_arxiv_pdf, but
+    writes to a caller-supplied directory under an arXiv-id-based filename."""
+    import time
+    from pathlib import Path
+
+    import httpx
+
+    RATE_LIMIT_SECS = 3.0
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    safe_name = (arxiv_id or pdf_url.rstrip('/').split('/')[-1]).replace('/', '_')
+    if not safe_name.endswith('.pdf'):
+        safe_name += '.pdf'
+    dest = out_path / safe_name
+
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+
+    try:
+        resp = httpx.get(pdf_url, timeout=60.0, follow_redirects=True)
+    except Exception as e:
+        raise RuntimeError(f'Network error downloading {pdf_url}: {e}') from e
+    if resp.status_code != 200:
+        raise RuntimeError(f'HTTP {resp.status_code} downloading {pdf_url}')
+
+    dest.write_bytes(resp.content)
+    time.sleep(RATE_LIMIT_SECS)
+    return str(dest)
+$$;
+
+CREATE TOOL_API init_summary_csv(csv_path TEXT)
+RETURNS TEXT AS PYTHON $$
+def init_summary_csv(csv_path: str) -> str:
+    """Create summary.csv with its header row if it doesn't exist yet."""
+    import csv
+    from pathlib import Path
+
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', encoding='utf-8', newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['arxiv_id', 'title', 'summary_desc', 'authors'])
+    return str(path)
+$$;
+
+CREATE TOOL_API append_csv_row(csv_path TEXT, arxiv_id TEXT, title TEXT, summary_desc TEXT, authors TEXT)
+RETURNS TEXT AS PYTHON $$
+def append_csv_row(csv_path: str, arxiv_id: str, title: str, summary_desc: str, authors: str) -> str:
+    """Append one verified-reference row to summary.csv."""
+    import csv
+    import re
+    from pathlib import Path
+
+    def _oneline(s: str) -> str:
+        return re.sub(r'\s*[\r\n]+\s*', ' ', s).strip()
+
+    path = Path(csv_path)
+    with path.open('a', encoding='utf-8', newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([_oneline(arxiv_id), _oneline(title),
+                         _oneline(summary_desc), _oneline(authors)])
+    return str(path)
+$$;
+
+CREATE TOOL_API append_skipped_row(csv_path TEXT, ref_index TEXT, arxiv_id TEXT, reason TEXT, ref_text TEXT)
+RETURNS TEXT AS PYTHON $$
+def append_skipped_row(csv_path: str, ref_index: str, arxiv_id: str, reason: str, ref_text: str) -> str:
+    """Append one skipped-reference row to summary-skipped.csv.
+    Creates the file with headers on first write."""
+    import csv
+    from pathlib import Path
+
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not path.exists()
+    with path.open('a', encoding='utf-8', newline="") as fh:
+        writer = csv.writer(fh)
+        if needs_header:
+            writer.writerow(['ref_index', 'arxiv_id', 'reason', 'ref_text'])
+        writer.writerow([ref_index, arxiv_id, reason, ref_text])
+    return str(path)
+$$;
+
+-- ── TOOL_API: JSON-list helpers (same shape as cookbook/tools/stdlib_list.spl) ─
+
+CREATE TOOL_API get_item(items TEXT, idx TEXT)
+RETURNS TEXT AS PYTHON $$
+def get_item(items: str, idx: str) -> str:
+    """Return the idx-th item (0-based) from a JSON array or comma-separated list."""
+    import json
+
+    try:
+        lst = json.loads(items)
+    except (json.JSONDecodeError, TypeError):
+        lst = [x.strip() for x in items.split(',')]
+    return str(lst[int(idx)])
+$$;
+
+CREATE TOOL_API list_count(json_list TEXT)
+RETURNS TEXT AS PYTHON $$
+def list_count(json_list: str) -> str:
+    """Return the number of items in a JSON array string."""
+    import json
+
+    try:
+        return str(len(json.loads(json_list)))
+    except (json.JSONDecodeError, TypeError):
+        return '0'
+$$;
+
+-- ── LLM function definitions ──────────────────────────────────
+
+CREATE FUNCTION digest_writer(title TEXT, abstract TEXT)
+RETURN TEXT
+AS $$
+You are a technical editor preparing a citation-verification table.
+Below is the title and abstract of a paper as recorded 
+on arXiv (the source of truth — not the citing paper''s description of it).
+
+Title: {title}
+
+Abstract: {abstract}
+
+Write a digest of the paper''s core contribution, method, and key result in fewer than 5 sentences. 
+Write plain prose only — no headings, no bullet points, no markdown formatting, no preamble such as "This paper...".
+$$;
+
+-- ── Workflow ──────────────────────────────────────────────────
+
+WORKFLOW verify_arxiv_references
+    INPUT:
+        @in_refs TEXT,
+        @out_dir TEXT DEFAULT 'cookbook/72_verify_arxiv_references/output'
+    OUTPUT: @summary_csv TEXT
+DO
+    CALL log_init('verify_arxiv_references') INTO @log_file
+    CALL log('Verify arXiv References — starting', 'INFO', @log_file) INTO @log_file
+
+    CALL parse_references(@in_refs) INTO @refs
+    CALL list_count(@refs) INTO @n
+    CALL log(f'References parsed: {@n}', 'INFO', @log_file) INTO @log_file
+
+    @csv_path := f'{@out_dir}/summary.csv'
+    CALL init_summary_csv(@csv_path) INTO @csv_path
+    CALL log(f'Summary CSV: {@csv_path}', 'INFO', @log_file) INTO @log_file
+
+    @skipped_csv_path := f'{@out_dir}/summary-skipped.csv'
+
+    @i        := 0
+    @verified := 0
+    @skipped  := 0
+
+    -- ── Per-reference loop ───────────────────────────────────
+    WHILE @i < @n DO
+        CALL get_item(@refs, @i) INTO @ref_text
+        CALL extract_arxiv_id(@ref_text) INTO @arxiv_id
+
+        DO
+            EVALUATE @arxiv_id
+                WHEN != "" THEN
+                    CALL log(f'[{@i}] arXiv:{@arxiv_id} — looking up ground-truth record', 'INFO', @log_file) INTO @log_file
+
+                    -- Step A: ground truth from arXiv (not from the citing paper)
+                    CALL lookup_arxiv(@arxiv_id) INTO @meta_json
+                    CALL json_field(@meta_json, 'title')   INTO @title
+                    CALL json_field(@meta_json, 'authors') INTO @authors
+                    CALL json_field(@meta_json, 'summary') INTO @abstract
+                    CALL json_field(@meta_json, 'pdf_url') INTO @pdf_url
+
+                    -- Step B: download the PDF (cached, rate-limited)
+                    CALL download_pdf_to(@pdf_url, @out_dir, @arxiv_id) INTO @pdf_path
+                    CALL log(f'[{@i}] downloaded -> {@pdf_path}', 'DEBUG', @log_file) INTO @log_file
+
+                    -- Step C: <5-sentence digest of the verified abstract
+                    GENERATE digest_writer(@title, @abstract)
+                        WITH OUTPUT BUDGET 180 TOKENS
+                        INTO @summary_desc
+
+                    -- Step D: record the verified row
+                    CALL append_csv_row(@csv_path, @arxiv_id, @title, @summary_desc, @authors) INTO @csv_path
+                    @verified := @verified + 1
+                    CALL log(f'[{@i}] verified: "{@title}" ({@authors})', 'INFO', @log_file) INTO @log_file
+                ELSE
+                    CALL log(f'[{@i}] no arXiv id in reference — likely a book/journal source, skipping', 'DEBUG', @log_file) INTO @log_file
+                    CALL append_skipped_row(@skipped_csv_path, @i, '', 'no_arxiv_id', @ref_text) INTO @skipped_csv_path
+                    @skipped := @skipped + 1
+            END
+        EXCEPTION
+            WHEN ToolError THEN
+                CALL log(f'[{@i}] arXiv:{@arxiv_id} — lookup/download failed, skipping', 'WARN', @log_file) INTO @log_file
+                CALL append_skipped_row(@skipped_csv_path, @i, @arxiv_id, 'lookup_or_download_failed', @ref_text) INTO @skipped_csv_path
+                @skipped := @skipped + 1
+            WHEN OTHERS THEN
+                CALL log(f'[{@i}] arXiv:{@arxiv_id} — unexpected error, skipping', 'WARN', @log_file) INTO @log_file
+                CALL append_skipped_row(@skipped_csv_path, @i, @arxiv_id, 'unexpected_error', @ref_text) INTO @skipped_csv_path
+                @skipped := @skipped + 1
+        END
+
+        @i := @i + 1
+    END
+
+    -- ── Summary ──────────────────────────────────────────────
+    CALL log(f'Done — {@verified} verified / {@skipped} skipped of {@n} references. Summary: {@csv_path} | Skipped: {@skipped_csv_path}', 'INFO', @log_file) INTO @log_file
+
+    RETURN @csv_path WITH
+        status           = 'complete',
+        total_refs       = @n,
+        verified         = @verified,
+        skipped          = @skipped,
+        skipped_csv_path = @skipped_csv_path,
+        log_file         = @log_file
+
+EXCEPTION
+    WHEN OTHERS THEN
+        CALL log('Reference verification failed', 'WARN', @log_file) INTO @log_file
+        RETURN "" WITH status = 'error'
+END

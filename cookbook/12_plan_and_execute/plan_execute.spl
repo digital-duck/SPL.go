@@ -1,0 +1,306 @@
+-- Recipe Name: Plan and Execute
+-- A planner agent decomposes a task into steps, then an executor implements each one.
+-- When output_dir is set, generated code files are written to disk one-by-one.
+--
+-- Usage:
+--   spl3 run cookbook/12_plan_and_execute/plan_execute.spl --adapter ollama \
+--       task="Build a REST API for a todo app" \
+--       output_dir="cookbook/12_plan_and_execute/output"
+--
+--   spl3 run cookbook/12_plan_and_execute/plan_execute.spl --adapter ollama \
+--       task="Set up a CI/CD pipeline for a Python project"
+
+CREATE TOOL_API write_code_files(content TEXT, output_dir TEXT)
+RETURNS TEXT AS PYTHON $$
+import os
+import re
+
+def write_code_files(content: str, output_dir: str) -> str:
+    """Parse fenced code blocks with '# filename:' comments and write each to output_dir.
+
+    Expects blocks in this format anywhere in the content:
+
+        ```python
+        # filename: app/main.py
+        ...code...
+        ```
+
+    Returns a summary of files written.
+    """
+    if not output_dir.strip():
+        return "No output_dir specified — files not written"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    pattern = re.compile(
+        r"```(?:\w+)?\n#\s*filename:\s*(\S+)\n(.*?)```",
+        re.DOTALL,
+    )
+
+    files_written = []
+    for match in pattern.finditer(content):
+        rel_path = match.group(1).strip()
+        code = match.group(2)
+        filepath = os.path.join(output_dir, rel_path)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(code)
+        files_written.append(rel_path)
+
+    if not files_written:
+        return (
+            "No code files found — ensure code blocks have a '# filename: path' "
+            "comment as the first line inside the fence."
+        )
+
+    lines = [f"Written {len(files_written)} file(s) to {output_dir}:"]
+    lines += [f"  {f}" for f in files_written]
+    return "\n".join(lines)
+$$;
+
+-- Phase 1: Decompose task into a numbered implementation plan
+CREATE FUNCTION plan(task TEXT) 
+RETURN TEXT
+AS $$
+You are a senior software architect. Break down this task into clear implementation steps:
+
+Task: {task}
+
+Output a numbered list of concrete steps (3–6 steps). Each step should be specific
+and independently executable. No prose — just the numbered list.
+$$;
+
+-- Count how many steps are in the plan (capped at max_steps)
+CREATE FUNCTION count_steps(plan TEXT, max_steps TEXT) 
+RETURN TEXT
+AS $$
+Count the number of numbered steps in this plan.
+Return ONLY a single integer — no explanation, no text.
+If there are more than {max_steps} steps, return {max_steps}.
+
+Plan:
+{plan}
+$$;
+
+-- Extract step N from the plan (0-indexed)
+CREATE FUNCTION extract_step(plan TEXT, step_index TEXT) 
+RETURN TEXT
+AS $$
+Extract step number {step_index} (0-indexed) from this numbered plan and return
+ONLY that step's description. No numbering prefix. No extra text.
+
+Plan:
+{plan}
+$$;
+
+-- Execute a step: produce a concise design decision + list of files to create
+CREATE FUNCTION execute_step(current_step TEXT, prior_results TEXT) 
+RETURN TEXT
+AS $$
+You are a senior software engineer planning an implementation.
+
+Step: {current_step}
+Completed so far: {prior_results}
+
+Describe in 2-3 sentences what this step produces and list the filenames it creates.
+Be brief — no code yet, just the design decision and file list.
+$$;
+
+-- Validate that a step produced meaningful output (design notes, not code)
+CREATE FUNCTION validate_step(current_step TEXT, step_result TEXT) 
+RETURN TEXT
+AS $$
+Does the following design note meaningfully address the step?
+Note: this is a planning phase — expect a 2-3 sentence description and a file list, NOT code.
+
+Step: {current_step}
+Design note: {step_result}
+
+Reply with exactly one word: "passed" or "failed".
+Only reply "failed" if the design note is empty, completely off-topic, or missing a file list.
+$$;
+
+-- Re-plan after a step failure
+CREATE FUNCTION replan(task TEXT, plan TEXT, step_index TEXT, step_result TEXT) 
+RETURN TEXT
+AS $$
+A step in our implementation plan failed. Create a revised plan.
+
+Original task: {task}
+Original plan: {plan}
+Failed at step: {step_index}
+Failure details: {step_result}
+
+Output a new numbered plan starting from step {step_index}. Keep completed steps as-is.
+$$;
+
+-- Phase 4a: List all source files to create (no code — just filenames + one-line descriptions)
+CREATE FUNCTION outline_files(task TEXT, results TEXT) 
+RETURN TEXT
+AS $$
+You are a senior software engineer. Based on the implementation plan below, list every
+source file that must be created to complete the task.
+
+Task: {task}
+
+Implementation plan:
+{results}
+
+Output a numbered list — one file per line — with the filename and a one-sentence description.
+Always include a README.md as the last item.
+Example:
+1. app.py - Flask application entry point, registers blueprints and starts the server
+2. models.py - SQLAlchemy ORM models for Todo and User
+3. README.md - Setup instructions, project layout, and example API calls
+
+No code. No prose. Just the numbered file list.
+$$;
+
+-- Count files in the outline
+CREATE FUNCTION count_files(outline TEXT) 
+RETURN TEXT
+AS $$
+Count the number of numbered items in this file list.
+Return ONLY a single integer — no explanation, no text.
+
+List:
+{outline}
+$$;
+
+-- Extract one file entry at index N (0-indexed)
+CREATE FUNCTION extract_file(outline TEXT, file_index TEXT) 
+RETURN TEXT
+AS $$
+Extract item number {file_index} (0-indexed) from this numbered file list and return
+ONLY that item's filename and description. No number prefix. No extra text.
+
+List:
+{outline}
+$$;
+
+-- Generate complete code for ONE file
+CREATE FUNCTION generate_file(task TEXT, results TEXT, file_desc TEXT) 
+RETURN TEXT
+AS $$
+You are a senior software engineer. Write complete, runnable code for ONE source file.
+
+Task: {task}
+
+Implementation plan:
+{results}
+
+File to create: {file_desc}
+
+Output a SINGLE fenced code block. The FIRST line inside the fence MUST be a filename comment:
+
+```python
+# filename: app/main.py
+...complete code...
+```
+
+Requirements:
+- Complete, runnable code — no placeholders, no TODOs.
+- Error handling, type hints, brief inline comments.
+- Only this one file — nothing else.
+$$;
+
+-- Summarize what was built
+CREATE FUNCTION summarize(task TEXT, results TEXT, file_outline TEXT) 
+RETURN TEXT
+AS $$
+In 3-5 sentences, describe what was built for this task and how to run it.
+
+Task: {task}
+Files created:
+{file_outline}
+$$;
+
+
+WORKFLOW plan_and_execute
+    INPUT:
+        @task TEXT DEFAULT 'Build a REST API for a todo app',
+        @output_dir TEXT DEFAULT "",
+        @max_steps INTEGER DEFAULT 5,
+        @max_replans INTEGER DEFAULT 3,
+        @log_dir TEXT DEFAULT 'cookbook/12_plan_and_execute/logs-spl'
+    OUTPUT: @final_report TEXT
+DO
+    @step_index := 0
+    @results := ""
+    @replan_count := 0
+    
+    LOGGING f'Plan-and-Execute | task: {@task}' LEVEL INFO
+
+    -- Phase 1: Plan
+    GENERATE plan(@task) INTO @plan
+    LOGGING f'Plan ready | steps to execute (max={@max_steps})' LEVEL INFO
+    CALL write_file(f'{@log_dir}/plan.md', @plan) INTO NONE
+
+    -- Phase 2: Count steps (capped at max_steps)
+    GENERATE count_steps(@plan, @max_steps) INTO @step_count
+    LOGGING f'Step count: {@step_count}' LEVEL DEBUG
+
+    -- Phase 3: Execute each step (brief design notes only — no code)
+    WHILE @step_index < @step_count DO
+        LOGGING f'Executing step {@step_index}/{@step_count} ...' LEVEL INFO
+        GENERATE extract_step(@plan, @step_index) INTO @current_step
+        GENERATE execute_step(@current_step, @results) INTO @step_result
+        GENERATE validate_step(@current_step, @step_result) INTO @validation
+
+        EVALUATE @validation
+            WHEN 'failed' THEN
+                @replan_count := @replan_count + 1
+                LOGGING f'Step {@step_index} failed — replanning ({@replan_count}/{@max_replans})' LEVEL WARN
+                EVALUATE @replan_count
+                    WHEN >= @max_replans THEN
+                        LOGGING f'Max replans reached — accepting step as-is' LEVEL WARN
+                        @results := @results || '\n## Step ' || @step_index || '\n' || @step_result
+                        CALL write_file(f'{@log_dir}/step_{@step_index}.md', @step_result) INTO NONE
+                        @step_index := @step_index + 1
+                    ELSE
+                        GENERATE replan(@task, @plan, @step_index, @step_result) INTO @plan
+                        GENERATE count_steps(@plan, @max_steps) INTO @step_count
+                        @step_index := 0
+                        @results := ""
+                END
+            ELSE
+                @results := @results || '\n## Step ' || @step_index || '\n' || @step_result
+                CALL write_file(f'{@log_dir}/step_{@step_index}.md', @step_result) INTO NONE
+                @step_index := @step_index + 1
+                LOGGING f'Step {@step_index} done' LEVEL DEBUG
+        END
+    END
+
+    LOGGING f'All {@step_count} steps complete — generating files' LEVEL INFO
+
+    -- Phase 4: Outline all files to generate
+    GENERATE outline_files(@task, @results) INTO @file_outline
+    GENERATE count_files(@file_outline) INTO @file_count
+    LOGGING f'File outline ready | {@file_count} files to generate' LEVEL INFO
+
+    -- Phase 5: Generate each file individually (one LLM call per file — avoids truncation)
+    @file_index := 0
+    WHILE @file_index < @file_count DO
+        LOGGING f'Generating file {@file_index}/{@file_count} ...' LEVEL INFO
+        GENERATE extract_file(@file_outline, @file_index) INTO @current_file
+        GENERATE generate_file(@task, @results, @current_file) INTO @file_code
+        CALL write_code_files(@file_code, @output_dir) INTO @file_written
+        LOGGING f'Written: {@file_written}' LEVEL DEBUG
+        @file_index := @file_index + 1
+    END
+
+    LOGGING f'All {@file_count} files generated' LEVEL INFO
+
+    -- Phase 6: Summary report
+    GENERATE summarize(@task, @results, @file_outline) INTO @final_report
+
+    CALL write_file(f'{@log_dir}/final_report.md', @final_report) INTO NONE
+    RETURN @final_report WITH status = 'complete', steps_executed = @step_index, files_generated = @file_count
+
+EXCEPTION
+    WHEN MaxIterationsReached THEN
+        GENERATE summarize(@task, @results, @file_outline) INTO @final_report
+        RETURN @final_report WITH status = 'partial', steps_executed = @step_index
+    WHEN BudgetExceeded THEN
+        RETURN @results WITH status = 'budget_limit'
+END

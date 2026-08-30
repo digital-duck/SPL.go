@@ -1,0 +1,73 @@
+-- Recipe 42: Knowledge Synthesis (RAG-Writer Pattern)
+-- Demonstrates how agents contribute back to the knowledge base.
+-- An LLM extracts structured insights from raw text; a deterministic CALL
+-- persists them to the vector store so future queries benefit.
+--
+-- Usage:
+--   spl3 run cookbook/42_knowledge_synthesis/knowledge_synthesis.spl \
+--       --adapter ollama \
+--       raw_text="Recent advances in sparse attention reduce transformer memory..."
+
+CREATE TOOL_API rag_update(content TEXT, metadata TEXT)
+RETURNS TEXT AS PYTHON $$
+def rag_update(content: str, metadata: str = "") -> str:
+    """
+    Add synthesized insights to the SPL RAG vector store.
+
+    Wraps the built-in CodeRAG pipeline so workflows can write back to the
+    knowledge base after extracting insights.  Returns 'success:<n_chunks>' on
+    success or 'error:<message>' on failure.
+    """
+    try:
+        from spl.code_rag import CodeRAG
+
+        rag = CodeRAG()
+        doc = f"{content}\n\n{metadata}".strip() if metadata else content
+        rag.add_document(doc)
+        return "success:1_chunk"
+    except Exception as exc:
+        return f"error:{exc}"
+$$;
+
+CREATE FUNCTION synthesize(raw_text TEXT)
+RETURN TEXT
+AS $$
+You are a knowledge engineer. Extract exactly 3 core insights from the text below.
+Format each insight as a concise bullet point (one sentence, no sub-bullets).
+Focus on novel claims, methods, or results — not background knowledge.
+
+Text:
+{raw_text}
+$$;
+
+WORKFLOW knowledge_synthesis
+    INPUT:
+        @raw_text TEXT,
+        @log_dir TEXT DEFAULT 'cookbook/42_knowledge_synthesis/logs-spl'
+    OUTPUT: @status TEXT
+DO
+    LOGGING 'Extracting insights from new information ...' LEVEL INFO
+
+    -- Step 1: Extract and synthesize insights (LLM)
+    GENERATE synthesize(@raw_text) INTO @insights
+    LOGGING f'Insights extracted: {@insights}' LEVEL DEBUG
+    CALL write_file(f'{@log_dir}/insights.md', @insights) INTO NONE
+
+    -- Step 2: Persist to vector store (deterministic CALL — no LLM cost)
+    LOGGING 'Updating RAG vector store ...' LEVEL DEBUG
+    CALL rag_update(@insights, f'Source: {@raw_text}') INTO @status
+
+    -- Step 3: Log outcome
+    EVALUATE @status
+        WHEN contains('success') THEN
+            LOGGING 'Knowledge base successfully updated' LEVEL INFO
+        ELSE
+            LOGGING f'Knowledge base update returned: {@status}' LEVEL WARN
+    END
+
+    RETURN f'Operation: {@status}' WITH status = @status
+
+EXCEPTION
+    WHEN GenerationError THEN
+        RETURN 'synthesis_failed' WITH status = 'error', reason = 'generation_error'
+END

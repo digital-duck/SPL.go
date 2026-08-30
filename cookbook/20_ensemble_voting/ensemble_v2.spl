@@ -1,0 +1,224 @@
+-- Recipe Name: Ensemble Voting — Multi-Model Edition
+-- Extends Recipe 20 with three key improvements inspired by Recipe 21 (Multi-Model Pipeline):
+--
+--   1. MODELS AS INPUT LIST    — pool of models to draw from (llama, qwen, gemma3, mistral, deepseek, ...)
+--   2. TWO SELECTION MODES     — random (default) or positional, controlled by @random_selection BOOL
+--        random=TRUE  → each candidate gets a randomly drawn model (simulates real-world diversity)
+--        random=FALSE → models rotate in list order (reproducible, each model gets one turn)
+--   3. INDEPENDENT SCORER      — scorer is always a different model from the generator (no self-grading)
+--   4. DETERMINISTIC WINNER    — select_winner() is a CALL to Python argmax, not an LLM guess
+--   5. DEDICATED POLISH MODEL  — best model reserved for final polish pass
+--   6. FILE LOGGING AT EVERY STEP — full audit trail under @log_dir
+--
+-- Architecture:
+--
+--   @models pool (LIST)
+--        │
+--        ├─ CALL pick_model(@random_selection, @i)              ──► GENERATE answer_candidate()  USING MODEL @gen_model
+--        │                                                                   │
+--        └─ CALL pick_model(@random_selection, @i, exclude=@gen_model) ──► GENERATE score_candidate()  USING MODEL @score_model
+--                                                                    │
+--                                                          GENERATE find_consensus()  USING MODEL @scorer_model
+--                                                                    │
+--                                                          CALL select_winner()  ← deterministic argmax
+--                                                                    │
+--                                                          GENERATE polish()  USING MODEL @polish_model
+--
+-- Tools (tools.py):
+--   pick_model(models, exclude, random_selection, index)
+--       random_selection=true  → random pick excluding @exclude
+--       random_selection=false → positional pick by @index (mod pool size), skips @exclude
+--   select_winner(candidates, scores)    — argmax: deterministic, zero tokens
+--
+-- Usage:
+--   spl3 run cookbook/20_ensemble_voting/ensemble_v2.spl \
+--       --adapter ollama \
+--       --tools cookbook/20_ensemble_voting/tools.py \
+--       question="What causes inflation?"
+--
+--   spl3 run cookbook/20_ensemble_voting/ensemble_v2.spl \
+--       --adapter ollama \
+--       --tools cookbook/20_ensemble_voting/tools.py \
+--       question="Is Rust faster than C++?" \
+--       models="llama3.2,qwen2.5,gemma3,mistral" \
+--       polish_model="deepseek-r1" \
+--       n_candidates=7
+--
+--   # Positional mode — reproducible, each model gets one turn as generator
+--   spl3 run cookbook/20_ensemble_voting/ensemble_v2.spl \
+--       --adapter ollama \
+--       --tools cookbook/20_ensemble_voting/tools.py \
+--       question="What is the best database for time-series data?" \
+--       random_selection=false
+
+-- ─── Prompt Definitions ──────────────────────────────────────────────────────
+
+CREATE FUNCTION answer_candidate(question TEXT) RETURN TEXT
+AS $$
+
+You are an expert assistant. Answer the following question thoroughly and accurately.
+Be specific, well-structured, and avoid vague generalities.
+
+Question: {question}
+$$;
+
+CREATE FUNCTION score_candidate(answer TEXT, question TEXT) RETURN TEXT
+AS $$
+
+You are a strict evaluator. Score the following answer to the question on three dimensions:
+  - Accuracy (0–10): factual correctness
+  - Completeness (0–10): covers all key aspects
+  - Clarity (0–10): clear and well-structured
+
+Question: {question}
+
+Answer:
+{answer}
+
+Return ONLY a single decimal number between 0.0 and 10.0 — the average of the three scores.
+No explanation, no label, just the number.
+$$;
+
+CREATE FUNCTION find_consensus(candidates TEXT) RETURN TEXT
+AS $$
+
+You are a synthesis expert. Read the following {n} independent answers to the same question,
+separated by "---".
+
+{candidates}
+
+Identify:
+1. Points agreed on by most answers
+2. Points unique to only one answer (notable divergence)
+3. Any factual contradictions
+
+Output a concise consensus summary (bullet points).
+$$;
+
+CREATE FUNCTION polish(best_answer TEXT, consensus TEXT, question TEXT) RETURN TEXT
+AS $$
+
+You are a world-class editor. Refine the answer below, incorporating the consensus insights.
+The result should be authoritative, clear, and complete — the definitive answer to the question.
+
+Question: {question}
+
+Best candidate answer:
+{best_answer}
+
+Consensus insights from all candidates:
+{consensus}
+
+Write the polished final answer now.
+$$;
+
+-- ─── Workflow ─────────────────────────────────────────────────────────────────
+
+WORKFLOW ensemble_voting_v2
+    INPUT:
+        @question          TEXT,
+        @models            LIST    DEFAULT ['llama3.2', 'qwen2.5', 'gemma3', 'mistral', 'deepseek-r1'],
+        @n_candidates      INT     DEFAULT 5,
+        @random_selection  BOOL    DEFAULT TRUE,
+        @consensus_model   TEXT    DEFAULT 'qwen2.5',
+        @polish_model      TEXT    DEFAULT 'deepseek-r1',
+        @log_dir           TEXT    DEFAULT 'cookbook/20_ensemble_voting/logs-spl'
+    OUTPUT: @final_answer TEXT
+DO
+    LOGGING f'Ensemble v2 | question={@question} | n={@n_candidates} | random={@random_selection} | models={@models}' LEVEL INFO
+
+    -- ── Step 1: Generate N candidates ────────────────────────────────────────
+    -- random_selection=TRUE  → generator and scorer both randomly drawn each iteration
+    -- random_selection=FALSE → generator rotates positionally through @models list;
+    --                          scorer takes the next model in the list (no self-grading)
+
+    @i          := 0
+    @candidates := []
+    @scores     := []
+
+    WHILE @i < @n_candidates DO
+
+        -- Pick generator model — random or positional depending on @random_selection
+        CALL pick_model(@models, "", @random_selection, @i) INTO @gen_model
+        LOGGING f'[Candidate {@i}] generating with model={@gen_model}' LEVEL INFO
+
+        GENERATE answer_candidate(@question) USING MODEL @gen_model INTO @candidate
+        CALL clean_output(@candidate) INTO @candidate
+
+        CALL write_file(
+            f'{@log_dir}/candidate_{@i}.md',
+            f'# Candidate {@i} — model: {@gen_model}\n\n{@candidate}'
+        ) INTO NONE
+
+        -- Pick scorer model — always excludes the generator to avoid self-grading
+        CALL pick_model(@models, @gen_model, @random_selection, @i) INTO @score_model
+        LOGGING f'[Candidate {@i}] scoring  with model={@score_model}' LEVEL INFO
+
+        GENERATE score_candidate(@candidate, @question) USING MODEL @score_model INTO @score
+        CALL clean_output(@score) INTO @score
+
+        CALL write_file(
+            f'{@log_dir}/score_{@i}.md',
+            f'# Score for candidate {@i}\nGenerator: {@gen_model} | Scorer: {@score_model}\n\nScore: {@score}'
+        ) INTO NONE
+
+        LOGGING f'[Candidate {@i}] score={@score}' LEVEL DEBUG
+
+        @candidates := list_append(@candidates, @candidate)
+        @scores     := list_append(@scores, @score)
+        @i          := @i + 1
+
+    END
+
+    -- ── Step 2: Find consensus across all candidates ─────────────────────────
+    LOGGING 'Finding consensus across all candidates ...' LEVEL INFO
+
+    @candidates_text := list_concat(@candidates, '\n---\n')
+
+    GENERATE find_consensus(@candidates_text) USING MODEL @consensus_model INTO @consensus
+    CALL clean_output(@consensus) INTO @consensus
+
+    CALL write_file(f'{@log_dir}/consensus.md', @consensus) INTO NONE
+    LOGGING 'Consensus saved' LEVEL DEBUG
+
+    -- ── Step 3: Select winner — deterministic Python argmax, zero LLM tokens ─
+    -- Passes candidates separated by ||| so commas inside answers don't conflict.
+    LOGGING 'Selecting winner (deterministic) ...' LEVEL INFO
+
+    @candidates_joined := list_concat(@candidates, '|||')
+    @scores_joined     := list_concat(@scores, '|||')
+
+    CALL select_winner(@candidates_joined, @scores_joined) INTO @best_candidate
+
+    CALL write_file(f'{@log_dir}/winner.md', @best_candidate) INTO NONE
+    LOGGING 'Winner selected' LEVEL INFO
+
+    -- ── Step 4: Polish with the designated high-quality model ─────────────────
+    LOGGING f'Polishing with model={@polish_model} ...' LEVEL INFO
+
+    GENERATE polish(@best_candidate, @consensus, @question) USING MODEL @polish_model INTO @final_answer
+    CALL clean_output(@final_answer) INTO @final_answer
+
+    CALL write_file(f'{@log_dir}/final_answer.md', @final_answer) INTO NONE
+    LOGGING 'Final answer ready' LEVEL INFO
+
+    RETURN @final_answer WITH
+        status       = 'complete',
+        candidates        = @n_candidates,
+        random_selection  = @random_selection,
+        polish_model      = @polish_model,
+        consensus_model   = @consensus_model
+
+EXCEPTION
+    WHEN BudgetExceeded THEN
+        -- Deterministic fallback: pick best from whatever candidates were scored so far
+        LOGGING 'Budget exceeded — selecting best from partial candidates' LEVEL WARN
+        @candidates_joined := list_concat(@candidates, '|||')
+        @scores_joined     := list_concat(@scores, '|||')
+        CALL select_winner(@candidates_joined, @scores_joined) INTO @final_answer
+        CALL write_file(f'{@log_dir}/final_answer_partial.md', @final_answer) INTO NONE
+        RETURN @final_answer WITH status = 'partial', candidates = @i
+
+    WHEN HallucinationDetected THEN
+        RETRY WITH temperature = 0.1
+END

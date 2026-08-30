@@ -1,0 +1,27 @@
+-- summarize_paper.spl
+-- Sub-workflow: download one arXiv PDF, chunk it, summarize, reduce to abstract.
+
+IMPORT 'functions.spl'
+IMPORT 'tools'
+
+WORKFLOW summarize_paper
+    INPUT:  @pdf_url    TEXT,
+            @max_tokens INT DEFAULT 512
+    OUTPUT: @paper_summary TEXT
+DO
+    CALL download_arxiv_pdf(@pdf_url) INTO @pdf_path
+    CALL semantic_chunk_plan(@pdf_path) INTO @chunks
+
+    @summaries := []
+    @i := 0
+    CALL list_count(@chunks) INTO @n
+    WHILE @i < @n DO
+        CALL list_get(@chunks, @i + 1) INTO @chunk
+        GENERATE chunk_summarizer(@chunk) WITH OUTPUT BUDGET @max_tokens TOKENS INTO @summary
+        CALL list_append(@summaries, @summary) INTO @summaries
+        @i := @i + 1
+    END
+
+    GENERATE paper_reducer(@summaries) WITH OUTPUT BUDGET 200 TOKENS INTO @paper_summary
+    RETURN @paper_summary
+END

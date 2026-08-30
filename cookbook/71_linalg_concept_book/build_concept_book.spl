@@ -1,0 +1,187 @@
+-- Layer 4a: build_concept_book.spl
+-- End-to-end Linear Algebra concept-book generation.
+-- Logical view (DODA): the physical artifact is produced by
+--   splc --lang python/linalg build_concept_book.spl
+--
+-- The concept graph (37 nodes, 51 edges) is pre-loaded in the setup cell.
+-- SOLVE / ASSERT statements route to the Python kernel deterministically.
+-- GENERATE statements call the LLM via _llm_call() in the notebook.
+--
+-- Style: @style selects a profile from style_profiles.py.
+--   SOLVE @style_guide := style_instruction(@style)  resolves it once
+--   and injects the prose instruction into every GENERATE prompt.
+--   The symbolic checks (verify_math, shape_check, reducible) are style-agnostic.
+
+-- ── Prompt templates ────────────────────────────────────────────────────────
+
+CREATE FUNCTION write_section(concept TEXT, context TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert linear algebra author.
+
+{style_guide}
+
+Write a self-contained section for the concept: {concept}
+Surrounding context: {context}
+
+Follow the structure and length specified in the STYLE GUIDE above exactly.
+Use LaTeX for all mathematics.
+Output only the section text. No preamble, no metadata.
+$$;
+
+CREATE FUNCTION refine_section(section TEXT, feedback TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert linear algebra author. Revise the section below based on
+the feedback provided. Keep all correct content; fix only what is flagged.
+Maintain the style described below throughout the revision.
+
+{style_guide}
+
+SECTION:
+{section}
+
+FEEDBACK:
+{feedback}
+
+Output the revised section only. No preamble. No commentary.
+$$;
+
+CREATE FUNCTION write_payoff(target TEXT, applications TEXT, style_guide TEXT)
+RETURN TEXT
+AS $$
+You are an expert author writing the capstone of a linear algebra concept-book.
+
+{style_guide}
+
+The textbook culminates in the concept: {target}
+Applications this concept unlocks: {applications}
+
+Write a "Payoff" section that:
+1. Explains what {target} achieves and why it is the natural endpoint.
+2. Shows how it connects to each listed application domain.
+3. Ends with an invitation to explore one application in depth.
+
+Follow the length and structure in the STYLE GUIDE above.
+Use LaTeX for mathematics. Output only the section. No preamble.
+$$;
+
+-- ── Main workflow ────────────────────────────────────────────────────────────
+
+WORKFLOW build_concept_book
+    INPUT:
+        @target TEXT DEFAULT 'spectral_theorem',
+        @style TEXT DEFAULT 'textbook',
+        @primitive_budget INT DEFAULT 2,
+        @payoff_weight FLOAT DEFAULT 1.5
+    OUTPUT:
+        @textbook TEXT
+DO
+    -- 0. Timing instrumentation — wall-clock elapsed time per section and
+    --    total, logged so runs can be profiled and compared (e.g. across
+    --    distributed workers on Momagrid). _now()/_elapsed() are bare-name
+    --    wrappers around time.time() defined in the python/linalg setup
+    --    cell — the SOLVE-template parser doesn't yet support dotted
+    --    continuations like `time.time()`, so we route through these
+    --    instead, the same way verify_math/shape_check route to _verify_math/_shape_check.
+    SOLVE @t_workflow_start FLOAT := _now()
+
+    -- 1. Resolve style profile once (deterministic — no LLM involved)
+    SOLVE @style_guide TEXT := style_instruction(@style)
+
+    LOGGING f"Style: {@style}" LEVEL INFO
+
+    -- 2. Verify the concept graph is well-formed (deterministic checks)
+    ASSERT acyclic(@graph)
+
+    ASSERT reducible(@graph, @primitives)
+
+    -- 3. Scope to target concept and compute teaching order
+    SOLVE @needed SET := ancestors(@graph, @target)
+
+    SOLVE @order LIST := productivity_order(restrict(@graph, @needed), weight=@payoff_weight)
+
+    SOLVE @order_len INT := len(@order)
+
+    LOGGING f"Teaching {@order_len} concepts toward {@target}" LEVEL INFO
+
+    -- 4. Generate and verify one section per concept in dependency order
+    @textbook := ""
+    @_i := 0
+
+    WHILE @_i < @order_len DO
+        SOLVE @concept TEXT := @order[@_i]
+        SOLVE @t_section_start FLOAT := _now()
+
+        LOGGING f"Section {@_i}: {@concept}" LEVEL INFO
+
+        -- 4a. Content cache lookup — concept id is the cache key's identity.
+        --     Write-once, content-addressed (Layer 2): a hit costs zero LLM
+        --     calls and skips straight past generation AND verification,
+        --     because what's cached here was already verified before being
+        --     stored (see cache_put below — only post-ASSERT/verify_math/
+        --     shape_check content ever reaches the cache). Mirrors the
+        --     pattern proven in cookbook/70_linalg_core_concepts/.
+        CALL cache_get(@concept) INTO @section
+        EVALUATE @section
+            WHEN = "miss" THEN
+                LOGGING f"cache MISS for {@concept} — generating with the LLM" LEVEL INFO
+
+                -- 4b. Generate the section for this concept (style injected via style_guide)
+                GENERATE write_section(@concept, @concept, @style_guide) INTO @section
+
+                -- 4c. Primitive budget: no more than primitive_budget new radicals per section
+                ASSERT new_primitives(@section) <= @primitive_budget
+                    OTHERWISE GENERATE refine_section(@section, "introduce at most one new primitive per section", @style_guide) INTO @section
+
+                -- 4d. Symbolic math check (SymPy recompute of worked examples)
+                CALL verify_math(@section) INTO @check
+                EVALUATE @check
+                    WHEN contains("fail") THEN
+                        GENERATE refine_section(@section, @check, @style_guide) INTO @section
+                    ELSE
+                        LOGGING "Math verified" LEVEL INFO
+                END
+
+                -- 4e. Shape / dimensional-analysis check
+                CALL shape_check(@section) INTO @shapes
+                EVALUATE @shapes
+                    WHEN contains("fail") THEN
+                        GENERATE refine_section(@section, @shapes, @style_guide) INTO @section
+                    ELSE
+                        LOGGING "Shapes OK" LEVEL INFO
+                END
+
+                -- 4f. Store the now-verified section — write-once, immutable (CAS)
+                CALL cache_put(@concept, @section) INTO @cache_key
+                LOGGING f"Stored verified section — cache key {@cache_key}" LEVEL INFO
+            ELSE
+                LOGGING f"cache HIT for {@concept} — reusing verified section (0 LLM calls)" LEVEL INFO
+        END
+
+        SOLVE @section_elapsed FLOAT := _elapsed(@t_section_start)
+        LOGGING f"[timing] {@concept}: {@section_elapsed:.1f}s" LEVEL INFO
+
+        @textbook := @textbook + "\n\n---\n\n" + @section
+        @_i := @_i + 1
+    END
+
+    -- 5. Capstone: tie target to its payoff applications
+    SOLVE @apps LIST := applications_of(@graph, @target)
+
+    SOLVE @t_payoff_start FLOAT := _now()
+
+    GENERATE write_payoff(@target, @apps, @style_guide) INTO @capstone
+
+    SOLVE @payoff_elapsed FLOAT := _elapsed(@t_payoff_start)
+    LOGGING f"[timing] payoff: {@payoff_elapsed:.1f}s" LEVEL INFO
+
+    @textbook := @textbook + "\n\n---\n\n## Payoff\n\n" + @capstone
+
+    SOLVE @total_elapsed FLOAT := _elapsed(@t_workflow_start)
+    LOGGING f"[timing] workflow total: {@total_elapsed:.1f}s for {@order_len} sections + payoff" LEVEL INFO
+
+    LOGGING f"Textbook complete — style: {@style}" LEVEL INFO
+
+    COMMIT @textbook
+END

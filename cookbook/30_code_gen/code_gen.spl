@@ -1,0 +1,134 @@
+-- Recipe Name: Code Generator + Tests
+-- Generate a function, then generate its unit tests — in a single workflow.
+-- Demonstrates sequential generation where output of step N is input to step N+1.
+--
+-- @spec accepts either:
+--   • an inline text description, or
+--   • a filename under cookbook/30_code_gen/specs/ — loaded automatically via load_spec()
+--
+-- Usage:
+--   spl3 run cookbook/30_code_gen/code_gen.spl --adapter ollama --model gemma3 \
+--       spec="A function that validates an email address" language="Python"
+--
+--   spl3 run cookbook/30_code_gen/code_gen.spl --adapter ollama \
+--       spec="Binary search over a sorted list, return index or -1" language="Go" \
+--       test_framework="testing"
+--
+--   spl3 run cookbook/30_code_gen/code_gen.spl --adapter ollama --model gemma3 \
+--       spec="email_validator.txt" language="Python"
+
+CREATE TOOL_API load_spec(spec TEXT)
+RETURNS TEXT AS PYTHON $$
+import os
+
+def load_spec(spec: str) -> str:
+    """Load a spec from a filename under cookbook/30_code_gen/specs/ or return text as-is.
+
+    If *spec* looks like a bare filename (no spaces, no newlines), the corresponding
+    file under cookbook/30_code_gen/specs/ is loaded and its contents returned.
+    Otherwise the string is returned unchanged so callers can pass an inline spec.
+    """
+    candidate = spec.strip()
+    if candidate and '\n' not in candidate and ' ' not in candidate:
+        path = os.path.join('cookbook/30_code_gen/specs', candidate)
+        if os.path.isfile(path):
+            with open(path, encoding='utf-8') as fh:
+                contents = fh.read().strip()
+            return f'[loaded from {path}]\n\n{contents}'
+    return candidate
+$$;
+
+CREATE FUNCTION language_conventions(language TEXT)
+RETURN TEXT
+AS $$
+SELECT CASE language
+  WHEN 'Python' THEN 'PEP 8 style. Type hints required. Docstring in Google format. No bare except.'
+  WHEN 'Go'     THEN 'Standard Go conventions. Return (value, error). Table-driven tests. No panics in library code.'
+  WHEN 'TypeScript' THEN 'Strict mode. Explicit return types. JSDoc comments. No any type.'
+  WHEN 'Rust'   THEN 'Idiomatic Rust. Result<T, E> for fallible ops. No unwrap() in library code. Doc comments.'
+  ELSE               'Clean, idiomatic code. Clear naming. Minimal dependencies. Well-commented edge cases.'
+END
+$$;
+
+CREATE FUNCTION test_framework_guide(language TEXT, framework TEXT DEFAULT 'default')
+RETURN TEXT
+AS $$
+SELECT CASE language || ':' || framework
+  WHEN 'Python:pytest'   THEN 'pytest. Use fixtures. Parametrize for multiple inputs. Assert with descriptive messages.'
+  WHEN 'Python:unittest' THEN 'unittest.TestCase. setUp/tearDown. assertEqual, assertRaises. One assertion per test.'
+  WHEN 'Go:testing'      THEN 'testing package. Table-driven tests with t.Run. t.Errorf not t.Fatalf unless truly fatal.'
+  WHEN 'TypeScript:jest' THEN 'Jest. describe/it blocks. Mocks via jest.fn(). Async tests with async/await.'
+  ELSE                        'Standard test framework for ' || language || '. Cover: happy path, edge cases, error cases.'
+END
+$$;
+
+WORKFLOW code_gen_with_tests
+    INPUT:
+        @spec           TEXT,
+        @language       TEXT DEFAULT 'Python',
+        @test_framework TEXT DEFAULT 'default'
+    OUTPUT: @final_output TEXT
+DO
+    LOGGING f'Code gen start | language={@language} framework={@test_framework}' LEVEL INFO
+
+    -- Step 0: Resolve spec — accept file path or inline text
+    CALL load_spec(@spec) INTO @spec
+    LOGGING f'Spec resolved ({@spec})' LEVEL DEBUG
+
+    -- Step 1: Generate the implementation
+    LOGGING 'Generating implementation ...' LEVEL DEBUG
+    GENERATE implement_function(
+        @spec,
+        @language,
+        language_conventions(@language)
+    ) INTO @implementation
+    LOGGING f'Implementation generated ({@language})' LEVEL DEBUG
+
+    -- Step 2: Self-review the implementation
+    LOGGING 'Reviewing implementation ...' LEVEL DEBUG
+    GENERATE review_implementation(@implementation, @spec, @language)
+        INTO @review_notes
+    LOGGING f'Review notes: {@review_notes}' LEVEL DEBUG
+
+    -- Step 3: Refine if issues found
+    EVALUATE @review_notes
+        WHEN contains('issue') OR contains('error') OR contains('problem') THEN
+            LOGGING 'Issues found — fixing implementation' LEVEL WARN
+            GENERATE fix_implementation(@implementation, @review_notes, @language)
+                INTO @implementation
+            LOGGING 'Fixed implementation generated' LEVEL DEBUG
+        ELSE
+            LOGGING 'Implementation looks good — skipping fix step' LEVEL DEBUG
+    END
+
+    -- Step 4: Generate unit tests targeting the implementation
+    LOGGING 'Generating unit tests ...' LEVEL DEBUG
+    GENERATE generate_tests(
+        @implementation,
+        @spec,
+        @language,
+        test_framework_guide(@language, @test_framework)
+    ) INTO @tests
+    LOGGING 'Unit tests generated' LEVEL DEBUG
+
+    -- Step 5: Verify tests compile/parse (static check)
+    LOGGING 'Verifying test syntax ...' LEVEL DEBUG
+    GENERATE verify_test_syntax(@tests, @language)
+        INTO @syntax_ok
+    LOGGING f'Syntax check result: {@syntax_ok}' LEVEL DEBUG
+
+    -- Step 6: Assemble final output
+    LOGGING 'Assembling final output ...' LEVEL DEBUG
+    GENERATE assemble_output(@implementation, @tests, @language) INTO @final_output
+
+    LOGGING f'Code gen complete | language={@language} framework={@test_framework}' LEVEL INFO
+    RETURN @final_output WITH
+        status = 'complete',
+        language = @language,
+        test_framework = @test_framework
+
+EXCEPTION
+    WHEN GenerationError THEN
+        LOGGING f'GenerationError caught — returning partial result' LEVEL WARN
+        RETURN @implementation WITH status = 'implementation_only', reason = 'test_generation_failed'
+END

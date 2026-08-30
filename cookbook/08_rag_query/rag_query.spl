@@ -1,0 +1,23 @@
+-- Recipe Name: RAG Query
+-- Retrieval-augmented generation over indexed documents.
+--
+-- Setup:
+--   pip install "dd-vectordb[faiss]" "dd-embed[sentence-transformers]"
+--   spl doc-rag add cookbook/08_rag_query/data/who-is-wen.md
+--
+-- Usage:
+--   spl3 run cookbook/08_rag_query/rag_query.spl --adapter ollama question="Where did Wen grow up?"
+
+CREATE FUNCTION answer(question TEXT)
+RETURNS TEXT
+AS $$
+You are a knowledgeable assistant. Use the provided context to answer the question accurately.
+Question: {question}
+$$;
+
+PROMPT rag_answer
+SELECT
+    system_role('You are a knowledgeable assistant. Use the provided context to answer accurately.'),
+    rag.query(context.question, top_k=3) AS background,
+    context.question AS question
+GENERATE answer(question)

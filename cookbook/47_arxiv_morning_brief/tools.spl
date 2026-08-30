@@ -1,0 +1,207 @@
+-- tools.spl — TOOL_API definitions for Recipe 47: arXiv Morning Brief
+-- Imported by arxiv_morning_brief.spl and summarize_paper.spl via IMPORT 'tools'
+--
+-- Stdlib tools used by this recipe (no TOOL_API needed):
+--   spl_list_get_item, list_append
+--
+-- list_count is NOT stdlib — defined here.
+
+CREATE TOOL_API download_arxiv_pdf(url TEXT)
+RETURNS TEXT AS PYTHON $$
+def download_arxiv_pdf(url: str) -> str:
+    import json
+    import logging
+    import time
+    from pathlib import Path
+
+    _log = logging.getLogger("arxiv_morning_brief.tools")
+
+    CACHE_DIR = Path.home() / ".cache" / "dd_arxiv_morning_brief"
+    PDF_DIR   = CACHE_DIR / "pdfs"
+    PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+    RATE_LIMIT_SECS = 3.0
+    PDF_TTL_SECS    = 86_400  # 24 hours
+
+    _rate_file = CACHE_DIR / ".last_download"
+
+    def _get_last_download():
+        try:
+            return float(_rate_file.read_text())
+        except Exception:
+            return 0.0
+
+    def _set_last_download(t):
+        try:
+            _rate_file.write_text(str(t))
+        except Exception:
+            pass
+
+    _cache_index_path = CACHE_DIR / "url_cache.json"
+
+    def _cache_get(u):
+        try:
+            idx = json.loads(_cache_index_path.read_text())
+            entry = idx.get(u)
+            if entry:
+                ts, path = entry["ts"], entry["path"]
+                if time.time() - ts < PDF_TTL_SECS and Path(path).exists():
+                    return path
+        except Exception:
+            pass
+        return None
+
+    def _cache_set(u, path):
+        try:
+            try:
+                idx = json.loads(_cache_index_path.read_text())
+            except Exception:
+                idx = {}
+            idx[u] = {"ts": time.time(), "path": path}
+            _cache_index_path.write_text(json.dumps(idx))
+        except Exception:
+            pass
+
+    cached_path = _cache_get(url)
+    if cached_path:
+        _log.debug("Cache hit %s -> %s", url, cached_path)
+        return cached_path
+
+    # Rate limit
+    elapsed = time.time() - _get_last_download()
+    if elapsed < RATE_LIMIT_SECS:
+        wait = RATE_LIMIT_SECS - elapsed
+        _log.debug("Rate limiting: sleeping %.1fs", wait)
+        time.sleep(wait)
+
+    import httpx
+    try:
+        resp = httpx.get(url, timeout=30.0, follow_redirects=True)
+    except Exception as e:
+        raise RuntimeError(f"Network error downloading {url}: {e}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} downloading {url}")
+
+    safe_name = url.rstrip("/").split("/")[-1]
+    if not safe_name.endswith(".pdf"):
+        safe_name += ".pdf"
+    pdf_path = str(PDF_DIR / safe_name)
+    Path(pdf_path).write_bytes(resp.content)
+
+    _set_last_download(time.time())
+    _cache_set(url, pdf_path)
+    _log.info("Downloaded %s -> %s", url, pdf_path)
+    return pdf_path
+$$;
+
+CREATE TOOL_API semantic_chunk_plan(pdf_path TEXT)
+RETURNS TEXT AS PYTHON $$
+def semantic_chunk_plan(pdf_path: str) -> str:
+    import json
+    import re
+    from pathlib import Path
+
+    path = Path(pdf_path)
+    if not path.exists():
+        raise RuntimeError(f"PDF not found: {pdf_path}")
+
+    try:
+        from dd_extract.pdf import PDFExtractor
+        extractor = PDFExtractor(engine="pypdf", max_chars=40_000)
+        text = extractor.from_file(pdf_path)
+    except Exception as e:
+        raise RuntimeError(f"dd-extract failed on {pdf_path}: {e}") from e
+
+    if not text.strip():
+        raise RuntimeError(f"No text extracted from {pdf_path}")
+
+    header_re = re.compile(
+        r'^(?:\d+\.?\s+[A-Z][A-Za-z\s]{2,60}|[A-Z][A-Z\s]{4,60})$',
+        re.MULTILINE,
+    )
+    matches = list(header_re.finditer(text))
+
+    chunks = []
+
+    if len(matches) >= 2:
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            chunk_text = text[m.start():end].strip()
+            if chunk_text:
+                chunks.append({
+                    "title": m.group().strip(),
+                    "text":  chunk_text,
+                    "page":  i + 1,
+                })
+    else:
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+        group_size = 3
+        for idx in range(0, len(paragraphs), group_size):
+            group = paragraphs[idx: idx + group_size]
+            chunks.append({
+                "title": f"Section {idx // group_size + 1}",
+                "text":  "\n\n".join(group),
+                "page":  idx // group_size + 1,
+            })
+
+    if not chunks:
+        chunks = [{"title": "Document", "text": text.strip(), "page": 1}]
+
+    return json.dumps(chunks)
+$$;
+
+CREATE TOOL_API list_count(json_list TEXT)
+RETURNS TEXT AS PYTHON $$
+def list_count(json_list: str) -> str:
+    import json
+
+    try:
+        return str(len(json.loads(json_list)))
+    except (json.JSONDecodeError, TypeError):
+        return "0"
+$$;
+
+CREATE TOOL_API parse_urls(raw TEXT)
+RETURNS TEXT AS PYTHON $$
+def parse_urls(raw: str) -> str:
+    import json
+    import re
+    from pathlib import Path
+
+    raw = raw.strip()
+
+    # 1. Already a JSON array
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            urls = [u.strip() for u in parsed if str(u).strip()]
+            return json.dumps(urls)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2. File path — relative to CWD, must not look like a URL
+    if not raw.startswith("http") and not raw.startswith("["):
+        candidate = Path.cwd() / raw
+        if candidate.is_file():
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+            urls = [
+                ln.strip() for ln in lines
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            return json.dumps(urls)
+
+    # 3. Comma or whitespace delimited string
+    urls = [u.strip() for u in re.split(r"[,\s]+", raw) if u.strip()]
+    return json.dumps(urls)
+$$;
+
+CREATE TOOL_API build_brief_date_header(date TEXT)
+RETURNS TEXT AS PYTHON $$
+def build_brief_date_header(date: str) -> str:
+    import datetime
+
+    if not date or not date.strip():
+        date = datetime.date.today().isoformat()
+    return f"# arXiv Morning Brief — {date.strip()}\n\n"
+$$;

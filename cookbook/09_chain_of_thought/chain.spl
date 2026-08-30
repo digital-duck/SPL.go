@@ -1,0 +1,44 @@
+-- Recipe Name: Chain of Thought
+-- Multi-step reasoning: Research → Analyze → Summarize
+-- Each GENERATE feeds into the next via workflow variables.
+--
+-- Usage:
+--   spl3 run cookbook/09_chain_of_thought/chain.spl --adapter ollama --model gemma3 topic="distributed AI inference"
+
+CREATE FUNCTION research(topic TEXT)
+RETURNS TEXT
+AS $$
+Research and provide key facts about {topic}.
+$$;
+
+CREATE FUNCTION analyze(research TEXT)
+RETURNS TEXT
+AS $$
+Analyze the following research findings for key trends and implications.
+Research: {research}
+$$;
+
+-- Note: summarize() is a built-in SPL function, but using it in GENERATE 
+-- without a template will use LLM fallback. We'll define a custom one.
+CREATE FUNCTION summarize_analysis(analysis TEXT)
+RETURNS TEXT
+AS $$
+Summarize the following analysis into a concise executive brief.
+Analysis: {analysis}
+$$;
+
+WORKFLOW chain_of_thought
+    INPUT: @topic TEXT DEFAULT 'distributed AI inference'
+    OUTPUT: @summary TEXT
+DO
+    -- Step 1: Research
+    GENERATE research(@topic) INTO @research
+
+    -- Step 2: Analyze
+    GENERATE analyze(@research) INTO @analysis
+
+    -- Step 3: Summarize
+    GENERATE summarize_analysis(@analysis) INTO @summary
+
+    RETURN @summary WITH status = 'complete'
+END

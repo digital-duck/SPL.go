@@ -1,0 +1,60 @@
+-- Recipe Name: Safe Generation with Exception Handling
+-- Demonstrates LLM-specific error handling patterns
+
+CREATE FUNCTION response(prompt TEXT)
+RETURNS TEXT
+AS $$
+You are a helpful assistant. Respond to the following prompt.
+Prompt: {prompt}
+$$;
+
+CREATE FUNCTION quality_assess(result TEXT)
+RETURNS TEXT
+AS $$
+Analyze the following result for quality.
+Reply with one of: 'high_quality', 'acceptable', or 'low_quality'.
+Result: {result}
+$$;
+
+CREATE FUNCTION improved(result TEXT, prompt TEXT)
+RETURNS TEXT
+AS $$
+Improve the following result based on the original prompt.
+Original Prompt: {prompt}
+Current Result: {result}
+$$;
+
+WORKFLOW safe_generation
+  INPUT: @prompt TEXT DEFAULT 'Explain how encryption works'
+  OUTPUT: @result TEXT
+  SECURITY: CLASSIFICATION: internal
+DO
+  GENERATE response(@prompt) INTO @result
+
+  -- Quality check via semantic evaluation (LLM-as-judge)
+  GENERATE quality_assess(@result) INTO @quality
+
+  EVALUATE @quality
+    WHEN 'high_quality' THEN
+      RETURN @result WITH status = 'high_quality'
+    WHEN 'acceptable' THEN
+      GENERATE improved(@result, @prompt) INTO @result
+      RETURN @result WITH status = 'refined'
+    ELSE
+      RETURN @result WITH status = 'best_effort'
+  END
+
+EXCEPTION
+  WHEN HallucinationDetected THEN
+    GENERATE response(@prompt) INTO @result
+    RETURN @result WITH status = 'conservative'
+
+  WHEN ContextLengthExceeded THEN
+    RETRY WITH temperature = 0.1 LIMIT 3
+
+  WHEN RefusalToAnswer THEN
+    RETURN @prompt WITH status = 'refused'
+
+  WHEN BudgetExceeded THEN
+    RETURN @result WITH status = 'truncated'
+END

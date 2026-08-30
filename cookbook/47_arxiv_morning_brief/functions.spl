@@ -1,0 +1,34 @@
+-- functions.spl
+-- LLM function definitions for the arXiv Morning Brief recipe.
+-- Imported by summarize_paper.spl via IMPORT 'functions.spl'.
+
+CREATE FUNCTION chunk_summarizer(chunk TEXT, max_tokens INT)
+RETURNS TEXT
+AS $$
+You are a technical summarizer. Produce a concise summary of the following research paper section in plain English. Focus on methods and findings. Aim for {max_tokens} words or fewer.
+
+Section:
+{chunk}
+$$;
+
+CREATE FUNCTION paper_reducer(summaries TEXT)
+RETURNS TEXT
+AS $$
+You are a research editor. Given the following list of section summaries from a single paper, write a concise abstract of about 150 words that captures the core contribution, method, and key results.
+
+Section summaries:
+{summaries}
+$$;
+
+CREATE FUNCTION brief_writer(header TEXT, summaries TEXT, word_count INT)
+RETURNS TEXT
+AS $$
+You are a technical newsletter editor. Format the following paper abstracts into a clean Markdown morning brief. Each paper gets a ### heading and a 2-3 sentence summary. End with a "## Key Themes" section listing 2-4 recurring themes across the papers.
+
+{header}
+
+Paper abstracts:
+{summaries}
+
+Target length: approximately {word_count} words.
+$$;

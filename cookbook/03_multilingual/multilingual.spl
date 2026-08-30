@@ -1,0 +1,20 @@
+-- Recipe Name: Multilingual Greeting
+-- Greet in any language — demonstrates parametric context with lang.
+--
+-- Usage:
+--   spl3 run cookbook/03_multilingual/multilingual.spl --adapter ollama user_input="hello wen" lang="Chinese"
+
+CREATE FUNCTION greeting(input TEXT := 'hello', lang List := ['Chinese', 'English'])
+RETURNS TEXT
+AS $$
+You are a friendly assistant. 
+The user said: "{input}"
+Please translate the message in multiple languages: {lang}.
+$$;
+
+PROMPT multilingual_greeting
+SELECT
+    system_role('You are a friendly assistant.'),
+    context.user_input AS input,
+    context.lang AS lang
+GENERATE greeting(input, lang)

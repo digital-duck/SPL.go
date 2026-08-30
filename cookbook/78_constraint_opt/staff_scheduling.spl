@@ -1,0 +1,259 @@
+-- ============================================================
+-- Recipe 78c: Staff Scheduling — Shift Assignment (ILP)
+--
+-- Domain: HR / operations — assign staff to shifts to meet
+-- minimum coverage requirements at minimum wage cost.
+--
+-- PuLP problem type: Integer Linear Program (ILP)
+--   en.wikipedia.org/wiki/Nurse_scheduling_problem
+--
+--   Decision variables : x[n][s] ∈ {0,1} — nurse n works shift s
+--   Objective          : minimize Σ wage[s] · Σ_n x[n][s]
+--   Constraints        :
+--     coverage — Σ_n x[n][s] ≥ min_nurses[s]  for each shift s
+--     workload — Σ_s x[n][s] ≤ 1              for each nurse n (1 shift/day)
+--     x[n][s] ∈ {0, 1}  (binary — each nurse either works a shift or not)
+--
+-- Default problem (hand-verifiable):
+--   4 nurses available (N1–N4), 3 shifts today (Morning, Afternoon, Night)
+--   Minimum coverage: Morning ≥ 2, Afternoon ≥ 2, Night ≥ 1
+--   Wage per nurse: Morning $200, Afternoon $180, Night $320
+--   Each nurse works at most 1 shift today.
+--
+--   Known optimal: $1,080
+--     Assign 2 nurses to Morning  (2 × $200 = $400)
+--     Assign 2 nurses to Afternoon (2 × $180 = $360)
+--     Assign 1 nurse  to Night    (1 × $320 = $320)
+--     But we only have 4 nurses and need 2+2+1=5 coverage → we must
+--     relax: with 4 nurses the cheapest coverage that meets minimums is
+--     2 Morning + 2 Afternoon + 0 Night — but Night needs ≥ 1, so
+--     we need exactly 5 nurse-shifts from 4 nurses with the 1-shift constraint.
+--     With 4 nurses and max 1 shift each, we can cover exactly 4 shifts.
+--     Night requires 1; cheapest remaining 3 go to Afternoon (2) + Morning (1).
+--     But Morning also needs 2 — constraint forces at least 5 nurse-slots.
+--     → Problem needs 5 nurses or the 1-shift constraint must be relaxed.
+--
+--   Revised (5 nurses, all constraints satisfiable):
+--   5 nurses (N1–N5), each works at most 1 shift.
+--   Coverage: Morning ≥ 2, Afternoon ≥ 2, Night ≥ 1 (total 5 min slots)
+--   Assign: N1,N2 → Morning; N3,N4 → Afternoon; N5 → Night
+--   Cost = 2×200 + 2×180 + 1×320 = 400 + 360 + 320 = $1,080
+--
+-- SPL value demonstrated:
+--   ILP — binary variables, integrality constraints. The LLM writes
+--   the ILP formulation including cat='Binary' variables. ASSERT guards
+--   against Infeasible or suboptimal partial solutions.
+--
+-- Run:
+--   spl-go run cookbook/78_constraint_opt/staff_scheduling.spl \
+--       --adapter claude_cli
+--   spl-go run cookbook/78_constraint_opt/staff_scheduling.spl \
+--       --adapter ollama --model gemma3 \
+--       --param problem="A restaurant needs ..."
+-- ============================================================
+
+-- ── Deterministic regime: PuLP ILP solver ────────────────────
+
+CREATE TOOL_API run_pulp(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_pulp(code: str) -> str:
+    import json, re, pulp
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"pulp": pulp}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API is_optimal(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def is_optimal(result_json: str) -> bool:
+    import json
+    try:
+        return json.loads(result_json).get("status") == "Optimal"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API format_schedule(problem TEXT, lp_code TEXT,
+                                solution_json TEXT, narrative TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_schedule(problem: str, lp_code: str,
+                    solution_json: str, narrative: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    status    = sol.get("status", "Unknown")
+    objective = sol.get("objective")
+    variables = sol.get("variables", {})
+
+    lines = [
+        "# Staff Scheduling Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Solver status:** `{status}`",
+    ]
+    if objective is not None:
+        lines.append(f"**Minimum total wage cost:** ${objective:.2f}")
+    if variables:
+        lines.append("")
+        lines.append("**Schedule (assigned shifts):**")
+        for var_name, val in variables.items():
+            v = float(val) if not isinstance(val, (int, float)) else val
+            if v > 0.5:   # binary variable = 1
+                lines.append(f"  - {var_name}: assigned")
+    lines += ["", "## Interpretation", "", narrative.strip()]
+    lines += ["", "## Solver Code (LLM-generated, PuLP)", "", "```python", lp_code.strip(), "```"]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_scheduling_ilp(problem TEXT)
+RETURNS TEXT AS $$
+You are an operations research expert specializing in workforce scheduling.
+Convert this staff scheduling problem to runnable PuLP Integer Linear Program (ILP) code.
+
+Rules:
+- The `pulp` module is already in scope — do NOT add import statements
+- Model this as a binary ILP:
+    * Create a pulp.LpProblem with sense=pulp.LpMinimize
+    * Decision variables: x[nurse][shift] = binary (1 if nurse works shift, 0 otherwise)
+      Use pulp.LpVariable(f"x_{nurse}_{shift}", cat='Binary')
+    * Objective: minimize total wage cost = Σ wage[shift] · Σ_nurse x[nurse][shift]
+    * Coverage constraints: for each shift s, sum of x[n][s] over all nurses >= min_nurses[s]
+    * Workload constraints: for each nurse n, sum of x[n][s] over all shifts <= max_shifts_per_nurse
+    * Call: prob.solve(pulp.PULP_CBC_CMD(msg=0))
+- After solving, store the result EXACTLY as:
+    _result = {
+        "status": pulp.LpStatus[prob.status],
+        "objective": pulp.value(prob.objective),
+        "variables": {v.name: pulp.value(v) for v in prob.variables()}
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem:
+{problem}
+$$;
+
+CREATE FUNCTION repair_scheduling_ilp(problem TEXT, lp_code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This PuLP staff scheduling ILP code produced an error or non-Optimal result.
+
+Problem:
+{problem}
+
+Previous code:
+{lp_code}
+
+Error / solver status:
+{error_info}
+
+Fix the code. Common causes for scheduling ILPs:
+- Forgot cat='Binary' on decision variables (treats them as continuous)
+- Coverage constraint uses wrong direction (must be >=, not <=)
+- Infeasible: total nurse capacity < total minimum coverage required
+  → Check if sum of (max_shifts_per_nurse * num_nurses) >= sum of min_coverage
+- Variable name typos in constraints
+- Missing _result assignment
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_schedule(problem TEXT, solution_json TEXT, lang TEXT)
+RETURNS TEXT AS $$
+You are an HR operations analyst. Interpret this staff scheduling result for
+a shift manager.
+
+Problem:
+{problem}
+
+Optimal schedule (JSON — variables with value 1.0 are assigned):
+{solution_json}
+
+Write a concise summary (under 150 words):
+1. What is the total minimum wage cost for this shift plan?
+2. Which nurses are assigned to which shifts?
+3. Are minimum coverage requirements exactly met, or does any shift have extra staff?
+4. One practical suggestion for the manager (e.g., cross-training, standby roster).
+
+Write in {lang}. No JSON, no code.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW staff_scheduling
+  INPUT @problem TEXT := "A clinic needs to staff one day with 3 shifts: Morning, Afternoon, and Night. Minimum nurse coverage required: Morning needs at least 2 nurses, Afternoon needs at least 2 nurses, Night needs at least 1 nurse. Five nurses are available (Nurse1 through Nurse5). Each nurse can work at most 1 shift today. Wage per nurse-shift: Morning costs $200, Afternoon costs $180, Night costs $320. Assign nurses to shifts to meet all minimum coverage requirements at minimum total wage cost."
+  INPUT @max_tries INTEGER := 3
+  INPUT @lang TEXT := "English"
+  INPUT @out_dir TEXT := "./cookbook/78_constraint_opt/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  LOGGING f"[staff_scheduling] start  ts={@ts_safe}  max_tries={@max_tries}" LEVEL INFO
+
+  -- Stage 1: LLM formulates ILP; PuLP solves; repair on failure
+  @tries   := 0;
+  @status  := "init";
+  @lp_code := "";
+  @solution := "{}";
+
+  WHILE @tries < @max_tries DO
+    EVALUATE @status
+      WHEN = "Optimal" THEN
+        @tries := @max_tries;
+
+      WHEN = "init" THEN
+        LOGGING "[staff_scheduling] attempt 1 — LLM formulating scheduling ILP" LEVEL INFO
+        GENERATE formulate_scheduling_ilp(@problem) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[staff_scheduling] attempt {@tries}: status={@status}" LEVEL INFO
+
+      ELSE
+        CALL result_error(@solution) INTO @error_info;
+        LOGGING f"[staff_scheduling] repair {@tries} — error: {@error_info}" LEVEL INFO
+        GENERATE repair_scheduling_ilp(@problem, @lp_code, @error_info) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[staff_scheduling] repair {@tries}: status={@status}" LEVEL INFO
+    END;
+  END;
+
+  -- Stage 2: deterministic gate — Infeasible or Error cannot proceed
+  LOGGING f"[staff_scheduling] ASSERT gate (status={@status})" LEVEL INFO
+  ASSERT is_optimal(@solution);
+  LOGGING "[staff_scheduling] ASSERT passed — schedule confirmed Optimal" LEVEL INFO
+
+  -- Stage 3: LLM explains the schedule in plain language
+  GENERATE interpret_schedule(@problem, @solution, @lang) INTO @narrative;
+
+  CALL format_schedule(@problem, @lp_code, @solution, @narrative) INTO @report;
+
+  CALL write_file(f"{@out_dir}/staff_scheduling_{@ts_safe}.md", @report) INTO @out_path;
+  CALL time_elapsed(@t_start) INTO @elapsed;
+  LOGGING f"[staff_scheduling] done — report → {@out_path}  ({@elapsed}s)" LEVEL INFO
+
+  RETURN @report WITH status = "complete";
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Scheduler could not find Optimal assignment after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/staff_scheduling_{@ts_safe}.md", @report) INTO @out_path;
+    CALL time_elapsed(@t_start) INTO @elapsed;
+    LOGGING f"[staff_scheduling] infeasible — {@out_path}  ({@elapsed}s)" LEVEL INFO
+    RETURN @report WITH status = "infeasible";
+END;

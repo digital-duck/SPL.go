@@ -1,0 +1,244 @@
+-- ============================================================
+-- Recipe 78: Constraint Optimization — LLM formulates, solver proves
+--
+-- Demonstrates SPL's unique deterministic-probabilistic boundary:
+--
+--   Probabilistic (LLM)  — read a natural-language problem and write
+--                          runnable PuLP constraint code
+--   Deterministic (PuLP) — CBC solver finds the OPTIMAL solution and
+--                          produces a proof of optimality; no LLM
+--                          arithmetic, no hallucinated values
+--   Deterministic (ASSERT) — formal gate: execution only continues
+--                          when the solver confirms Optimal status
+--   Probabilistic (LLM)  — interpret the solution for the user
+--
+-- This pattern is inexpressible in LangChain/AutoGen/PDL without
+-- significant glue code: there is no ASSERT-on-solver-output concept,
+-- no typed verifier gate, and no deterministic-to-probabilistic handoff
+-- at the language level.
+--
+-- Requires: pip install pulp
+-- Run:
+--   spl3 run cookbook/78_constraint_opt/constraint_opt.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/78_constraint_opt/constraint_opt.spl \
+--       --llm ollama:gemma3 \
+--       --param problem="A factory produces chairs and tables ..."
+-- ============================================================
+
+-- ── Deterministic regime: PuLP solver tools ──────────────────
+
+CREATE TOOL_API run_pulp(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_pulp(code: str) -> str:
+    """Execute LLM-generated PuLP code and return a JSON result dict.
+
+    The LLM writes the code; this function is the deterministic oracle.
+    Returns {"status": ..., "objective": ..., "variables": {...}}
+    On any error returns {"status": "Error", "error": "<msg>"}.
+    """
+    import json
+    import re
+    import pulp
+    # Strip markdown fences the LLM occasionally emits despite instructions
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"pulp": pulp}
+    try:
+        exec(code, namespace)
+        result = namespace.get("_result")
+        if result is None:
+            return json.dumps({"status": "Error",
+                               "error": "code did not set _result"})
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API is_optimal(result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def is_optimal(result_json: str) -> bool:
+    """ASSERT gate: True only when PuLP reports Optimal status."""
+    import json
+    try:
+        return json.loads(result_json).get("status") == "Optimal"
+    except Exception:
+        return False
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, lp_code TEXT,
+                              solution_json TEXT, narrative TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, lp_code: str,
+                  solution_json: str, narrative: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    status    = sol.get("status", "Unknown")
+    objective = sol.get("objective")
+    variables = sol.get("variables", {})
+
+    lines = [
+        "# Constraint Optimization Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Solver status:** `{status}`",
+    ]
+    if objective is not None:
+        lines.append(f"**Optimal objective value:** {objective:.4g}")
+    if variables:
+        lines.append("")
+        lines.append("**Decision variables:**")
+        for name, val in variables.items():
+            lines.append(f"  - {name} = {val:.4g}" if isinstance(val, float) else f"  - {name} = {val}")
+    lines += ["", "## Interpretation", "", narrative.strip()]
+    lines += ["", "## Solver Code (LLM-generated, PuLP)", "", "```python", lp_code.strip(), "```"]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_lp(problem TEXT)
+RETURNS TEXT AS $$
+You are an operations research expert. Convert this optimization problem
+to runnable PuLP Python code.
+
+Rules:
+- The `pulp` module is already in scope — do NOT add import statements
+- Create a pulp.LpProblem, define decision variables, set the objective,
+  add all constraints, then call: prob.solve(pulp.PULP_CBC_CMD(msg=0))
+- After solving, store the result EXACTLY as:
+    _result = {
+        "status": pulp.LpStatus[prob.status],
+        "objective": pulp.value(prob.objective),
+        "variables": {v.name: pulp.value(v) for v in prob.variables()}
+    }
+- All quantity variables must have lb=0 (non-negative by default in PuLP)
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_lp(problem TEXT, lp_code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This PuLP optimization code produced an error or infeasible result.
+
+Problem: {problem}
+
+Previous code:
+{lp_code}
+
+Error / solver status:
+{error_info}
+
+Fix the code. Common causes:
+- Missing lb=0 for non-negative variables
+- Wrong constraint direction (>= vs <=)
+- Typo in variable names used in constraints
+- Missing or duplicate _result assignment
+- Incorrect sense for LpProblem (LpMaximize vs LpMinimize)
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_solution(problem TEXT, solution_json TEXT, lang TEXT)
+RETURNS TEXT AS $$
+You are an operations research expert. Interpret this optimization result
+for a business user.
+
+Problem: {problem}
+
+Optimal solution (JSON):
+{solution_json}
+
+Provide a concise interpretation (under 120 words):
+1. What is the optimal decision? (which variable takes what value)
+2. What is the optimal objective value?
+3. Are any constraints binding (at their exact limit)?
+4. One-sentence recommendation.
+
+Write in {lang}. No JSON, no code.
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW constraint_opt
+  -- Default: a two-product production planning problem with a known
+  -- closed-form optimum (x=3 bread, y=3 croissants, profit=$60)
+  -- that a human can verify by hand but which requires LP to prove optimal.
+  INPUT @problem TEXT := "A bakery produces artisan bread and croissants. Each loaf of bread requires 3 hours of labor and 2 kg of flour, earning $12 profit. Each batch of croissants requires 1 hour of labor and 3 kg of flour, earning $8 profit. The bakery has 12 hours of labor and 15 kg of flour available each day. Both products must have non-negative quantities. Maximize daily profit."
+  INPUT @max_tries INTEGER := 3
+  INPUT @lang TEXT := "English"
+  INPUT @out_dir TEXT := "./cookbook/78_constraint_opt/output"
+  OUTPUT @report TEXT
+DO
+  -- 0. Timing + run-id
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  LOGGING f"[constraint_opt] start  run_id={@ts_safe}  max_tries={@max_tries}" LEVEL INFO
+
+  -- ── Stage 1: LLM formulates LP; PuLP solves; repair loop on failure ──
+  LOGGING "[constraint_opt] Stage 1 — LLM formulation + solver" LEVEL INFO
+  @tries     := 0;
+  @status    := "init";
+  @lp_code   := "";
+  @solution  := "{}";
+
+  WHILE @tries < @max_tries DO
+    EVALUATE @status
+      WHEN = "Optimal" THEN
+        @tries := @max_tries;               -- solved: exit the loop
+
+      WHEN = "init" THEN
+        -- First attempt: LLM formulates from scratch
+        LOGGING "[constraint_opt] attempt 1 — LLM formulating LP code" LEVEL INFO
+        GENERATE formulate_lp(@problem) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[constraint_opt] attempt {@tries}: status={@status}" LEVEL INFO
+
+      ELSE
+        -- Subsequent attempts: LLM repairs with error/status feedback
+        CALL result_error(@solution) INTO @error_info;
+        LOGGING f"[constraint_opt] repair {@tries} — feeding error to LLM: {@error_info}" LEVEL INFO
+        GENERATE repair_lp(@problem, @lp_code, @error_info) INTO @lp_code;
+        CALL run_pulp(@lp_code) INTO @solution;
+        CALL result_status(@solution) INTO @status;
+        @tries := @tries + 1;
+        LOGGING f"[constraint_opt] repair {@tries}: status={@status}" LEVEL INFO
+    END;
+  END;
+
+  -- ── Stage 2: deterministic correctness gate ───────────────────
+  -- ASSERT is the formal boundary: execution only continues when
+  -- PuLP confirms Optimal. A non-Optimal status raises AssertionError
+  -- and is caught below — the solver's verdict is authoritative.
+  LOGGING f"[constraint_opt] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+  ASSERT is_optimal(@solution);
+  LOGGING "[constraint_opt] ASSERT passed — solver confirmed Optimal" LEVEL INFO
+
+  -- ── Stage 3: LLM interprets the verified result ───────────────
+  LOGGING "[constraint_opt] Stage 3 — LLM interpreting verified solution" LEVEL INFO
+  GENERATE interpret_solution(@problem, @solution, @lang) INTO @narrative;
+
+  CALL format_report(@problem, @lp_code, @solution, @narrative) INTO @report;
+
+  -- Write report to output file
+  CALL write_file(f"{@out_dir}/constraint_opt_{@ts_safe}.md", @report) INTO @out_path;
+  CALL time_elapsed(@t_start) INTO @elapsed;
+  LOGGING f"[constraint_opt] done — report → {@out_path}  ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+  RETURN @report WITH status = "complete";
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Solver did not reach Optimal status after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/constraint_opt_{@ts_safe}.md", @report) INTO @out_path;
+    CALL time_elapsed(@t_start) INTO @elapsed;
+    LOGGING f"[constraint_opt] infeasible — report → {@out_path}  ({@elapsed}s)" LEVEL INFO
+    RETURN @report WITH status = "infeasible";
+END;

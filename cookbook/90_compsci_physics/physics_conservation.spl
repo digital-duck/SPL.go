@@ -1,0 +1,370 @@
+-- ============================================================
+-- Recipe 90: Physics Conservation Check — LLM simulates, conservation laws prove
+--
+-- Extends the verifier ladder into computational-science physics
+-- simulation. The LLM's most common failure mode on collision/impact
+-- problems isn't setting up the wrong formula — it's silently
+-- returning a final state that VIOLATES momentum or energy
+-- conservation (e.g. an "elastic" collision that leaks kinetic
+-- energy, or a momentum vector that doesn't sum to the initial
+-- total). Conservation laws are the oracle every physics grad
+-- student checks by hand before trusting a result — here they
+-- become machine-checkable ASSERT predicates.
+--
+--   Probabilistic (LLM)   — read the natural-language collision
+--                            problem and write runnable NumPy code
+--                            that computes the final-state velocities
+--   Deterministic (NumPy) — execute the code; independently recompute
+--                            total momentum and total kinetic energy
+--                            before vs. after from the LLM's own
+--                            reported final velocities
+--   Deterministic (ASSERT)— formal gate: only continue when BOTH
+--                            momentum and (for elastic collisions)
+--                            energy are conserved within tolerance
+--   Probabilistic (LLM)   — narrate the result, restating the
+--                            final answer explicitly
+--   Deterministic (round- — regex-and-compare classifier confirms the
+--    trip classifier)       LLM's stated final answer matches the
+--                            verified computed value (WITH roundtrip = ...)
+--
+-- @enable_solver = false is the unaided-LLM baseline arm — collision
+-- problems are exactly where models compute a plausible-looking final
+-- velocity that silently fails to conserve momentum or energy.
+--
+-- Requires: numpy only (already a project dependency) — no new pip install
+-- Run:
+--   spl3 run cookbook/90_compsci_physics/physics_conservation.spl \
+--       --llm claude_cli
+--   spl3 run cookbook/90_compsci_physics/physics_conservation.spl \
+--       --llm ollama:gemma3 --param enable_solver=false
+-- ============================================================
+
+-- ── Deterministic regime: conservation-law verifier ──────────
+
+CREATE TOOL_API run_conservation_check(code TEXT)
+RETURNS TEXT AS PYTHON $$
+def run_conservation_check(code: str) -> str:
+    """Execute LLM-generated NumPy code and INDEPENDENTLY recompute the
+    conservation invariants from the values the code reports — the code
+    is never trusted to grade its own homework.
+
+    The LLM's code must set:
+        _result = {"m1": .., "m2": .., "v1i": .., "v2i": ..,
+                   "v1f": .., "v2f": .., "elastic": true|false}
+    (1-D collision along a single axis; SI units throughout).
+
+    This function then independently computes:
+        p_before = m1*v1i + m2*v2i
+        p_after  = m1*v1f + m2*v2f
+        ke_before = 0.5*m1*v1i^2 + 0.5*m2*v2i^2
+        ke_after  = 0.5*m1*v1f^2 + 0.5*m2*v2f^2
+    and reports whether each is conserved within 1% relative tolerance.
+    Momentum must ALWAYS be conserved; energy must be conserved only
+    when the problem states an elastic collision.
+    """
+    import json
+    import re
+    import numpy as np
+    code = re.sub(r'^```(?:python)?\s*\n?', '', code.strip(), flags=re.IGNORECASE)
+    code = re.sub(r'\n?```\s*$', '', code)
+    namespace = {"np": np}
+    try:
+        exec(code, namespace)
+        r = namespace.get("_result")
+        if r is None:
+            return json.dumps({"status": "Error", "error": "code did not set _result"})
+        m1, m2 = float(r["m1"]), float(r["m2"])
+        v1i, v2i = float(r["v1i"]), float(r["v2i"])
+        v1f, v2f = float(r["v1f"]), float(r["v2f"])
+        elastic = bool(r.get("elastic", False))
+
+        p_before = m1 * v1i + m2 * v2i
+        p_after = m1 * v1f + m2 * v2f
+        ke_before = 0.5 * m1 * v1i ** 2 + 0.5 * m2 * v2i ** 2
+        ke_after = 0.5 * m1 * v1f ** 2 + 0.5 * m2 * v2f ** 2
+
+        def _rel_ok(a, b, tol=0.01):
+            denom = max(abs(a), 1e-9)
+            return abs(a - b) / denom < tol
+
+        momentum_ok = _rel_ok(p_before, p_after)
+        energy_ok = _rel_ok(ke_before, ke_after) if elastic else True
+
+        status = "OK" if (momentum_ok and energy_ok) else "Error"
+        out = {
+            "status": status,
+            "answer": round(v1f, 4),
+            "answer2": round(v2f, 4),
+            "unit": "m/s",
+            "p_before": round(p_before, 4), "p_after": round(p_after, 4),
+            "ke_before": round(ke_before, 4), "ke_after": round(ke_after, 4),
+            "momentum_conserved": momentum_ok,
+            "energy_conserved": energy_ok if elastic else "not_applicable",
+            "elastic": elastic,
+        }
+        if status == "Error":
+            reasons = []
+            if not momentum_ok:
+                reasons.append(f"momentum NOT conserved ({p_before:.4f} -> {p_after:.4f})")
+            if elastic and not energy_ok:
+                reasons.append(f"kinetic energy NOT conserved ({ke_before:.4f} -> {ke_after:.4f})")
+            out["error"] = "; ".join(reasons)
+        return json.dumps(out, default=str)
+    except Exception as e:
+        return json.dumps({"status": "Error", "error": str(e)})
+$$;
+
+CREATE TOOL_API classify_roundtrip(narrative TEXT, result_json TEXT)
+RETURNS TEXT AS PYTHON $$
+def classify_roundtrip(narrative: str, result_json: str) -> str:
+    """Round-trip check: does the LLM's own 'Final answer: ...' line, in
+    its narration of the VERIFIED conserved result, match the ground-truth
+    final velocity of object 1 (within 0.5% relative tolerance)?
+
+    Returns 'match' / 'mismatch' / 'unverifiable'.
+    """
+    import re
+    import json
+    m = re.search(r'final answer\s*:?\s*(.+)', narrative, re.IGNORECASE)
+    if not m:
+        return "unverifiable"
+    llm_val = m.group(1).strip().rstrip('.').lower()
+    try:
+        truth = json.loads(result_json).get("answer")
+    except Exception:
+        return "unverifiable"
+    if truth is None:
+        return "unverifiable"
+
+    def _num(s):
+        try:
+            return float(re.sub(r'[^0-9.\-]', '', str(s)))
+        except Exception:
+            return None
+
+    ln, tn = _num(llm_val), _num(truth)
+    if ln is None or tn is None:
+        return "unverifiable"
+    if tn == 0:
+        return "match" if abs(ln) < 1e-6 else "mismatch"
+    rel_err = abs(ln - tn) / abs(tn)
+    return "match" if rel_err < 0.005 else "mismatch"
+$$;
+
+CREATE TOOL_API format_report(problem TEXT, code TEXT, solution_json TEXT,
+                              narrative TEXT, roundtrip TEXT)
+RETURNS TEXT AS PYTHON $$
+def format_report(problem: str, code: str, solution_json: str,
+                  narrative: str, roundtrip: str) -> str:
+    import json
+    try:
+        sol = json.loads(solution_json)
+    except Exception:
+        sol = {}
+    lines = [
+        "# Physics Conservation Check Report",
+        "",
+        f"**Problem:** {problem.strip()}",
+        "",
+        f"**Verifier status:** `{sol.get('status', 'Unknown')}`",
+        f"**Final velocity (object 1):** `{sol.get('answer', '?')} {sol.get('unit', '')}`",
+        f"**Momentum conserved:** `{sol.get('momentum_conserved', '?')}` "
+        f"({sol.get('p_before', '?')} -> {sol.get('p_after', '?')})",
+        f"**Energy conserved:** `{sol.get('energy_conserved', '?')}` "
+        f"({sol.get('ke_before', '?')} -> {sol.get('ke_after', '?')})",
+        f"**Round-trip check:** `{roundtrip}`",
+        "",
+        "## Interpretation", "", narrative.strip(),
+        "", "## Solver Code (LLM-generated, NumPy)", "",
+        "```python", code.strip(), "```",
+    ]
+    return "\n".join(lines)
+$$;
+
+-- ── Probabilistic regime: LLM prompt templates ───────────────
+
+CREATE FUNCTION formulate_conservation_code(problem TEXT)
+RETURNS TEXT AS $$
+You are a physicist. Convert this 1-D collision word problem into
+runnable Python code using NumPy.
+
+Rules:
+- `np` (NumPy) is already imported — do NOT add import statements
+- Work in SI units throughout (kg, m/s)
+- Solve for the final velocities using the appropriate physics
+  (conservation of momentum always applies; if the collision is
+  elastic, kinetic energy is ALSO conserved — use the standard
+  1-D elastic collision formulas; if perfectly inelastic, the
+  objects move together after collision)
+- Store the result EXACTLY as:
+    _result = {
+        "m1": <mass of object 1, kg>, "m2": <mass of object 2, kg>,
+        "v1i": <initial velocity of object 1, m/s>,
+        "v2i": <initial velocity of object 2, m/s>,
+        "v1f": <your computed final velocity of object 1, m/s>,
+        "v2f": <your computed final velocity of object 2, m/s>,
+        "elastic": true or false (True if the problem is an elastic
+                   collision, False if perfectly inelastic)
+    }
+- Output ONLY raw Python code — no markdown fences, no commentary
+
+Problem: {problem}
+$$;
+
+CREATE FUNCTION repair_conservation_code(problem TEXT, code TEXT, error_info TEXT)
+RETURNS TEXT AS $$
+This physics code produced a conservation-law violation or an error.
+
+Problem: {problem}
+
+Previous code:
+{code}
+
+Error:
+{error_info}
+
+Fix the code. Common causes:
+- Momentum not conserved: double-check m1*v1i + m2*v2i == m1*v1f + m2*v2f
+- For an ELASTIC collision, kinetic energy must ALSO be conserved — use
+  the standard formulas:
+    v1f = ((m1-m2)*v1i + 2*m2*v2i) / (m1+m2)
+    v2f = ((m2-m1)*v2i + 2*m1*v1i) / (m1+m2)
+- For a PERFECTLY INELASTIC collision, both objects share one final
+  velocity: v1f = v2f = (m1*v1i + m2*v2i) / (m1+m2), and set elastic=False
+- A sign error on velocity direction is the most common mistake
+- Missing or duplicate _result assignment
+
+Output ONLY the corrected Python code — no markdown fences, no commentary.
+$$;
+
+CREATE FUNCTION interpret_conservation_result(problem TEXT, solution_json TEXT)
+RETURNS TEXT AS $$
+You are a physicist. Interpret this VERIFIED, conservation-checked
+collision result for a general audience.
+
+Problem: {problem}
+
+Verified result (JSON, independently recomputed to confirm momentum
+and, if applicable, kinetic energy are conserved — trust it completely,
+do not re-derive it):
+{solution_json}
+
+Provide a concise interpretation (under 100 words):
+1. Restate what the problem asks
+2. State object 1's final velocity, referencing the exact value from the JSON
+3. One sentence confirming which conservation law(s) were verified
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+CREATE FUNCTION solve_directly(problem TEXT)
+RETURNS TEXT AS $$
+A student asked this physics collision question: "{problem}"
+
+There is no conservation-law checker backing you up this time — work it
+out yourself, from scratch.
+
+Write a clear walkthrough in under 8 sentences that:
+1. Restates the problem
+2. Shows your calculation step by step, naming which conservation
+   law(s) you are applying
+3. Gives the final velocity of object 1 plainly, with its unit
+
+End your response with a line in EXACTLY this format (no extra words,
+number only, no unit):
+Final answer: <value>
+$$;
+
+-- ── WORKFLOW ─────────────────────────────────────────────────
+
+WORKFLOW physics_conservation
+  -- Default: a classic elastic collision with a known closed-form
+  -- answer (equal masses swap velocities): m1=2kg at 5 m/s hits
+  -- stationary m2=2kg elastically -> v1f=0, v2f=5 m/s.
+  INPUT @problem TEXT := "A 2 kg ball moving at 5 m/s strikes a stationary 2 kg ball head-on in a perfectly elastic collision. What is the final velocity of the first ball, in m/s?"
+  INPUT @enable_solver TEXT := "true"
+  INPUT @max_tries INTEGER := 3
+  INPUT @out_dir TEXT := "./cookbook/90_compsci_physics/output"
+  OUTPUT @report TEXT
+DO
+  CALL time_monotonic() INTO @t_start;
+  CALL time_now() INTO @ts_safe;
+  CALL lower(@enable_solver) INTO @solver_mode;
+  LOGGING f"[physics_conservation] start run_id={@ts_safe} solver={@solver_mode}" LEVEL INFO
+
+  EVALUATE @solver_mode
+    WHEN IN ("true", "1", "yes") THEN
+      @use_solver := "yes"
+    ELSE
+      @use_solver := "no"
+  END
+
+  EVALUATE @use_solver
+    WHEN = "no" THEN
+      DO
+        -- ── ARM B: unaided LLM baseline — no conservation-law checker ──
+        LOGGING "[arm=llm_only] solving with NO conservation checker" LEVEL INFO
+        GENERATE solve_directly(@problem) INTO @report;
+        CALL trim(@report) INTO @report;
+        RETURN @report WITH status = "complete", arm = "llm_only", roundtrip = "not_applicable"
+      END
+
+    ELSE
+      DO
+        -- ── ARM A: LLM formulates NumPy code; conservation-checked solve ──
+        LOGGING "[arm=solver] Stage 1 — LLM formulation + conservation check" LEVEL INFO
+        @tries    := 0;
+        @status   := "init";
+        @code     := "";
+        @solution := "{}";
+
+        WHILE @tries < @max_tries DO
+          EVALUATE @status
+            WHEN = "OK" THEN
+              @tries := @max_tries
+            WHEN = "init" THEN
+              DO
+                GENERATE formulate_conservation_code(@problem) INTO @code;
+                CALL run_conservation_check(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] attempt {@tries}: status={@status}" LEVEL INFO
+              END
+            ELSE
+              DO
+                CALL result_error(@solution) INTO @error_info;
+                GENERATE repair_conservation_code(@problem, @code, @error_info) INTO @code;
+                CALL run_conservation_check(@code) INTO @solution;
+                CALL result_status(@solution) INTO @status;
+                @tries := @tries + 1;
+                LOGGING f"[arm=solver] repair {@tries}: status={@status}" LEVEL INFO
+              END
+          END
+        END
+
+        LOGGING f"[physics_conservation] Stage 2 — ASSERT gate (status={@status})" LEVEL INFO
+        ASSERT result_ok(@solution);
+        LOGGING "[physics_conservation] ASSERT passed — conservation laws confirmed" LEVEL INFO
+
+        GENERATE interpret_conservation_result(@problem, @solution) INTO @narrative;
+        CALL classify_roundtrip(@narrative, @solution) INTO @roundtrip;
+        LOGGING f"[physics_conservation] round-trip check: {@roundtrip}" LEVEL INFO
+
+        CALL format_report(@problem, @code, @solution, @narrative, @roundtrip) INTO @report;
+        CALL write_file(f"{@out_dir}/physics_{@ts_safe}.md", @report) INTO @out_path;
+        CALL time_elapsed(@t_start) INTO @elapsed;
+        LOGGING f"[physics_conservation] done — report -> {@out_path} ({@elapsed}s, attempts={@tries})" LEVEL INFO
+
+        RETURN @report WITH status = "complete", arm = "solver", roundtrip = @roundtrip
+      END
+  END
+
+EXCEPTION
+  WHEN ToolFailed THEN
+    @report := "Conservation laws could not be satisfied after " + @tries + " attempts. Last status: " + @status;
+    CALL write_file(f"{@out_dir}/physics_{@ts_safe}.md", @report) INTO @out_path;
+    LOGGING f"[physics_conservation] failure — report -> {@out_path}" LEVEL INFO
+    RETURN @report WITH status = "error", arm = "solver", roundtrip = "unverifiable"
+END;
